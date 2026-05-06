@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}Skylar IQ QA{% endblock %} — Skylar IQ QA Tool</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script>
+// Apply persisted theme before first paint to avoid flash
+(function() {
+  try {
+    const t = localStorage.getItem('skylar.theme') || 'light';
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+})();
+</script>
+{% block head_extra %}{% endblock %}
+</head>
+<body>
+<div class="app">
+  <aside class="app-sidebar">
+    <div class="brand"><span class="dot"></span> Skylar IQ QA</div>
+    <a href="{{ url_for('dashboard') }}" class="nav-link {% if active=='dashboard' %}active{% endif %}"><span class="ico">📊</span> Dashboard</a>
+    <a href="{{ url_for('runs_page') }}" class="nav-link {% if active=='runs' %}active{% endif %}"><span class="ico">📁</span> Runs</a>
+    <a href="{{ url_for('new_run_page') }}" class="nav-link {% if active=='new_run' %}active{% endif %}"><span class="ico">➕</span> New Run</a>
+    <a href="{{ url_for('test_files_page') }}" class="nav-link {% if active=='test_files' %}active{% endif %}"><span class="ico">📋</span> Test Files</a>
+    <a href="{{ url_for('test_pages_page') }}" class="nav-link {% if active=='test_pages' %}active{% endif %}"><span class="ico">📦</span> Test Pages</a>
+    <div class="nav-section">Configure</div>
+    <a href="{{ url_for('settings_page') }}" class="nav-link {% if active=='settings' %}active{% endif %}"><span class="ico">⚙</span> Settings</a>
+    <a href="{{ url_for('help_page') }}" class="nav-link {% if active=='help' %}active{% endif %}"><span class="ico">📖</span> Help</a>
+    <div style="margin-top:auto; padding:12px; font-size:11px; color:var(--text-soft)">v{{ app_version }}</div>
+  </aside>
+
+  <header class="app-header">
+    <div class="title">{% block header_title %}Skylar IQ QA{% endblock %}<small id="header-subtitle">{% block header_sub %}{% endblock %}</small></div>
+    <a class="btn btn-primary btn-sm" href="{{ url_for('new_run_page') }}">+ New Run</a>
+    <button id="theme-toggle" class="btn-icon" type="button" aria-label="Toggle dark mode" title="Toggle theme">
+      <span id="theme-icon">🌙</span>
+    </button>
+    {% if g.user %}
+      <div class="user-widget">
+        <span class="user-chip" title="Signed in as {{ g.user.email }}">
+          👤 {{ (g.user.name or g.user.email).split('@')[0][:18] }}
+        </span>
+        <a href="{{ url_for('logout') }}" class="btn btn-sm" title="Sign out of {{ g.user.email }}">
+          ⎋ Sign out
+        </a>
+      </div>
+    {% endif %}
+  </header>
+
+  <main class="app-main">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

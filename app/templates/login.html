@@ -1,0 +1,23 @@
+{% extends "auth_layout.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<h1>Sign in</h1>
+{% if error %}<div class="err">{{ error }}</div>{% endif %}
+{% if message %}<div class="ok">{{ message }}</div>{% endif %}
+<form method="POST" class="form">
+  <label>
+    <span class="label-text">Email</span>
+    <input type="email" name="email" autocomplete="username" required autofocus value="{{ email or '' }}">
+  </label>
+  <label>
+    <span class="label-text">Password</span>
+    <input type="password" name="password" autocomplete="current-password" required>
+  </label>
+  <button type="submit" class="btn btn-primary" style="width:100%; margin-top:8px">Sign in</button>
+</form>
+{% if signup_allowed %}
+  <p class="meta" style="text-align:center; margin-top:18px">
+    No account? <a href="{{ url_for('signup') }}">Create one</a>.
+  </p>
+{% endif %}
+{% endblock %}

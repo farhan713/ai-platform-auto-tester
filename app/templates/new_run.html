@@ -1,0 +1,445 @@
+{% extends "base.html" %}
+{% block title %}New Run{% endblock %}
+{% block header_title %}New Run{% endblock %}
+{% block header_sub %}— Configure and launch a QA run{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>Configuration</h2>
+    <form id="new-run-form" class="form" method="POST" action="{{ url_for('jobs_create') }}" enctype="multipart/form-data">
+      <label class="label-text">Test type <em>required</em></label>
+      <div style="display:flex; gap:16px; margin-bottom:14px">
+        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+          <input type="radio" name="test_type" value="sql_agent" id="tt-sql" checked> 🧠 SQL AI Engine
+        </label>
+        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+          <input type="radio" name="test_type" value="site_search" id="tt-search"> 🔎 Site Search
+        </label>
+      </div>
+
+      <label>
+        <span class="label-text">Use a saved preset</span>
+        <select id="preset-select">
+          <option value="">— None —</option>
+        </select>
+        <small>Loads a previously saved login configuration. Manage presets in <a href="{{ url_for('settings_page') }}">Settings</a>.</small>
+      </label>
+
+      <!-- Source picker — only visible on Site Search since SQL Agent always uses login_url -->
+      <div id="block-search-source" style="display:none">
+        <label class="label-text">Where is your search page?</label>
+        <div style="display:flex; gap:16px; margin-bottom:8px; flex-wrap:wrap">
+          <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+            <input type="radio" name="search_source" value="url" id="ssrc-url" checked> Live URL
+          </label>
+          <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+            <input type="radio" name="search_source" value="bundle" id="ssrc-bundle"> Use uploaded bundle
+          </label>
+          <a href="{{ url_for('test_pages_page') }}" class="meta" style="margin-left:auto; align-self:center">Manage uploaded bundles →</a>
+        </div>
+      </div>
+
+      <!-- Live URL block -->
+      <div id="block-url">
+        <label>
+          <span class="label-text" id="label-login-url">Login URL <em>required</em></span>
+          <input type="url" name="login_url" id="f-login_url" placeholder="https://&lt;host&gt;:8443/backoffice/?mid=100" required>
+          <small id="hint-login-url">Full URL of the Celerant login page.</small>
+          <div id="file-url-warning" style="display:none; margin-top:6px; padding:8px 12px; background:#fff7e6; border-left:3px solid var(--partial); border-radius:4px; font-size:12px; color:#8a5a00; line-height:1.5">
+            ⚠ <b>file:// URLs cannot be reached from inside Docker.</b> Either deploy your page on a public URL, or run this from the page's folder:
+            <code style="display:block; margin:6px 0; padding:6px 10px; background:#fff; color:#222">python3 -m http.server 8765</code>
+            then use <code>http://host.docker.internal:8765/index.html</code> — or pick "Use uploaded bundle" above.
+          </div>
+        </label>
+      </div>
+
+      <!-- Uploaded bundle block (Site Search only) -->
+      <div id="block-bundle" style="display:none">
+        <label>
+          <span class="label-text">Uploaded bundle <em>required</em></span>
+          <select name="bundle_id" id="f-bundle_id">
+            <option value="">— Pick an uploaded bundle —</option>
+          </select>
+          <small>Bundles are <a href="{{ url_for('test_pages_page') }}">uploaded once</a> from <code>dist/ss-library.bundle.js</code> + optional <code>.css</code>. The tool generates a wrapper page and runs the search against it.</small>
+        </label>
+      </div>
+
+      <!-- SQL Agent fields -->
+      <div id="block-sql-fields">
+        <div class="row">
+          <label>
+            <span class="label-text">Username <em>required</em></span>
+            <input type="text" name="username" id="f-username" autocomplete="username">
+          </label>
+          <label>
+            <span class="label-text">Password <em>required</em></span>
+            <input type="password" name="password" id="f-password" autocomplete="current-password">
+          </label>
+        </div>
+        <div class="row">
+          <label>
+            <span class="label-text">Machine ID</span>
+            <input type="text" name="machine_id" id="f-machine_id" value="100">
+          </label>
+          <label>
+            <span class="label-text">SQL Agent path</span>
+            <input type="text" name="sql_agent_path" id="f-sql_agent_path" value="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent">
+          </label>
+        </div>
+      </div>
+
+      <!-- Site Search fields -->
+      <div id="block-search-fields" style="display:none">
+        <label>
+          <span class="label-text">Search input selector</span>
+          <input type="text" name="search_input_selector" id="f-search_input_selector" value="#searchbox">
+          <small>CSS selector for the search box. Default <code>#searchbox</code> matches the ssLibrary widget.</small>
+        </label>
+
+        <details open style="margin-top:14px; padding:10px 14px; background:var(--surface-2); border:1px solid var(--border); border-radius:6px">
+          <summary style="cursor:pointer; font-weight:600; color:var(--text)">Tenant override (recommended)</summary>
+          <p class="meta" style="margin:8px 0 12px">
+            Override the <code>ssLibrary.init(...)</code> values hardcoded in the page so you can test any tenant
+            without editing the index.html. Leave blank to use whatever the page already passes.
+          </p>
+          <div class="row">
+            <label>
+              <span class="label-text">Org ID</span>
+              <input type="text" name="ss_org_id" id="f-ss_org_id" placeholder="e.g. r222ipid">
+            </label>
+            <label>
+              <span class="label-text">Console URL</span>
+              <input type="url" name="ss_console_url" id="f-ss_console_url" placeholder="https://celerantai.com/">
+            </label>
+          </div>
+          <label>
+            <span class="label-text">Server URL</span>
+            <input type="url" name="ss_server_url" id="f-ss_server_url" placeholder="(defaults to Console URL)">
+          </label>
+          <div class="row">
+            <label>
+              <span class="label-text">JWT username</span>
+              <input type="text" name="ss_jwt_user" id="f-ss_jwt_user" placeholder="(defaults to Org ID)" autocomplete="off">
+            </label>
+            <label>
+              <span class="label-text">JWT password</span>
+              <input type="password" name="ss_jwt_pass" id="f-ss_jwt_pass" placeholder="(leave blank to use page default)" autocomplete="new-password">
+            </label>
+          </div>
+          <details>
+            <summary class="meta" style="cursor:pointer">Image URLs (optional)</summary>
+            <div class="row">
+              <label>
+                <span class="label-text">Image base URL</span>
+                <input type="url" name="ss_image_url" id="f-ss_image_url" placeholder="https://...">
+              </label>
+              <label>
+                <span class="label-text">Not-found image URL</span>
+                <input type="url" name="ss_not_found_image_url" id="f-ss_not_found_image_url" placeholder="https://.../image_not_avail.jpg">
+              </label>
+            </div>
+          </details>
+        </details>
+      </div>
+
+      <label class="label-text" id="label-questions"><span id="label-questions-text">Questions</span> <em>required</em></label>
+      <div style="display:flex; gap:16px; margin-bottom:8px">
+        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+          <input type="radio" name="questions_source" value="upload" id="src-upload" checked> Upload new file
+        </label>
+        <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
+          <input type="radio" name="questions_source" value="saved" id="src-saved"> Use saved test file
+        </label>
+        <a href="{{ url_for('test_files_page') }}" class="meta" style="margin-left:auto; align-self:center">Manage test files →</a>
+      </div>
+
+      <div id="block-upload">
+        <input type="file" name="questions" id="f-questions" accept=".xlsx">
+        <small id="hint-questions">Column A = NL question. Column B (optional) = expected SQL. Header row auto-skipped.</small>
+      </div>
+
+      <div id="block-saved" style="display:none">
+        <select name="test_file_id" id="f-test_file_id">
+          <option value="">— Pick a saved test file —</option>
+        </select>
+        <small>Files persist on the server — upload them once on the <a href="{{ url_for('test_files_page') }}">Test Files</a> page.</small>
+      </div>
+
+      <details>
+        <summary class="meta" style="cursor:pointer; padding:6px 0">Advanced timeouts</summary>
+        <div class="row">
+          <label>
+            <span class="label-text">run-sql timeout (ms)</span>
+            <input type="number" name="run_sql_timeout_ms" value="120000" min="10000">
+          </label>
+          <label>
+            <span class="label-text">generate-viz timeout (ms)</span>
+            <input type="number" name="gen_viz_timeout_ms" value="120000" min="10000">
+          </label>
+        </div>
+      </details>
+
+      <details>
+        <summary class="meta" style="cursor:pointer; padding:6px 0">Save this configuration as a preset</summary>
+        <label>
+          <span class="label-text">Preset name</span>
+          <input type="text" id="save-preset-name" placeholder="e.g. Acme Corp — Production">
+        </label>
+        <button type="button" id="save-preset-btn" class="btn btn-sm">Save preset</button>
+        <small class="meta">Username and password are NOT stored. URL, machine ID, paths, and timeouts are.</small>
+      </details>
+
+      <div style="margin-top:18px; display:flex; gap:8px">
+        <button type="submit" class="btn btn-success">▶ Start QA Run</button>
+        <a href="{{ url_for('dashboard') }}" class="btn btn-ghost">Cancel</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Excel preview</h2>
+    <p class="meta" id="preview-status">Choose an .xlsx file to preview the first 20 questions.</p>
+    <div id="preview-wrap" class="preview-table" style="display:none">
+      <table>
+        <thead><tr><th style="width:40px">#</th><th>Question (col A)</th><th>Expected SQL (col B)</th></tr></thead>
+        <tbody id="preview-body"></tbody>
+      </table>
+    </div>
+    <div id="preview-warnings" style="margin-top:8px"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ---- Test-type toggle ----
+function applyTestType() {
+  const isSearch = document.getElementById('tt-search').checked;
+  document.getElementById('block-sql-fields').style.display = isSearch ? 'none' : '';
+  document.getElementById('block-search-fields').style.display = isSearch ? '' : 'none';
+  document.getElementById('block-search-source').style.display = isSearch ? '' : 'none';
+  // SQL Agent fields are required only in sql_agent mode
+  document.getElementById('f-username').required = !isSearch;
+  document.getElementById('f-password').required = !isSearch;
+  // Re-label the URL field
+  const lbl = document.getElementById('label-login-url');
+  const hint = document.getElementById('hint-login-url');
+  const url = document.getElementById('f-login_url');
+  if (isSearch) {
+    lbl.innerHTML = 'Page URL <em>required</em>';
+    hint.innerHTML = 'URL of the page hosting the search input. The page handles JWT auth in the background.';
+    url.placeholder = 'https://your-site.example.com/search.html';
+  } else {
+    lbl.innerHTML = 'Login URL <em>required</em>';
+    hint.innerHTML = 'Full URL of the Celerant login page.';
+    url.placeholder = 'https://<host>:8443/backoffice/?mid=100';
+  }
+  // Re-label the questions section + the hint under the file input
+  const qLabelText = document.getElementById('label-questions-text');
+  const qHint = document.getElementById('hint-questions');
+  if (isSearch) {
+    qLabelText.textContent = 'Search keywords';
+    qHint.textContent = 'Column A = search keyword (one per row). Other columns ignored. Header row auto-skipped.';
+  } else {
+    qLabelText.textContent = 'Questions';
+    qHint.textContent = 'Column A = NL question. Column B (optional) = expected SQL. Header row auto-skipped.';
+  }
+  // If we're switching back to SQL Agent, force url-source mode
+  if (!isSearch) {
+    document.getElementById('ssrc-url').checked = true;
+  }
+  applySearchSource();
+}
+document.getElementById('tt-sql').addEventListener('change', applyTestType);
+document.getElementById('tt-search').addEventListener('change', applyTestType);
+
+// ---- Search source picker (Live URL vs Uploaded bundle) ----
+function applySearchSource() {
+  const useBundle = document.getElementById('ssrc-bundle').checked &&
+                    document.getElementById('tt-search').checked;
+  document.getElementById('block-url').style.display = useBundle ? 'none' : '';
+  document.getElementById('block-bundle').style.display = useBundle ? '' : 'none';
+  document.getElementById('f-login_url').required = !useBundle;
+  document.getElementById('f-bundle_id').required = useBundle;
+}
+document.getElementById('ssrc-url').addEventListener('change', applySearchSource);
+document.getElementById('ssrc-bundle').addEventListener('change', applySearchSource);
+
+// Load uploaded bundles into the dropdown
+async function loadBundles() {
+  try {
+    const data = await SQA.fetchJSON('/api/hosted-bundles');
+    const sel = document.getElementById('f-bundle_id');
+    data.bundles.forEach(b => {
+      const o = document.createElement('option');
+      o.value = b.id;
+      o.textContent = `${b.name}  (${b.original_filename || 'bundle'})`;
+      sel.appendChild(o);
+    });
+    // If we arrived with ?bundle_id=xxx, auto-select Site Search + bundle mode
+    const params = new URLSearchParams(location.search);
+    const preselect = params.get('bundle_id');
+    if (preselect) {
+      document.getElementById('tt-search').click();
+      document.getElementById('ssrc-bundle').click();
+      sel.value = preselect;
+    }
+  } catch (e) { /* ignore */ }
+}
+loadBundles();
+// Live warning the moment someone pastes a file:// URL
+document.getElementById('f-login_url').addEventListener('input', (e) => {
+  const isFile = (e.target.value || '').trim().toLowerCase().startsWith('file:');
+  document.getElementById('file-url-warning').style.display = isFile ? 'block' : 'none';
+});
+// Pre-select from URL ?type=site_search
+const initType = new URLSearchParams(location.search).get('type');
+if (initType === 'site_search') {
+  document.getElementById('tt-search').checked = true;
+}
+applyTestType();
+
+// ---- Presets ----
+async function loadPresets() {
+  try {
+    const data = await SQA.fetchJSON('/api/presets');
+    const sel = document.getElementById('preset-select');
+    data.presets.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.id;
+      o.textContent = p.name + ' — ' + (p.login_url || '');
+      o.dataset.preset = JSON.stringify(p);
+      sel.appendChild(o);
+    });
+  } catch (e) {
+    SQA.toast('Failed to load presets: ' + e.message, 'error');
+  }
+}
+document.getElementById('preset-select').addEventListener('change', e => {
+  const opt = e.target.selectedOptions[0];
+  if (!opt || !opt.dataset.preset) return;
+  const p = JSON.parse(opt.dataset.preset);
+  if (p.login_url) document.getElementById('f-login_url').value = p.login_url;
+  if (p.machine_id) document.getElementById('f-machine_id').value = p.machine_id;
+  if (p.sql_agent_path) document.getElementById('f-sql_agent_path').value = p.sql_agent_path;
+  document.querySelector('input[name=run_sql_timeout_ms]').value = p.run_sql_timeout_ms || 120000;
+  document.querySelector('input[name=gen_viz_timeout_ms]').value = p.gen_viz_timeout_ms || 120000;
+  if (p.username) document.getElementById('f-username').value = p.username;
+  SQA.toast('Loaded preset: ' + p.name, 'info');
+});
+document.getElementById('save-preset-btn').addEventListener('click', async () => {
+  const name = document.getElementById('save-preset-name').value.trim();
+  if (!name) { SQA.toast('Please enter a preset name', 'error'); return; }
+  const body = {
+    name,
+    login_url: document.getElementById('f-login_url').value,
+    username: document.getElementById('f-username').value,
+    machine_id: document.getElementById('f-machine_id').value,
+    sql_agent_path: document.getElementById('f-sql_agent_path').value,
+    run_sql_timeout_ms: +document.querySelector('input[name=run_sql_timeout_ms]').value,
+    gen_viz_timeout_ms: +document.querySelector('input[name=gen_viz_timeout_ms]').value,
+  };
+  try {
+    await SQA.fetchJSON('/api/presets', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    SQA.toast('Preset saved.', 'success');
+    document.getElementById('preset-select').innerHTML = '<option value="">— None —</option>';
+    await loadPresets();
+  } catch (e) {
+    SQA.toast('Failed to save preset: ' + e.message, 'error');
+  }
+});
+loadPresets();
+
+// ---- Test-file source picker ----
+async function loadSavedFiles() {
+  try {
+    const data = await SQA.fetchJSON('/api/test-files');
+    const sel = document.getElementById('f-test_file_id');
+    data.files.forEach(f => {
+      const o = document.createElement('option');
+      o.value = f.id;
+      o.textContent = `${f.original_name} (${f.question_count} questions)`;
+      sel.appendChild(o);
+    });
+    // If we arrived with ?test_file_id=xxx, switch to saved mode and pre-select
+    const params = new URLSearchParams(location.search);
+    const preselect = params.get('test_file_id');
+    if (preselect) {
+      document.getElementById('src-saved').click();
+      sel.value = preselect;
+      sel.dispatchEvent(new Event('change'));
+    }
+  } catch (e) { /* ignore — page still works */ }
+}
+loadSavedFiles();
+
+document.getElementById('src-upload').addEventListener('change', () => {
+  document.getElementById('block-upload').style.display = '';
+  document.getElementById('block-saved').style.display = 'none';
+  document.getElementById('f-questions').disabled = false;
+  document.getElementById('f-test_file_id').disabled = true;
+});
+document.getElementById('src-saved').addEventListener('change', () => {
+  document.getElementById('block-upload').style.display = 'none';
+  document.getElementById('block-saved').style.display = '';
+  document.getElementById('f-questions').disabled = true;
+  document.getElementById('f-test_file_id').disabled = false;
+});
+
+document.getElementById('f-test_file_id').addEventListener('change', async (e) => {
+  const fid = e.target.value;
+  const status = document.getElementById('preview-status');
+  const wrap = document.getElementById('preview-wrap');
+  if (!fid) { status.textContent = 'Pick a saved file to preview…'; wrap.style.display = 'none'; return; }
+  status.textContent = 'Loading saved file…';
+  try {
+    const r = await SQA.fetchJSON('/api/test-files/' + encodeURIComponent(fid) + '/preview');
+    status.innerHTML = `<b>${SQA.escapeHtml(r.meta.original_name)}</b> — <b>${r.total}</b> questions. Showing first ${r.preview.length}.`;
+    document.getElementById('preview-body').innerHTML = r.preview.map(rr => `
+      <tr>
+        <td class="meta">${rr.id}</td>
+        <td>${SQA.escapeHtml(rr.natural_language_query || '')}</td>
+        <td><code style="font-size:11px">${SQA.escapeHtml((rr.expected_sql || '').slice(0, 100))}${rr.expected_sql && rr.expected_sql.length > 100 ? '…' : ''}</code></td>
+      </tr>`).join('');
+    wrap.style.display = 'block';
+  } catch (err) { status.innerHTML = '<span style="color:var(--fail)">' + SQA.escapeHtml(err.message) + '</span>'; }
+});
+
+// ---- Excel preview (upload path) ----
+document.getElementById('f-questions').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  const status = document.getElementById('preview-status');
+  const wrap = document.getElementById('preview-wrap');
+  const warnings = document.getElementById('preview-warnings');
+  warnings.innerHTML = '';
+  if (!file) { status.textContent = 'Choose an .xlsx file…'; wrap.style.display = 'none'; return; }
+  status.textContent = 'Reading ' + file.name + '…';
+  const fd = new FormData();
+  fd.append('questions', file);
+  try {
+    const data = await SQA.fetchJSON('/api/preview-questions', { method: 'POST', body: fd });
+    status.innerHTML = `Found <b>${data.total}</b> questions. Showing first ${data.preview.length}.`;
+    document.getElementById('preview-body').innerHTML = data.preview.map((r, i) => `
+      <tr>
+        <td class="meta">${r.id || (i+1)}</td>
+        <td>${SQA.escapeHtml(r.natural_language_query || '')}</td>
+        <td><code style="font-size:11px">${SQA.escapeHtml((r.expected_sql || '').slice(0, 100))}${r.expected_sql && r.expected_sql.length > 100 ? '…' : ''}</code></td>
+      </tr>`).join('');
+    wrap.style.display = 'block';
+    if (data.warnings && data.warnings.length) {
+      warnings.innerHTML = '<div class="toast info" style="position:static; margin:0; max-width:none">'
+        + '<b>Warnings:</b><ul style="margin:4px 0">'
+        + data.warnings.map(w => '<li>' + SQA.escapeHtml(w) + '</li>').join('')
+        + '</ul></div>';
+    }
+  } catch (e) {
+    status.innerHTML = '<span style="color:var(--fail)">Could not read file: ' + SQA.escapeHtml(e.message) + '</span>';
+    wrap.style.display = 'none';
+  }
+});
+</script>
+{% endblock %}

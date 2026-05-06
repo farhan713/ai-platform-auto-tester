@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Help{% endblock %}
+{% block header_title %}Help{% endblock %}
+{% block header_sub %}— Quick reference{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>Quick start</h2>
+    <ol>
+      <li>Go to <a href="{{ url_for('new_run_page') }}"><b>New Run</b></a></li>
+      <li>Enter the Celerant tenant <b>Login URL</b>, <b>username</b>, and <b>password</b></li>
+      <li>Upload your <b>questions Excel</b> (column A = NL question, column B = optional expected SQL)</li>
+      <li>Click <b>Start QA Run</b></li>
+      <li>Watch the live progress — click any query to drill down</li>
+      <li>When done, click <b>Open final report</b></li>
+    </ol>
+
+    <h3>Excel format</h3>
+    <p>Both test types use the same xlsx shape — column A holds the test input, column B is optional metadata.</p>
+
+    <h4 style="margin-top:14px">SQL AI Engine</h4>
+    <table class="table" style="font-size:12px">
+      <thead><tr><th>Col A — natural-language question</th><th>Col B — expected SQL <span class="meta">(optional)</span></th></tr></thead>
+      <tbody>
+        <tr><td>What are my top 10 selling brands this year?</td><td><span class="meta">(optional)</span></td></tr>
+        <tr><td>Show inventory cost by department</td><td><span class="meta">(optional)</span></td></tr>
+      </tbody>
+    </table>
+
+    <h4 style="margin-top:14px">Site Search</h4>
+    <table class="table" style="font-size:12px">
+      <thead><tr><th>Col A — search keyword</th><th>Col B</th></tr></thead>
+      <tbody>
+        <tr><td>shirt</td><td><span class="meta">ignored</span></td></tr>
+        <tr><td>boot</td><td><span class="meta">ignored</span></td></tr>
+        <tr><td>knife</td><td><span class="meta">ignored</span></td></tr>
+      </tbody>
+    </table>
+
+    <ul>
+      <li>First row may be a header — auto-skipped if column A is "question", "keyword", "query", "nl", etc.</li>
+      <li>Empty rows skipped</li>
+      <li>Anything past column B is ignored</li>
+      <li>Same .xlsx file can be uploaded once and reused across many runs from <a href="{{ url_for('test_files_page') }}">Test Files</a></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>What gets validated per query</h2>
+    <table class="table" style="font-size:12px">
+      <thead><tr><th>Check</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>run-sql</code> HTTP 2xx</td><td>The SQL execution endpoint returned successfully</td></tr>
+        <tr><td><code>run-sql</code> has rows</td><td>Query returned at least one data row</td></tr>
+        <tr><td>No empty column names</td><td>Blank column names indicate a SQL aliasing bug</td></tr>
+        <tr><td><code>generate-viz</code> HTTP 2xx</td><td>The chart-generation LLM call succeeded</td></tr>
+        <tr><td>Chart payload</td><td>Response actually contains chart_type + axes + columns</td></tr>
+        <tr><td>Column-name sync</td><td>Chart columns match the columns returned by run-sql</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Status meaning</h3>
+    <ul>
+      <li><span class="badge PASS">PASS</span> Everything green</li>
+      <li><span class="badge PARTIAL">PARTIAL</span> At least one warning (e.g. zero rows, mismatched columns)</li>
+      <li><span class="badge FAIL">FAIL</span> A hard failure (call missing or HTTP error)</li>
+      <li><span class="badge TIMEOUT">TIMEOUT</span> Call did not return within the per-query budget</li>
+    </ul>
+
+    <h3>Troubleshooting</h3>
+    <ul>
+      <li><b>"Machine ID is empty"</b> — wrong Machine ID. Try <code>100</code> or get the right value from the client.</li>
+      <li><b>Lots of TIMEOUTs</b> — Slow LLM endpoint. Bump <code>run-sql timeout</code> to 300000–600000 (5–10 min).</li>
+      <li><b>Login fails immediately</b> — Check the login URL is reachable from this machine. Try opening it in a browser first.</li>
+    </ul>
+  </div>
+</div>
+{% endblock %}

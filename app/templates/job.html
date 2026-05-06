@@ -1,0 +1,347 @@
+{% extends "base.html" %}
+{% block title %}Run {{ job_id[:10] }}{% endblock %}
+{% block header_title %}Run {{ job_id[:18] }}…{% endblock %}
+{% block header_sub %}— <span id="header-status"><span class="badge {{ meta.status|upper }}">{{ meta.status }}</span></span>{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Run <code>{{ job_id }}</code></h1>
+    <p class="subtitle"><span class="meta">{{ meta.created_at }}</span> · <code>{{ meta.login_url }}</code></p>
+  </div>
+  <div style="display:flex; gap:8px; flex-wrap:wrap">
+    <button id="stop-btn" type="button" class="btn btn-danger" style="display:none">⏹ Stop run</button>
+    <a id="report-link" class="btn btn-primary" href="{{ url_for('job_report', job_id=job_id) }}" target="_blank" style="display:none">Open report ↗</a>
+    <a id="dl-zip" class="btn" href="{{ url_for('job_download_zip', job_id=job_id) }}" style="display:none">↓ Download report (zip)</a>
+    <a id="dl-failures" class="btn btn-danger" href="{{ url_for('job_export_failures_xlsx', job_id=job_id) }}" style="display:none">↓ Download failed queries (xlsx)</a>
+    <a class="btn" href="{{ url_for('job_export_csv', job_id=job_id) }}">Export CSV</a>
+  </div>
+</div>
+
+<!-- Live progress strip -->
+<div class="card">
+  <div class="card-row">
+    <div class="counts">
+      <span class="count-pill PASS">PASS<b id="cnt-PASS">0</b></span>
+      <span class="count-pill PARTIAL">PARTIAL<b id="cnt-PARTIAL">0</b></span>
+      <span class="count-pill FAIL">FAIL<b id="cnt-FAIL">0</b></span>
+      <span class="count-pill TIMEOUT">TIMEOUT<b id="cnt-TIMEOUT">0</b></span>
+      <span class="count-pill">Done<b id="cnt-total">0</b> / <span id="cnt-total-of">{{ meta.question_count }}</span></span>
+    </div>
+    <div style="min-width:140px"><span class="meta" id="duration-display">—</span></div>
+  </div>
+  <progress id="progress" max="{{ meta.question_count or 100 }}" value="0"></progress>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="queries">All queries (<span id="t-queries-count">0</span>)</button>
+  <button class="tab" data-tab="events">Event log</button>
+  <button class="tab" data-tab="network">Network</button>
+  <button class="tab" data-tab="config">Configuration</button>
+</div>
+
+<!-- Overview tab -->
+<div class="tab-panel active" data-panel="overview">
+  <div class="grid-2">
+    <div class="card">
+      <h2>Outcome</h2>
+      <div class="chart-box"><canvas id="chart-outcome"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Slowest queries</h2>
+      <table class="table" id="slowest-tbl">
+        <thead><tr><th>q</th><th>Question</th><th style="width:90px">Duration</th><th style="width:90px">Status</th></tr></thead>
+        <tbody><tr><td colspan="4" class="table-empty">Waiting…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Top failure reasons (this run)</h2>
+    <table class="table" id="reasons-tbl">
+      <thead><tr><th>Reason</th><th style="width:80px">Count</th></tr></thead>
+      <tbody><tr><td colspan="2" class="table-empty">Waiting…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- All queries tab -->
+<div class="tab-panel" data-panel="queries">
+  <div class="card">
+    <div class="toolbar">
+      <input type="search" id="q-filter-text" placeholder="Search question text…">
+      <select id="q-filter-status">
+        <option value="">All statuses</option>
+        <option value="PASS">PASS</option>
+        <option value="PARTIAL">PARTIAL</option>
+        <option value="FAIL">FAIL</option>
+        <option value="TIMEOUT">TIMEOUT</option>
+        <option value="PENDING">PENDING</option>
+      </select>
+      <select id="q-sort">
+        <option value="id">Sort: question order</option>
+        <option value="duration">Sort: duration (longest first)</option>
+        <option value="status">Sort: status</option>
+      </select>
+      <span class="meta" id="q-count" style="margin-left:auto"></span>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="table" id="queries-tbl">
+        <thead>
+          <tr><th>q</th><th>Status</th><th>Question</th><th>run-sql</th><th>generate-viz</th><th>Duration</th><th></th></tr>
+        </thead>
+        <tbody><tr><td colspan="7" class="table-empty">Waiting for results…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Event log tab -->
+<div class="tab-panel" data-panel="events">
+  <div class="card">
+    <h2>Live event stream</h2>
+    <p class="meta">Server-sent events from the runner. Auto-scrolls.</p>
+    <pre id="events" class="events"></pre>
+  </div>
+</div>
+
+<!-- Network tab -->
+<div class="tab-panel" data-panel="network">
+  <div class="card">
+    <h2>Network call summary</h2>
+    <p class="meta">Aggregated XHR/fetch traffic captured across all queries.</p>
+    <table class="table" id="network-tbl">
+      <thead><tr><th>Classification</th><th>Count</th><th>Avg HTTP</th><th>Avg duration</th></tr></thead>
+      <tbody><tr><td colspan="4" class="table-empty">Waiting…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Configuration tab -->
+<div class="tab-panel" data-panel="config">
+  <div class="card">
+    <h2>Run configuration</h2>
+    <table class="kv">
+      <tr><th>Login URL</th><td><code>{{ meta.login_url }}</code></td></tr>
+      <tr><th>Username</th><td>{{ meta.username }}</td></tr>
+      <tr><th>Machine ID</th><td>{{ meta.machine_id }}</td></tr>
+      <tr><th>SQL Agent path</th><td><code>{{ meta.sql_agent_path }}</code></td></tr>
+      <tr><th>Questions</th><td>{{ meta.question_count }}</td></tr>
+      <tr><th>Created</th><td><span class="meta">{{ meta.created_at }}</span></td></tr>
+      <tr><th>Started</th><td><span class="meta">{{ meta.started_at or '—' }}</span></td></tr>
+      <tr><th>Finished</th><td><span class="meta">{{ meta.finished_at or '—' }}</span></td></tr>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
+<script>
+const jobId = {{ job_id|tojson }};
+const eventsEl = document.getElementById('events');
+const progressEl = document.getElementById('progress');
+const reportLink = document.getElementById('report-link');
+const stopBtn = document.getElementById('stop-btn');
+const headerStatus = document.getElementById('header-status');
+
+let outcomeChart = null;
+let allResults = [];   // every per-query JSON we've fetched
+let firstLoad = true;
+
+// ---- Stop button -----------------------------------------------------------
+stopBtn.addEventListener('click', async () => {
+  if (!confirm('Stop this run after the current query finishes?\nThe report will still be generated for queries already executed.')) return;
+  stopBtn.disabled = true;
+  stopBtn.textContent = 'Stopping…';
+  try { await SQA.fetchJSON(`/jobs/${jobId}/stop`, { method: 'POST' }); SQA.toast('Stop requested.', 'info'); }
+  catch (e) { stopBtn.disabled = false; stopBtn.textContent = '⏹ Stop run'; SQA.toast(e.message, 'error'); }
+});
+
+// ---- Live status (counts + last5 + stop button visibility) -----------------
+function refreshStatus() {
+  fetch(`/jobs/${jobId}/status`).then(r => r.json()).then(s => {
+    document.getElementById('cnt-PASS').textContent = s.counts.PASS || 0;
+    document.getElementById('cnt-PARTIAL').textContent = s.counts.PARTIAL || 0;
+    document.getElementById('cnt-FAIL').textContent = s.counts.FAIL || 0;
+    document.getElementById('cnt-TIMEOUT').textContent = s.counts.TIMEOUT || 0;
+    document.getElementById('cnt-total').textContent = s.completed || 0;
+    if (s.total) {
+      progressEl.max = s.total;
+      progressEl.value = s.completed || 0;
+      document.getElementById('cnt-total-of').textContent = s.total;
+    }
+    headerStatus.innerHTML = `<span class="badge ${(s.status||'').toUpperCase()}">${SQA.escapeHtml(s.status||'?')}</span>`;
+    if (s.status === 'running' || s.status === 'queued') {
+      stopBtn.style.display = 'inline-flex';
+      stopBtn.disabled = !!s.stop_requested;
+      stopBtn.textContent = s.stop_requested ? 'Stopping…' : '⏹ Stop run';
+    } else {
+      stopBtn.style.display = 'none';
+    }
+    if (s.status === 'done' || s.status === 'failed' || s.status === 'stopped') {
+      reportLink.style.display = 'inline-flex';
+      document.getElementById('dl-zip').style.display = 'inline-flex';
+    }
+    // Show "Download failed queries" only if there are any failures
+    const failCount = (s.counts.FAIL || 0) + (s.counts.PARTIAL || 0) + (s.counts.TIMEOUT || 0);
+    if (failCount > 0 && (s.status === 'done' || s.status === 'failed' || s.status === 'stopped' || s.status === 'running')) {
+      const dlf = document.getElementById('dl-failures');
+      dlf.style.display = 'inline-flex';
+      dlf.textContent = '↓ Download failed queries (' + failCount + ')';
+    }
+    refreshAllResults();
+  }).catch(()=>{});
+}
+
+// ---- Fetch all per-query results, populate Overview + All Queries tabs -----
+async function refreshAllResults() {
+  try {
+    const r = await SQA.fetchJSON(`/jobs/${jobId}/results`);
+    allResults = r.results || [];
+    document.getElementById('t-queries-count').textContent = allResults.length;
+    renderOverview();
+    renderQueries();
+    renderNetwork();
+    if (firstLoad && allResults.length === 0) firstLoad = false;
+  } catch (e) {
+    // The endpoint may not exist on older runs — silently skip
+  }
+}
+
+// ---- Overview --------------------------------------------------------------
+function renderOverview() {
+  const counts = { PASS: 0, PARTIAL: 0, FAIL: 0, TIMEOUT: 0, PENDING: 0 };
+  allResults.forEach(r => { counts[r.overall_status] = (counts[r.overall_status]||0) + 1; });
+
+  // Donut
+  const cs = getComputedStyle(document.documentElement);
+  const data = {
+    labels: ['PASS', 'PARTIAL', 'FAIL', 'TIMEOUT'],
+    datasets: [{
+      data: [counts.PASS, counts.PARTIAL, counts.FAIL, counts.TIMEOUT],
+      backgroundColor: [
+        cs.getPropertyValue('--pass').trim() || '#1a8a3a',
+        cs.getPropertyValue('--partial').trim() || '#d49a00',
+        cs.getPropertyValue('--fail').trim() || '#c62828',
+        cs.getPropertyValue('--timeout').trim() || '#6a4ec2'
+      ]
+    }]
+  };
+  if (outcomeChart) {
+    outcomeChart.data = data;
+    outcomeChart.update();
+  } else {
+    outcomeChart = new Chart(document.getElementById('chart-outcome').getContext('2d'), {
+      type: 'doughnut', data,
+      options: { maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+    });
+  }
+
+  // Slowest 10
+  const sl = [...allResults].filter(r => r.total_duration_ms != null).sort((a,b) => b.total_duration_ms - a.total_duration_ms).slice(0, 10);
+  document.querySelector('#slowest-tbl tbody').innerHTML = sl.length === 0
+    ? '<tr><td colspan="4" class="table-empty">No completed queries yet.</td></tr>'
+    : sl.map(r => `
+        <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(jobId)}/queries/${r.id}'">
+          <td>q${String(r.id).padStart(2,'0')}</td>
+          <td>${SQA.escapeHtml((r.nl_query||'').slice(0,80))}${(r.nl_query||'').length > 80 ? '…' : ''}</td>
+          <td>${SQA.fmtDuration(r.total_duration_ms)}</td>
+          <td><span class="badge ${r.overall_status}">${r.overall_status}</span></td>
+        </tr>`).join('');
+
+  // Failure reasons aggregation
+  const reasons = {};
+  allResults.forEach(r => {
+    const v = r.validations || {};
+    (v.fail_reasons || []).forEach(reason => { reasons[reason] = (reasons[reason]||0) + 1; });
+    (v.warn_reasons || []).forEach(reason => { reasons['(warn) ' + reason] = (reasons['(warn) ' + reason]||0) + 1; });
+  });
+  const sorted = Object.entries(reasons).sort((a,b) => b[1] - a[1]);
+  document.querySelector('#reasons-tbl tbody').innerHTML = sorted.length === 0
+    ? '<tr><td colspan="2" class="table-empty">No failures or warnings yet.</td></tr>'
+    : sorted.map(([reason, count]) => `<tr><td>${SQA.escapeHtml(reason)}</td><td><b>${count}</b></td></tr>`).join('');
+}
+
+// ---- All queries tab -------------------------------------------------------
+function renderQueries() {
+  const search = document.getElementById('q-filter-text').value.toLowerCase();
+  const status = document.getElementById('q-filter-status').value;
+  const sort = document.getElementById('q-sort').value;
+
+  let rows = [...allResults];
+  if (status) rows = rows.filter(r => r.overall_status === status);
+  if (search) rows = rows.filter(r => (r.nl_query||'').toLowerCase().includes(search));
+  if (sort === 'duration') rows.sort((a,b) => (b.total_duration_ms||0) - (a.total_duration_ms||0));
+  else if (sort === 'status') {
+    const order = { FAIL: 0, TIMEOUT: 1, PARTIAL: 2, PENDING: 3, PASS: 4 };
+    rows.sort((a,b) => (order[a.overall_status]||9) - (order[b.overall_status]||9));
+  } else rows.sort((a,b) => a.id - b.id);
+
+  document.getElementById('q-count').textContent = `${rows.length} of ${allResults.length}`;
+
+  const tbody = document.querySelector('#queries-tbl tbody');
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No queries match.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const v = r.validations || {};
+    const rs = r.run_sql_call || {};
+    const gv = r.generate_viz_call || {};
+    return `
+    <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(jobId)}/queries/${r.id}'">
+      <td><b>q${String(r.id).padStart(2,'0')}</b></td>
+      <td><span class="badge ${r.overall_status}">${r.overall_status}</span></td>
+      <td>${SQA.escapeHtml((r.nl_query||'').slice(0,90))}${(r.nl_query||'').length > 90 ? '…' : ''}</td>
+      <td>${rs.status ? `HTTP ${rs.status}` : '<span class="meta">—</span>'} ${v.run_sql_row_count != null ? `<span class="meta">(${v.run_sql_row_count}r)</span>` : ''}</td>
+      <td>${gv.status ? `HTTP ${gv.status}` : '<span class="meta">—</span>'}</td>
+      <td>${SQA.fmtDuration(r.total_duration_ms)}</td>
+      <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(jobId)}/queries/${r.id}" onclick="event.stopPropagation()">Open →</a></td>
+    </tr>`;
+  }).join('');
+}
+['q-filter-text','q-filter-status','q-sort'].forEach(id =>
+  document.getElementById(id).addEventListener('input', renderQueries)
+);
+
+// ---- Network tab -----------------------------------------------------------
+function renderNetwork() {
+  const agg = {};
+  allResults.forEach(r => {
+    (r.calls || []).forEach(c => {
+      const k = c.classification || 'other';
+      if (!agg[k]) agg[k] = { count: 0, statusSum: 0, durSum: 0, statusN: 0, durN: 0 };
+      agg[k].count++;
+      if (c.status != null) { agg[k].statusSum += c.status; agg[k].statusN++; }
+      if (c.duration_ms != null) { agg[k].durSum += c.duration_ms; agg[k].durN++; }
+    });
+  });
+  const tbody = document.querySelector('#network-tbl tbody');
+  const entries = Object.entries(agg).sort((a,b) => b[1].count - a[1].count);
+  tbody.innerHTML = entries.length === 0
+    ? '<tr><td colspan="4" class="table-empty">No network calls captured yet.</td></tr>'
+    : entries.map(([k, a]) => `
+        <tr>
+          <td><code>${SQA.escapeHtml(k)}</code></td>
+          <td>${a.count}</td>
+          <td>${a.statusN ? Math.round(a.statusSum / a.statusN) : '—'}</td>
+          <td>${a.durN ? Math.round(a.durSum / a.durN) + ' ms' : '—'}</td>
+        </tr>`).join('');
+}
+
+// ---- SSE event stream ------------------------------------------------------
+const es = new EventSource(`/jobs/${jobId}/events`);
+es.onmessage = (e) => {
+  if (e.data === '[__end__]') { es.close(); refreshStatus(); SQA.toast('Run complete.', 'success'); return; }
+  eventsEl.textContent += e.data + '\n';
+  eventsEl.scrollTop = eventsEl.scrollHeight;
+  if (/^\[q\d+\] (PASS|PARTIAL|FAIL|TIMEOUT)/.test(e.data)) refreshStatus();
+};
+es.onerror = () => { /* auto-reconnect */ };
+
+refreshStatus();
+setInterval(refreshStatus, 4000);
+</script>
+{% endblock %}

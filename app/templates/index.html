@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Skylar IQ QA Tool</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>Skylar IQ SQL Agent — QA Tool</h1>
+  <p class="subtitle">Drop in your client's URL, login, and Excel of questions. The tool runs the full Skylar IQ flow, captures every API call, and produces a QA report.</p>
+</header>
+
+<main class="grid">
+  <section class="card form-card">
+    <h2>Start a new run</h2>
+    <form method="POST" action="{{ url_for('jobs_create') }}" enctype="multipart/form-data" class="form">
+      <label>
+        <span>Login URL <em>required</em></span>
+        <input name="login_url" type="url" placeholder="https://&lt;client-host&gt;:8443/backoffice/?mid=100" required>
+        <small>Full URL of the Celerant Back Office login page. Include <code>?mid=&lt;machine-id&gt;</code> if you know it.</small>
+      </label>
+      <div class="row">
+        <label>
+          <span>Username</span>
+          <input name="username" required autocomplete="off">
+        </label>
+        <label>
+          <span>Password</span>
+          <input name="password" type="password" required autocomplete="off">
+        </label>
+      </div>
+      <div class="row">
+        <label>
+          <span>Machine ID <small>(default 100)</small></span>
+          <input name="machine_id" value="100">
+        </label>
+        <label>
+          <span>SQL Agent path</span>
+          <input name="sql_agent_path" value="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent">
+        </label>
+      </div>
+      <div class="row">
+        <label>
+          <span>run-sql timeout (ms)</span>
+          <input name="run_sql_timeout_ms" type="number" value="120000" min="10000">
+        </label>
+        <label>
+          <span>generate-viz timeout (ms)</span>
+          <input name="gen_viz_timeout_ms" type="number" value="120000" min="10000">
+        </label>
+      </div>
+      <label>
+        <span>Questions Excel (.xlsx) <em>required</em></span>
+        <input name="questions" type="file" accept=".xlsx" required>
+        <small>Column A: natural language question. Column B (optional): expected SQL.</small>
+      </label>
+      <button type="submit">Start QA Run</button>
+    </form>
+  </section>
+
+  <section class="card history-card">
+    <h2>Past runs</h2>
+    {% if jobs %}
+      <table class="history">
+        <thead><tr><th>ID</th><th>Status</th><th>Questions</th><th>Created</th><th></th></tr></thead>
+        <tbody>
+        {% for j in jobs %}
+          <tr>
+            <td><code>{{ j.id }}</code></td>
+            <td><span class="badge {{ j.status|upper }}">{{ j.status }}</span></td>
+            <td>{{ j.question_count or '-' }}</td>
+            <td><span class="meta">{{ j.created_at or '-' }}</span></td>
+            <td><a href="{{ url_for('job_view', job_id=j.id) }}">Open</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="meta">No runs yet.</p>
+    {% endif %}
+  </section>
+</main>
+
+<footer>
+  <p>Skylar IQ QA Tool · runs locally · uses Playwright + Flask</p>
+</footer>
+</body>
+</html>

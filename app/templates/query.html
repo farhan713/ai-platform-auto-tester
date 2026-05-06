@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block title %}q{{ qid }} — Run {{ job_id[:10] }}{% endblock %}
+{% block header_title %}<a href="{{ url_for('job_view', job_id=job_id) }}" style="color:inherit; text-decoration:none">← Run {{ job_id[:18] }}…</a> / q{{ '%02d' % qid }}{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 id="q-title">Query q{{ '%02d' % qid }}</h1>
+    <p class="subtitle" id="q-subtitle"><span class="meta">Loading…</span></p>
+  </div>
+  <div style="display:flex; gap:8px">
+    <a id="prev-link" class="btn" href="#">← Previous</a>
+    <a id="next-link" class="btn" href="#">Next →</a>
+  </div>
+</div>
+
+<div id="content"><p class="meta">Loading query detail…</p></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const jobId = {{ job_id|tojson }};
+const qid = {{ qid|tojson }};
+
+let RUN_META = { test_type: 'sql_agent' };
+
+async function load() {
+  // Fetch run meta (knows which test type — affects which call sections to render)
+  try {
+    RUN_META = await SQA.fetchJSON(`/jobs/${jobId}/meta`);
+  } catch (e) {
+    /* fall back to sql_agent; non-fatal */
+  }
+  let d;
+  try {
+    d = await SQA.fetchJSON(`/jobs/${jobId}/result/${qid}`);
+  } catch (e) {
+    document.getElementById('content').innerHTML = `<div class="card"><p style="color:var(--fail)">Could not load query: ${SQA.escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+  if (d.pending) {
+    document.getElementById('content').innerHTML = '<div class="card"><p>This query has not finished yet. <a href="javascript:location.reload()">Reload</a> to try again.</p></div>';
+    return;
+  }
+  render(d);
+  document.getElementById('prev-link').href = qid > 1
+    ? `/jobs/${encodeURIComponent(jobId)}/queries/${qid - 1}` : '#';
+  document.getElementById('next-link').href =
+    `/jobs/${encodeURIComponent(jobId)}/queries/${qid + 1}`;
+}
+
+function render(d) {
+  const status = d.overall_status || 'PENDING';
+  const v = d.validations || {};
+  const rs = d.run_sql_call || {};
+  const gv = d.generate_viz_call || {};
+  const shots = (d.screenshots || []).filter(Boolean);
+
+  document.getElementById('q-title').innerHTML =
+    `<span class="badge ${status}">${status}</span> q${String(d.id).padStart(2,'0')} — ${SQA.escapeHtml(d.nl_query || '')}`;
+  document.getElementById('q-subtitle').innerHTML =
+    `Duration: <b>${SQA.fmtDuration(d.total_duration_ms)}</b> · Started <span class="meta">${SQA.escapeHtml(d.started_at || '')}</span>`;
+
+  let html = '';
+
+  // Validations summary
+  html += `<div class="grid-2"><div class="card">
+    <h2>Validations</h2>
+    <table class="kv">
+      <tr><th>Status</th><td><span class="badge ${status}">${status}</span></td></tr>
+      <tr><th>Timed out</th><td>${d.timed_out ? '<span style="color:var(--fail)">yes</span> on <code>'+SQA.escapeHtml(v.timed_out_on||'?')+'</code>' : 'no'}</td></tr>
+      <tr><th>run-sql columns</th><td><code>${SQA.escapeHtml(JSON.stringify(v.run_sql_columns||[]))}</code></td></tr>
+      <tr><th>run-sql rows</th><td>${v.run_sql_row_count != null ? v.run_sql_row_count : '—'}</td></tr>
+      <tr><th>chart type</th><td><code>${SQA.escapeHtml(String(v.generate_viz_chart_type||'—'))}</code></td></tr>
+      <tr><th>columns synced</th><td>${formatBool(v.columns_synced_run_sql_vs_generate_viz)}</td></tr>
+      <tr><th>fail reasons</th><td>${formatList(v.fail_reasons)}</td></tr>
+      <tr><th>warn reasons</th><td>${formatList(v.warn_reasons)}</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Question</h2>
+    <p><b>NL query:</b><br>${SQA.escapeHtml(d.nl_query || '')}</p>
+    ${d.expected_sql ? `<h3>Expected SQL</h3><pre>${SQA.escapeHtml(d.expected_sql)}</pre>` : ''}
+    ${v.run_sql_returned_sql ? `<h3>SQL the agent generated</h3><pre>${SQA.escapeHtml(v.run_sql_returned_sql)}</pre>` : ''}
+  </div></div>`;
+
+  // Error trace
+  if (d.error) {
+    html += `<div class="card"><h2 style="color:var(--fail)">Unhandled exception</h2><pre>${SQA.escapeHtml(d.error)}</pre></div>`;
+  }
+
+  // Captured network calls — sections depend on the run's test_type
+  if (RUN_META.test_type === 'site_search') {
+    const sk = d.search_keywords_call || {};
+    const sr = d.search_results_call || {};
+    html += `<div class="card">${renderCall('search-keywords', sk, 'Autocomplete keywords endpoint — fires on every keystroke')}</div>`;
+    html += `<div class="card">${renderCall('search-results', sr, 'Product results endpoint — fires after keywords resolve')}</div>`;
+  } else {
+    const gs = d.generate_sql_call || {};
+    html += `<div class="card">${renderCall('generate-sql', gs, 'NL → SQL conversion (LLM call to celerantai.com)')}</div>`;
+    html += `<div class="card">${renderCall('run-sql', rs, 'SQL execution against the tenant database')}</div>`;
+    html += `<div class="card">${renderCall('generate-viz', gv, 'Chart generation (LLM call) — only when "Generate Visualization" is clicked')}</div>`;
+  }
+
+  // Screenshots
+  if (shots.length) {
+    html += '<div class="card"><h2>Screenshots</h2><div class="grid-2">';
+    shots.forEach(sp => {
+      const fname = sp.split('/').pop();
+      const url = `/jobs/${encodeURIComponent(jobId)}/screenshots/${encodeURIComponent(fname)}`;
+      html += `<div><a href="${url}" target="_blank">${SQA.escapeHtml(fname)} ↗</a><br><img src="${url}" style="max-width:100%; border:1px solid var(--border); border-radius:6px; margin-top:6px"></div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Notes
+  if (d.notes && d.notes.length) {
+    html += `<div class="card"><h2>Runner notes (${d.notes.length})</h2><ul>${d.notes.map(n => `<li><code>${SQA.escapeHtml(n)}</code></li>`).join('')}</ul></div>`;
+  }
+
+  // All XHR/fetch
+  if (d.calls && d.calls.length) {
+    html += `<div class="card"><h2>All captured XHR/fetch (${d.calls.length})</h2><div style="overflow-x:auto"><table class="table">
+      <thead><tr><th>#</th><th>Class</th><th>Method</th><th>URL</th><th>HTTP</th><th>Duration</th></tr></thead>
+      <tbody>${d.calls.map((c, i) => `<tr>
+        <td>${i+1}</td>
+        <td><code>${SQA.escapeHtml(c.classification||'-')}</code></td>
+        <td>${SQA.escapeHtml(c.method||'-')}</td>
+        <td><code>${SQA.escapeHtml(c.url||'')}</code></td>
+        <td>${c.status==null?'-':c.status}</td>
+        <td>${SQA.fmtDuration(c.duration_ms)}</td>
+      </tr>`).join('')}</tbody>
+    </table></div></div>`;
+  }
+
+  document.getElementById('content').innerHTML = html;
+}
+
+function renderCall(label, call, description) {
+  description = description || '';
+  if (!call || !call.url) {
+    return `<h2>${SQA.escapeHtml(label)} <span class="meta">— not captured</span></h2>
+      ${description ? `<p class="meta">${SQA.escapeHtml(description)}</p>` : ''}
+      <p class="meta">The runner did not see a ${SQA.escapeHtml(label)} call for this query.</p>`;
+  }
+  const reqHeaders = sanitize(call.request_headers || {});
+  const respHeaders = sanitize(call.response_headers || {});
+  const reqBody = call.request_post_data;
+  const respBody = call.response_body;
+  const reqStr = reqBody == null ? '(no body)' : (typeof reqBody === 'string' ? reqBody : JSON.stringify(reqBody, null, 2));
+  const respStr = respBody == null ? '(no body)' : (typeof respBody === 'string' ? respBody : JSON.stringify(respBody, null, 2));
+  const hasResponse = call.status != null;
+  const isOk = hasResponse && call.status >= 200 && call.status < 300;
+  const statusLabel = !hasResponse ? '<span class="badge TIMEOUT">no response</span>'
+                    : `<b style="color:${isOk?'var(--pass)':'var(--fail)'}">HTTP ${call.status}</b>`;
+  const curl = buildCurl(call);
+
+  return `
+    <h2>${SQA.escapeHtml(label)} ${statusLabel}</h2>
+    ${description ? `<p class="meta">${SQA.escapeHtml(description)}</p>` : ''}
+    ${!hasResponse ? `<div class="toast info" style="position:static; margin:0 0 12px; max-width:none">
+      <b>Request was sent but no response was received yet.</b> The headers and body below are what the tool actually sent.
+      ${call.failure ? `<br><b>Failure:</b> <code>${SQA.escapeHtml(call.failure)}</code>` : ''}
+    </div>` : ''}
+    <table class="kv">
+      <tr><th>Method</th><td><code>${SQA.escapeHtml(call.method||'')}</code></td></tr>
+      <tr><th>URL</th><td><code>${SQA.escapeHtml(call.url||'')}</code></td></tr>
+      <tr><th>HTTP status</th><td>${hasResponse ? `<b style="color:${isOk?'var(--pass)':'var(--fail)'}">${call.status}</b>` : '<span class="meta">no response</span>'}</td></tr>
+      <tr><th>Duration</th><td>${call.duration_ms != null ? SQA.fmtDuration(call.duration_ms) : '<span class="meta">pending / no response</span>'}</td></tr>
+      <tr><th>Started</th><td><span class="meta">${SQA.escapeHtml(call.started_at || '-')}</span></td></tr>
+      <tr><th>Finished</th><td><span class="meta">${SQA.escapeHtml(call.finished_at || '-')}</span></td></tr>
+    </table>
+    <div style="margin:8px 0">
+      <button class="btn btn-sm" onclick="copyText(${JSON.stringify(curl).replace(/</g,'\\u003c')})">Copy as cURL</button>
+    </div>
+    <h4>Request headers (sanitized)</h4><pre>${SQA.escapeHtml(JSON.stringify(reqHeaders, null, 2))}</pre>
+    <h4>Request body</h4><pre>${SQA.escapeHtml(reqStr.slice(0, 12000))}</pre>
+    <h4>Response headers</h4><pre>${hasResponse ? SQA.escapeHtml(JSON.stringify(respHeaders, null, 2)) : '(no response received)'}</pre>
+    <h4>Response body</h4><pre>${hasResponse ? SQA.escapeHtml(respStr.slice(0, 16000)) : '(no response received)'}</pre>
+  `;
+}
+
+function buildCurl(call) {
+  const parts = [`curl -X ${call.method || 'GET'} \\`, `  '${(call.url||'').replace(/'/g, "'\\''")}' \\`];
+  const h = call.request_headers || {};
+  Object.keys(h).forEach(k => {
+    const lk = k.toLowerCase();
+    if (lk.includes('cookie') || lk.includes('authorization')) return; // skip in curl too
+    parts.push(`  -H '${k}: ${String(h[k]).replace(/'/g, "'\\''")}' \\`);
+  });
+  if (call.request_post_data != null) {
+    const body = typeof call.request_post_data === 'string' ? call.request_post_data : JSON.stringify(call.request_post_data);
+    parts.push(`  --data-raw '${body.replace(/'/g, "'\\''")}'`);
+  } else {
+    parts[parts.length - 1] = parts[parts.length - 1].replace(/ \\$/, '');
+  }
+  return parts.join('\n');
+}
+
+function copyText(s) {
+  navigator.clipboard.writeText(s).then(() => SQA.toast('Copied to clipboard', 'success'),
+    () => SQA.toast('Copy failed', 'error'));
+}
+
+function sanitize(h) {
+  const out = {};
+  const REDACT = ['authorization','cookie','set-cookie','x-csrf-token','x-api-key','x-auth-token','jsessionid'];
+  Object.keys(h).forEach(k => {
+    out[k] = REDACT.some(r => k.toLowerCase().includes(r)) ? '***redacted***' : h[k];
+  });
+  return out;
+}
+function formatList(arr) {
+  if (!arr || !arr.length) return '<span class="meta">none</span>';
+  return '<ul style="margin:0">' + arr.map(x => '<li>'+SQA.escapeHtml(String(x))+'</li>').join('') + '</ul>';
+}
+function formatBool(b) {
+  if (b == null) return '<span class="meta">—</span>';
+  return b ? '<span style="color:var(--pass)">yes</span>' : '<span style="color:var(--fail)">no</span>';
+}
+
+load();
+</script>
+{% endblock %}

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block header_title %}Settings{% endblock %}
+{% block header_sub %}— Presets, theme, defaults{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>Saved login presets</h2>
+    <p class="meta">URL, machine ID, paths and timeouts only — passwords are never stored.</p>
+    <table class="table" id="presets-table">
+      <thead><tr><th>Name</th><th>Login URL</th><th>Machine</th><th></th></tr></thead>
+      <tbody><tr><td colspan="4" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+
+    <h3 style="margin-top:24px">Add new preset</h3>
+    <form id="add-preset" class="form">
+      <label><span class="label-text">Name</span><input type="text" id="np-name" placeholder="Acme Corp — Production"></label>
+      <label><span class="label-text">Login URL</span><input type="url" id="np-url" placeholder="https://host:8443/backoffice/?mid=100"></label>
+      <div class="row">
+        <label><span class="label-text">Username (optional)</span><input type="text" id="np-username"></label>
+        <label><span class="label-text">Machine ID</span><input type="text" id="np-machine" value="100"></label>
+      </div>
+      <label><span class="label-text">SQL Agent path</span><input type="text" id="np-path" value="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent"></label>
+      <button type="button" class="btn btn-primary" id="add-preset-btn">+ Save preset</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Appearance</h2>
+    <p>Toggle light / dark mode using the icon in the top bar. Your choice is saved to this browser.</p>
+
+    <h3>Tool info</h3>
+    <table class="kv">
+      <tr><th>Version</th><td>{{ app_version }}</td></tr>
+      <tr><th>Python</th><td>{{ python_version }}</td></tr>
+      <tr><th>Playwright</th><td>{{ playwright_version }}</td></tr>
+      <tr><th>Runs directory</th><td><code>{{ runs_dir }}</code></td></tr>
+      <tr><th>Presets file</th><td><code>{{ presets_file }}</code></td></tr>
+    </table>
+
+    <h3>Bulk actions</h3>
+    <div style="display:flex; gap:8px; flex-wrap:wrap">
+      <a class="btn" href="/api/runs/export.csv">Export all runs (CSV)</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadPresets() {
+  try {
+    const data = await SQA.fetchJSON('/api/presets');
+    const tbody = document.querySelector('#presets-table tbody');
+    if (data.presets.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No presets saved yet. Add one below.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.presets.map(p => `
+      <tr>
+        <td><b>${SQA.escapeHtml(p.name)}</b><br><span class="meta">${SQA.escapeHtml(p.username || '')}</span></td>
+        <td><code>${SQA.escapeHtml(p.login_url || '')}</code></td>
+        <td>${SQA.escapeHtml(p.machine_id || '')}</td>
+        <td><button type="button" class="btn btn-sm btn-danger" data-id="${SQA.escapeHtml(p.id)}">Delete</button></td>
+      </tr>`).join('');
+    tbody.querySelectorAll('button[data-id]').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('Delete preset "' + b.closest('tr').querySelector('b').textContent + '"?')) return;
+      try {
+        await SQA.fetchJSON('/api/presets/' + b.dataset.id, { method: 'DELETE' });
+        SQA.toast('Preset deleted.', 'success');
+        loadPresets();
+      } catch (e) { SQA.toast(e.message, 'error'); }
+    }));
+  } catch (e) { SQA.toast(e.message, 'error'); }
+}
+document.getElementById('add-preset-btn').addEventListener('click', async () => {
+  const body = {
+    name: document.getElementById('np-name').value.trim(),
+    login_url: document.getElementById('np-url').value.trim(),
+    username: document.getElementById('np-username').value.trim(),
+    machine_id: document.getElementById('np-machine').value.trim(),
+    sql_agent_path: document.getElementById('np-path').value.trim(),
+    run_sql_timeout_ms: 120000,
+    gen_viz_timeout_ms: 120000,
+  };
+  if (!body.name || !body.login_url) { SQA.toast('Name and Login URL are required', 'error'); return; }
+  try {
+    await SQA.fetchJSON('/api/presets', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    document.getElementById('add-preset').reset();
+    SQA.toast('Preset saved.', 'success');
+    loadPresets();
+  } catch (e) { SQA.toast(e.message, 'error'); }
+});
+loadPresets();
+</script>
+{% endblock %}

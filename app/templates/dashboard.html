@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block header_title %}Dashboard{% endblock %}
+{% block header_sub %}— Overview of all QA runs{% endblock %}
+
+{% block content %}
+<div class="grid-4">
+  <div class="stat-card">
+    <div class="label">Total runs</div>
+    <div class="value" id="stat-runs">—</div>
+    <div class="delta" id="stat-runs-delta"></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Queries tested</div>
+    <div class="value" id="stat-queries">—</div>
+    <div class="delta" id="stat-queries-delta"></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Pass rate</div>
+    <div class="value" id="stat-pass-rate">—</div>
+    <div class="delta" id="stat-pass-rate-delta"></div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Avg duration</div>
+    <div class="value" id="stat-avg">—</div>
+    <div class="delta" id="stat-avg-delta"></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h2>Pass rate over time</h2>
+    <div class="chart-box tall"><canvas id="chart-trend"></canvas></div>
+  </div>
+  <div class="card">
+    <h2>Outcome distribution</h2>
+    <div class="chart-box tall"><canvas id="chart-outcomes"></canvas></div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h2>Top failure reasons</h2>
+    <table class="table" id="failure-reasons">
+      <thead><tr><th>Reason</th><th style="width:80px">Count</th></tr></thead>
+      <tbody><tr><td colspan="2" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Recent runs</h2>
+    <table class="table" id="recent-runs">
+      <thead><tr><th>Run</th><th>Started</th><th>Result</th><th></th></tr></thead>
+      <tbody><tr><td colspan="4" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
+<script>
+async function loadDashboard() {
+  try {
+    const s = await SQA.fetchJSON('/api/stats');
+
+    document.getElementById('stat-runs').textContent = s.totals.runs;
+    document.getElementById('stat-queries').textContent = s.totals.queries;
+    document.getElementById('stat-pass-rate').textContent = (s.totals.queries ? ((s.totals.pass / s.totals.queries) * 100).toFixed(1) + '%' : '—');
+    document.getElementById('stat-avg').textContent = SQA.fmtDuration(s.totals.avg_ms);
+    document.getElementById('stat-runs-delta').textContent = s.totals.runs_last_7d + ' in last 7 days';
+    document.getElementById('stat-queries-delta').textContent = s.totals.queries_last_7d + ' tested in last 7 days';
+
+    // Trend chart
+    const trendCtx = document.getElementById('chart-trend').getContext('2d');
+    const cs = getComputedStyle(document.documentElement);
+    new Chart(trendCtx, {
+      type: 'line',
+      data: {
+        labels: s.daily.map(d => d.date),
+        datasets: [
+          {
+            label: 'Pass rate %',
+            data: s.daily.map(d => d.queries ? +(d.pass / d.queries * 100).toFixed(1) : null),
+            borderColor: cs.getPropertyValue('--pass').trim() || '#22c55e',
+            backgroundColor: 'rgba(34,197,94,0.1)',
+            tension: 0.3, fill: true, yAxisID: 'y'
+          },
+          {
+            label: 'Queries',
+            data: s.daily.map(d => d.queries),
+            borderColor: cs.getPropertyValue('--accent').trim() || '#2563eb',
+            backgroundColor: 'transparent',
+            tension: 0.3, yAxisID: 'y2'
+          }
+        ]
+      },
+      options: {
+        maintainAspectRatio: false,
+        scales: {
+          y: { beginAtZero: true, max: 100, title: { display: true, text: '% pass' } },
+          y2: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'queries' } }
+        }
+      }
+    });
+
+    // Outcomes donut
+    const outCtx = document.getElementById('chart-outcomes').getContext('2d');
+    new Chart(outCtx, {
+      type: 'doughnut',
+      data: {
+        labels: ['PASS', 'PARTIAL', 'FAIL', 'TIMEOUT'],
+        datasets: [{
+          data: [s.totals.pass, s.totals.partial, s.totals.fail, s.totals.timeout],
+          backgroundColor: [
+            cs.getPropertyValue('--pass').trim() || '#1a8a3a',
+            cs.getPropertyValue('--partial').trim() || '#d49a00',
+            cs.getPropertyValue('--fail').trim() || '#c62828',
+            cs.getPropertyValue('--timeout').trim() || '#6a4ec2'
+          ]
+        }]
+      },
+      options: { maintainAspectRatio: false, plugins: { legend: { position: 'bottom' } } }
+    });
+
+    // Failure reasons
+    const fr = document.getElementById('failure-reasons').querySelector('tbody');
+    if (s.top_failures.length === 0) {
+      fr.innerHTML = '<tr><td colspan="2" class="table-empty">No failures recorded yet.</td></tr>';
+    } else {
+      fr.innerHTML = s.top_failures.map(f =>
+        `<tr><td>${SQA.escapeHtml(f.reason)}</td><td><b>${f.count}</b></td></tr>`
+      ).join('');
+    }
+
+    // Recent runs
+    const rr = document.getElementById('recent-runs').querySelector('tbody');
+    if (s.recent_runs.length === 0) {
+      rr.innerHTML = '<tr><td colspan="4" class="table-empty">No runs yet — start one from <a href="/runs/new">New Run</a>.</td></tr>';
+    } else {
+      rr.innerHTML = s.recent_runs.map(r => `
+        <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(r.id)}'">
+          <td><code>${SQA.escapeHtml(r.id.slice(0, 18))}</code></td>
+          <td><span class="meta">${SQA.fmtDate(r.created_at)}</span></td>
+          <td>
+            <span class="badge ${(r.status||'').toUpperCase()}">${SQA.escapeHtml(r.status||'?')}</span>
+            ${r.summary ? `<span class="meta" style="margin-left:6px">${r.summary.PASS||0}P · ${r.summary.PARTIAL||0}W · ${r.summary.FAIL||0}F · ${r.summary.TIMEOUT||0}T</span>` : ''}
+          </td>
+          <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(r.id)}">Open →</a></td>
+        </tr>`).join('');
+    }
+  } catch (e) {
+    SQA.toast('Failed to load dashboard: ' + e.message, 'error');
+  }
+}
+loadDashboard();
+</script>
+{% endblock %}

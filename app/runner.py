@@ -1,0 +1,900 @@
+"""
+Generic Skylar IQ SQL Agent QA runner.
+
+Drives the Celerant Back Office "Skylar IQ" SQL Agent for any tenant:
+  1. Login at <login_url> with <username>/<password>, injecting <machine_id>
+     into localStorage so the server-side "Machine ID" check passes.
+  2. Navigate to the SQL Agent SPA route.
+  3. For every natural-language question in the supplied list:
+        a) Type the question
+        b) Click the send button
+        c) Wait (event-driven) for the run-sql response
+        d) If the UI shows a "Generate Visualization" button, click it
+        e) Wait for the generate-viz response
+        f) Validate everything and persist a per-query JSON
+  4. Aggregate results to <output_dir>/all_results.json.
+
+Config is a dict (or argparse Namespace). See `RunConfig` for the schema.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urljoin, urlparse, urlunparse
+
+from playwright.sync_api import (
+    sync_playwright,
+    Page,
+    Request,
+    Response,
+    TimeoutError as PWTimeoutError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+@dataclass
+class RunConfig:
+    """Per-run configuration. Build one of these and pass to run() or run_sitesearch()."""
+    login_url: str                 # SQL Agent: login page URL.  Site Search: target page URL with #searchbox
+    username: str                  # SQL Agent only — leave "" for site search
+    password: str                  # SQL Agent only — leave "" for site search
+    questions: list[dict[str, Any]]  # [{id, natural_language_query, expected_sql?}]
+    output_dir: Path
+    test_type: str = "sql_agent"   # 'sql_agent' or 'site_search'
+    machine_id: str = "100"
+    sql_agent_path: str = "/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent"
+    search_input_selector: str = "#searchbox"   # site_search only
+    # Optional site-search runtime override. When set, the runner injects an
+    # init-script that intercepts the page's ssLibrary.init(...) call and
+    # substitutes these values — letting QA test any tenant without editing
+    # the hosted index.html. Keys: org_id, console_url, server_url, image_url,
+    # not_found_image_url, jwt_user, jwt_pass.
+    site_search_config: dict[str, str] | None = None
+    run_sql_timeout_ms: int = 120_000
+    gen_viz_timeout_ms: int = 120_000
+    page_load_timeout_ms: int = 60_000
+    headless: bool = True
+    on_event: Callable[[str], None] | None = None
+    should_stop: Callable[[], bool] | None = None
+
+
+# Endpoint URL substring hints (used to classify each XHR/fetch we observe)
+RUN_SQL_HINTS = ("run-sql", "runsql", "execute-sql", "executesql")
+GEN_VIZ_HINTS = ("generate-viz", "generateviz", "generate_viz", "/viz", "visualization", "chart-data")
+GEN_SQL_HINTS = ("generate_sql", "generate-sql")
+# Site Search classifications
+SS_KEYWORDS_HINTS = ("/search_keywords/",)
+SS_RESULTS_HINTS  = ("/search_results/", "/search_multi_keyword_and_results/", "/user_search_result")
+SS_AUTH_HINTS     = ("/organization_validation/", "/search_ui_styling_info")
+
+
+# ---------------------------------------------------------------------------
+# Captured network call + per-query result
+# ---------------------------------------------------------------------------
+@dataclass
+class CapturedCall:
+    request_id: str
+    url: str
+    method: str
+    started_at: str
+    finished_at: str | None = None
+    duration_ms: int | None = None
+    status: int | None = None
+    request_headers: dict[str, str] = field(default_factory=dict)
+    request_post_data: Any = None
+    response_headers: dict[str, str] = field(default_factory=dict)
+    response_body: Any = None
+    response_body_preview: str | None = None
+    failure: str | None = None
+    classification: str = "other"
+
+
+@dataclass
+class QueryResult:
+    id: int
+    nl_query: str
+    expected_sql: str
+    started_at: str
+    finished_at: str | None = None
+    total_duration_ms: int | None = None
+    screenshots: list[str] = field(default_factory=list)
+    calls: list[CapturedCall] = field(default_factory=list)
+    run_sql_call: CapturedCall | None = None
+    generate_sql_call: CapturedCall | None = None
+    generate_viz_call: CapturedCall | None = None
+    # Site Search runner populates these instead of run_sql_call / generate_viz_call:
+    search_keywords_call: CapturedCall | None = None
+    search_results_call: CapturedCall | None = None
+    validations: dict[str, Any] = field(default_factory=dict)
+    overall_status: str = "PENDING"  # PASS | PARTIAL | FAIL | TIMEOUT
+    notes: list[str] = field(default_factory=list)
+    error: str | None = None
+    timed_out: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _classify(url: str) -> str:
+    low = url.lower()
+    # Site search classifications first — more specific URL substrings.
+    if any(h in low for h in SS_KEYWORDS_HINTS):
+        return "search-keywords"
+    if any(h in low for h in SS_RESULTS_HINTS):
+        return "search-results"
+    if any(h in low for h in SS_AUTH_HINTS):
+        return "search-auth"
+    if any(h in low for h in GEN_VIZ_HINTS):
+        return "generate-viz"
+    if any(h in low for h in RUN_SQL_HINTS):
+        return "run-sql"
+    if any(h in low for h in GEN_SQL_HINTS):
+        return "generate-sql"
+    return "other"
+
+
+def _is_run_sql_url(url: str) -> bool:
+    return any(h in url.lower() for h in RUN_SQL_HINTS)
+
+
+def _is_gen_viz_url(url: str) -> bool:
+    return any(h in url.lower() for h in GEN_VIZ_HINTS)
+
+
+def _is_search_keywords_url(url: str) -> bool:
+    return any(h in url.lower() for h in SS_KEYWORDS_HINTS)
+
+
+def _is_search_results_url(url: str) -> bool:
+    return any(h in url.lower() for h in SS_RESULTS_HINTS)
+
+
+def derive_sql_agent_url(login_url: str, sql_agent_path: str) -> str:
+    """Build the SQL Agent SPA URL from the login URL's origin + the configured path."""
+    parsed = urlparse(login_url)
+    origin = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+    if sql_agent_path.startswith("http"):
+        return sql_agent_path
+    if not sql_agent_path.startswith("/"):
+        sql_agent_path = "/" + sql_agent_path
+    return origin + sql_agent_path
+
+
+# ---------------------------------------------------------------------------
+# NetworkRecorder
+# ---------------------------------------------------------------------------
+class NetworkRecorder:
+    """Subscribes to page.on('request' / 'response' / 'requestfailed') and records every XHR/fetch."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self._calls: dict[str, CapturedCall] = {}
+        self._order: list[str] = []
+        page.on("request", self._on_request)
+        page.on("response", self._on_response)
+        page.on("requestfailed", self._on_failed)
+
+    def _on_request(self, req: Request) -> None:
+        if req.resource_type not in ("xhr", "fetch"):
+            return
+        rid = self._key(req)
+        try:
+            post = req.post_data
+        except Exception:
+            post = None
+        try:
+            post_json = req.post_data_json
+        except Exception:
+            post_json = None
+        self._calls[rid] = CapturedCall(
+            request_id=rid,
+            url=req.url,
+            method=req.method,
+            started_at=now_iso(),
+            request_headers=dict(req.headers),
+            request_post_data=post_json if post_json is not None else post,
+            classification=_classify(req.url),
+        )
+        self._order.append(rid)
+
+    def _on_response(self, resp: Response) -> None:
+        rid = self._key(resp.request)
+        call = self._calls.get(rid)
+        if not call:
+            return
+        call.status = resp.status
+        call.response_headers = dict(resp.headers)
+        call.finished_at = now_iso()
+        try:
+            text = resp.text()
+            call.response_body_preview = text[:500]
+            try:
+                call.response_body = json.loads(text)
+            except Exception:
+                call.response_body = text
+        except Exception as e:
+            call.response_body = f"<failed to read body: {e}>"
+
+    def _on_failed(self, req: Request) -> None:
+        rid = self._key(req)
+        call = self._calls.get(rid)
+        if not call:
+            return
+        call.failure = req.failure or "unknown"
+        call.finished_at = now_iso()
+
+    @staticmethod
+    def _key(req: Request) -> str:
+        return f"{id(req):x}-{req.method}-{req.url}"
+
+    def snapshot_after(self, started_iso: str) -> list[CapturedCall]:
+        out: list[CapturedCall] = []
+        for rid in self._order:
+            c = self._calls.get(rid)
+            if not c:
+                continue
+            if c.started_at >= started_iso:
+                if c.started_at and c.finished_at:
+                    try:
+                        s = datetime.fromisoformat(c.started_at)
+                        e = datetime.fromisoformat(c.finished_at)
+                        c.duration_ms = int((e - s).total_seconds() * 1000)
+                    except Exception:
+                        pass
+                out.append(c)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Login + navigation
+# ---------------------------------------------------------------------------
+def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
+    log(f"[login] navigating {cfg.login_url}")
+    page.goto(cfg.login_url, wait_until="load", timeout=cfg.page_load_timeout_ms)
+    page.wait_for_selector("#userid", timeout=20_000)
+
+    # Wait for jQuery's submit handler to be wired by RequireJS — without it the form does a
+    # native POST that omits machineid and the server returns "Machine ID is empty".
+    log("[login] waiting for jQuery submit handler to bind")
+    page.wait_for_function(
+        """
+        () => {
+            if (!window.jQuery) return false;
+            const events = jQuery._data(document.getElementById('loginform'), 'events');
+            return !!(events && events.submit && events.submit.length > 0);
+        }
+        """,
+        timeout=cfg.page_load_timeout_ms,
+    )
+    if cfg.machine_id:
+        page.evaluate(
+            "(mid) => window.localStorage.setItem('MACHINE_ID', mid)",
+            cfg.machine_id,
+        )
+    page.wait_for_timeout(300)
+
+    page.locator("#userid").fill(cfg.username)
+    page.locator("#passwd").fill(cfg.password)
+    try:
+        page.locator("#btnLogin").click(timeout=5_000)
+    except PWTimeoutError:
+        page.locator("#btnLogin").click(force=True)
+
+    try:
+        page.wait_for_url(re.compile(r".*wrmsscreen.*"), timeout=cfg.page_load_timeout_ms)
+    except PWTimeoutError:
+        pass
+    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+
+    url = page.url
+    if "UserAuthenticationServlet" in url or url == cfg.login_url:
+        body = page.content()[:300]
+        raise RuntimeError(f"Login failed at {url}: {body}")
+    log(f"[login] success — {url}")
+
+
+def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Page:
+    target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
+    log(f"[nav] opening {target}")
+    page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+    page.wait_for_selector(
+        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
+        timeout=60_000,
+    )
+    log("[nav] SQL Agent ready")
+    return page
+
+
+# ---------------------------------------------------------------------------
+# Per-query
+# ---------------------------------------------------------------------------
+def submit_query(
+    page: Page,
+    recorder: NetworkRecorder,
+    cfg: RunConfig,
+    qresult: QueryResult,
+    screenshot_dir: Path,
+) -> None:
+    box = page.locator(
+        'input.greeting-input, input.chat-input, '
+        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]'
+    ).first
+    box.wait_for(state="visible", timeout=15_000)
+    # The chat input is disabled while the previous query is still being
+    # processed by the SQL Agent. Without this wait, q02 onward fail with
+    # "element is not enabled" because we click before the agent finishes.
+    # Tolerate up to 90s — slow tenants can take that long between turns.
+    try:
+        page.wait_for_function(
+            """
+            () => {
+                const el = document.querySelector(
+                    'input.chat-input, input.greeting-input, '
+                    + 'input[placeholder*="sales question" i], '
+                    + 'textarea[placeholder*="sales question" i]'
+                );
+                return el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+            }
+            """,
+            timeout=90_000,
+        )
+    except PWTimeoutError:
+        qresult.notes.append("chat input still disabled after 90s — proceeding with force-click")
+    try:
+        box.click(timeout=5_000)
+    except PWTimeoutError:
+        # Last-ditch: force-click even if Playwright thinks it's disabled
+        box.click(force=True)
+        qresult.notes.append("clicked input with force=True")
+    box.fill("")
+    box.type(qresult.nl_query, delay=6)
+
+    qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_01_input.png"))
+    started_iso = now_iso()
+    qresult.notes.append(f"submit_started={started_iso}")
+
+    send_selectors = [
+        "img.greeting-send-btn",
+        "img.chat-send-btn",
+        '[class*="send-btn"]',
+        '[class*="send-icon"]',
+        ".chat-input-bar img",
+        ".chat-input-bar button",
+    ]
+
+    def click_send() -> None:
+        for sel in send_selectors:
+            loc = page.locator(sel)
+            try:
+                n = loc.count()
+            except Exception:
+                n = 0
+            if n:
+                try:
+                    loc.last.click(timeout=2500)
+                    qresult.notes.append(f"send via {sel!r}")
+                    return
+                except Exception as e:
+                    qresult.notes.append(f"send {sel!r} click failed: {e}")
+        try:
+            box.press("Enter")
+            qresult.notes.append("send via Enter (fallback)")
+        except Exception as e:
+            qresult.notes.append(f"send Enter failed: {e}")
+
+    # run-sql wait via Playwright's event-driven API
+    run_sql_resp = None
+    try:
+        with page.expect_response(
+            lambda r: _is_run_sql_url(r.url),
+            timeout=cfg.run_sql_timeout_ms,
+        ) as info:
+            click_send()
+        run_sql_resp = info.value
+        qresult.notes.append(f"run-sql HTTP {run_sql_resp.status} {run_sql_resp.url}")
+    except PWTimeoutError:
+        qresult.notes.append(f"run-sql TIMEOUT after {cfg.run_sql_timeout_ms}ms")
+        qresult.timed_out = True
+        qresult.validations["timed_out_on"] = "run-sql"
+        return
+    except Exception as e:
+        qresult.notes.append(f"run-sql expect_response error: {type(e).__name__}: {e}")
+
+    page.wait_for_timeout(1500)
+    # Capture both run-sql and generate-sql from the recorder. We accept calls
+    # WITHOUT a finished response too — for TIMEOUT cases the request side has
+    # been captured (URL, method, headers, body) and the user still needs to
+    # see what we sent, even if no response came back.
+    snapshot = recorder.snapshot_after(started_iso)
+    if run_sql_resp is not None:
+        for c in snapshot:
+            if c.classification == "run-sql" and c.url == run_sql_resp.url and c.finished_at:
+                qresult.run_sql_call = c
+                break
+    if qresult.run_sql_call is None:
+        # Prefer a finished call; fall back to a request-only one (timeout case).
+        for c in snapshot:
+            if c.classification == "run-sql" and c.finished_at:
+                qresult.run_sql_call = c
+                break
+        if qresult.run_sql_call is None:
+            for c in snapshot:
+                if c.classification == "run-sql":
+                    qresult.run_sql_call = c
+                    qresult.notes.append("run-sql captured request-only (no response received)")
+                    break
+    # Same logic for generate-sql (the NL → SQL LLM call to celerantai.com).
+    for c in snapshot:
+        if c.classification == "generate-sql":
+            qresult.generate_sql_call = c
+            break
+
+    page.wait_for_timeout(1500)
+    qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_02_runsql.png"))
+
+    # Generate Visualization is conditional — UI omits it for non-chartable (single-column) results.
+    gv_btn = page.get_by_role("button", name=re.compile("Generate Visualization", re.I))
+    try:
+        gv_count = gv_btn.count()
+    except Exception:
+        gv_count = 0
+    if gv_count == 0:
+        gv_btn = page.locator('button:has-text("Generate Visualization"), :text-is("Generate Visualization")')
+        try:
+            gv_count = gv_btn.count()
+        except Exception:
+            gv_count = 0
+
+    qresult.notes.append(f"Generate Visualization button count={gv_count}")
+    if gv_count == 0:
+        qresult.notes.append("Generate Visualization button not present (UI hides for non-chartable result)")
+        qresult.validations["viz_button_present"] = False
+        return
+    qresult.validations["viz_button_present"] = True
+
+    viz_started_iso = now_iso()
+    gen_viz_resp = None
+    try:
+        with page.expect_response(
+            lambda r: _is_gen_viz_url(r.url),
+            timeout=cfg.gen_viz_timeout_ms,
+        ) as gv_info:
+            try:
+                target = gv_btn.last
+                target.scroll_into_view_if_needed(timeout=3000)
+                target.click(timeout=5000)
+                qresult.notes.append("clicked Generate Visualization")
+            except Exception as e:
+                qresult.notes.append(f"Generate Visualization click failed: {e}")
+                raise
+        gen_viz_resp = gv_info.value
+        qresult.notes.append(f"generate-viz HTTP {gen_viz_resp.status} {gen_viz_resp.url}")
+    except PWTimeoutError:
+        qresult.notes.append(f"generate-viz TIMEOUT after {cfg.gen_viz_timeout_ms}ms")
+        qresult.timed_out = True
+        qresult.validations["timed_out_on"] = "generate-viz"
+    except Exception as e:
+        qresult.notes.append(f"generate-viz expect_response error: {type(e).__name__}: {e}")
+
+    page.wait_for_timeout(2000)
+    viz_snapshot = recorder.snapshot_after(viz_started_iso)
+    if gen_viz_resp is not None:
+        for c in viz_snapshot:
+            if c.classification == "generate-viz" and c.url == gen_viz_resp.url and c.finished_at:
+                qresult.generate_viz_call = c
+                break
+    if qresult.generate_viz_call is None:
+        for c in viz_snapshot:
+            if c.classification == "generate-viz" and c.finished_at:
+                qresult.generate_viz_call = c
+                break
+        # Fall back to request-only (timeout case)
+        if qresult.generate_viz_call is None:
+            for c in viz_snapshot:
+                if c.classification == "generate-viz":
+                    qresult.generate_viz_call = c
+                    qresult.notes.append("generate-viz captured request-only (no response received)")
+                    break
+
+    qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_03_viz.png"))
+
+
+def _screenshot(page: Page, path: Path) -> str:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(path), full_page=True)
+        return str(path)
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def validate_query(qr: QueryResult) -> None:
+    v: dict[str, Any] = dict(qr.validations or {})
+
+    # Back-fill from qr.calls when expect_response missed by a few ms.
+    # First try finished calls, then fall back to request-only (timeout case).
+    if qr.run_sql_call is None:
+        for c in qr.calls:
+            if c.classification == "run-sql" and c.finished_at:
+                qr.run_sql_call = c
+                qr.notes.append("run-sql back-filled from calls list")
+                break
+        if qr.run_sql_call is None:
+            for c in qr.calls:
+                if c.classification == "run-sql":
+                    qr.run_sql_call = c
+                    qr.notes.append("run-sql back-filled (request-only, no response)")
+                    break
+    if qr.generate_viz_call is None and v.get("viz_button_present"):
+        for c in qr.calls:
+            if c.classification == "generate-viz" and c.finished_at:
+                qr.generate_viz_call = c
+                qr.notes.append("generate-viz back-filled from calls list")
+                break
+    if qr.generate_sql_call is None:
+        for c in qr.calls:
+            if c.classification == "generate-sql":
+                qr.generate_sql_call = c
+                break
+
+    rs = qr.run_sql_call
+    if not rs:
+        v.update({
+            "run_sql_present": False,
+            "run_sql_status_ok": False,
+            "run_sql_has_rows": False,
+            "run_sql_columns": [],
+        })
+    else:
+        v["run_sql_present"] = True
+        v["run_sql_status_ok"] = bool(rs.status and 200 <= rs.status < 300)
+        cols, rc, hr = extract_table_shape(rs.response_body)
+        v["run_sql_columns"] = cols
+        v["run_sql_empty_named_columns"] = sum(1 for c in cols if not str(c).strip())
+        v["run_sql_row_count"] = rc
+        v["run_sql_has_rows"] = hr
+        v["run_sql_returned_sql"] = extract_returned_sql(rs.response_body)
+        v["run_sql_response_keys"] = list(rs.response_body.keys()) if isinstance(rs.response_body, dict) else None
+
+    gv = qr.generate_viz_call
+    if not gv:
+        v.update({
+            "generate_viz_present": False,
+            "generate_viz_status_ok": False,
+            "generate_viz_has_chart": False,
+        })
+    else:
+        v["generate_viz_present"] = True
+        v["generate_viz_status_ok"] = bool(gv.status and 200 <= gv.status < 300)
+        v["generate_viz_response_keys"] = list(gv.response_body.keys()) if isinstance(gv.response_body, dict) else None
+        chart = inspect_chart_payload(gv.response_body)
+        v.update({
+            "generate_viz_has_chart": chart["has_chart"],
+            "generate_viz_chart_type": chart["chart_type"],
+            "generate_viz_chart_title": chart["chart_title"],
+            "generate_viz_x_axis": chart["x_axis"],
+            "generate_viz_y_axis": chart["y_axis"],
+            "generate_viz_x_axis_label": chart["x_axis_label"],
+            "generate_viz_y_axis_label": chart["y_axis_label"],
+            "generate_viz_columns": chart["columns"],
+            "generate_viz_data_points": chart["data_points"],
+            "generate_viz_visualizations_count": chart["visualizations_count"],
+        })
+
+    rs_norm = [c.lower() for c in (v.get("run_sql_columns") or [])]
+    gv_norm = [c.lower() for c in (v.get("generate_viz_columns") or [])]
+    if rs_norm and gv_norm:
+        synced = set(rs_norm).issubset(set(gv_norm)) or set(gv_norm).issubset(set(rs_norm))
+        v["columns_synced_run_sql_vs_generate_viz"] = synced
+        v["column_intersection"] = sorted(set(rs_norm) & set(gv_norm))
+        v["column_only_in_run_sql"] = sorted(set(rs_norm) - set(gv_norm))
+        v["column_only_in_generate_viz"] = sorted(set(gv_norm) - set(rs_norm))
+    else:
+        v["columns_synced_run_sql_vs_generate_viz"] = None
+
+    qr.validations = v
+
+    fails: list[str] = []
+    warns: list[str] = []
+    if not v.get("run_sql_present"):
+        fails.append("run-sql call missing")
+    elif not v.get("run_sql_status_ok"):
+        fails.append(f"run-sql HTTP {qr.run_sql_call.status if qr.run_sql_call else 'n/a'}")
+    elif not v.get("run_sql_has_rows"):
+        warns.append("run-sql returned no rows")
+
+    viz_button_present = v.get("viz_button_present")
+    if viz_button_present is False:
+        v["viz_skipped_reason"] = "Generate Visualization button not rendered (single-column / non-chartable result)"
+    elif not v.get("generate_viz_present"):
+        fails.append("generate-viz call missing")
+    elif not v.get("generate_viz_status_ok"):
+        fails.append(f"generate-viz HTTP {qr.generate_viz_call.status if qr.generate_viz_call else 'n/a'}")
+    elif not v.get("generate_viz_has_chart"):
+        warns.append("generate-viz returned no usable chart payload")
+
+    if v.get("columns_synced_run_sql_vs_generate_viz") is False:
+        warns.append("columns differ between run-sql and generate-viz")
+    if v.get("run_sql_empty_named_columns"):
+        warns.append(f"run-sql returned {v['run_sql_empty_named_columns']} column(s) with empty/missing name (SQL aliasing bug)")
+
+    if qr.timed_out:
+        qr.overall_status = "TIMEOUT"
+    elif fails:
+        qr.overall_status = "FAIL"
+    elif warns:
+        qr.overall_status = "PARTIAL"
+    else:
+        qr.overall_status = "PASS"
+    v["fail_reasons"] = fails
+    v["warn_reasons"] = warns
+
+
+def extract_table_shape(body: Any) -> tuple[list[str], int, bool]:
+    cols: list[str] = []
+    row_count = 0
+    if isinstance(body, dict):
+        if isinstance(body.get("columns"), list) and body["columns"]:
+            cols = [str(c) for c in body["columns"]]
+        for k in ("data", "rows", "result", "results", "records"):
+            v = body.get(k)
+            if isinstance(v, list):
+                row_count = len(v)
+                if v and isinstance(v[0], dict) and not cols:
+                    cols = list(v[0].keys())
+                break
+    elif isinstance(body, list) and body:
+        row_count = len(body)
+        if isinstance(body[0], dict):
+            cols = list(body[0].keys())
+    return cols, row_count, row_count > 0
+
+
+def extract_returned_sql(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    for k in ("sql", "query", "sql_query", "executed_sql", "generated_sql"):
+        if isinstance(body.get(k), str):
+            return body[k]
+    return None
+
+
+def inspect_chart_payload(body: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "has_chart": False,
+        "chart_type": None,
+        "chart_title": None,
+        "x_axis_label": None,
+        "y_axis_label": None,
+        "x_axis_columns": [],
+        "y_axis_columns": [],
+        "x_axis": None,
+        "y_axis": None,
+        "columns": [],
+        "data_points": 0,
+        "visualizations_count": 0,
+    }
+    if not isinstance(body, dict):
+        return out
+
+    visualizations = None
+    rb = body.get("responseBody")
+    if isinstance(rb, dict):
+        d = rb.get("data")
+        if isinstance(d, dict):
+            v = d.get("visualizations")
+            if isinstance(v, list):
+                visualizations = v
+    if visualizations is None and isinstance(body.get("visualizations"), list):
+        visualizations = body["visualizations"]
+
+    if visualizations:
+        out["visualizations_count"] = len(visualizations)
+        first = visualizations[0]
+        if isinstance(first, dict):
+            out["chart_type"] = first.get("chart_type") or first.get("type")
+            out["chart_title"] = first.get("chart_title") or first.get("title")
+            cfg = first.get("chart_config") or {}
+            xa = cfg.get("x_axis") or {}
+            ya = cfg.get("y_axis") or {}
+            out["x_axis_label"] = xa.get("label")
+            out["y_axis_label"] = ya.get("label")
+            x_cols = xa.get("columns") or []
+            y_cols = ya.get("columns") or []
+            out["x_axis_columns"] = list(x_cols) if isinstance(x_cols, list) else []
+            out["y_axis_columns"] = list(y_cols) if isinstance(y_cols, list) else []
+            out["x_axis"] = out["x_axis_columns"][0] if out["x_axis_columns"] else None
+            out["y_axis"] = out["y_axis_columns"][0] if out["y_axis_columns"] else None
+            out["columns"] = out["x_axis_columns"] + out["y_axis_columns"]
+        out["has_chart"] = bool(out["chart_type"] or out["columns"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main run loop
+# ---------------------------------------------------------------------------
+def save_query_result(qr: QueryResult, output_dir: Path) -> Path:
+    results_dir = output_dir / "results"
+    network_dir = output_dir / "network_logs"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    network_dir.mkdir(parents=True, exist_ok=True)
+    payload = asdict(qr)
+    out = results_dir / f"q{qr.id:02d}.json"
+    out.write_text(json.dumps(payload, indent=2, default=str))
+    (network_dir / f"q{qr.id:02d}_calls.json").write_text(
+        json.dumps([asdict(c) for c in qr.calls], indent=2, default=str)
+    )
+    return out
+
+
+def run(cfg: RunConfig) -> dict[str, Any]:
+    """Execute every question in cfg.questions sequentially. Returns a summary dict."""
+    cfg.output_dir = Path(cfg.output_dir)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_dir = cfg.output_dir / "screenshots"
+    screenshot_dir.mkdir(exist_ok=True)
+
+    def log(line: str) -> None:
+        print(line, flush=True)
+        if cfg.on_event:
+            try:
+                cfg.on_event(line)
+            except Exception:
+                pass
+
+    log(f"[run] {len(cfg.questions)} questions")
+    log(f"[run] login_url={cfg.login_url}")
+    log(f"[run] output_dir={cfg.output_dir}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=cfg.headless)
+        context = browser.new_context(
+            ignore_https_errors=True,
+            viewport={"width": 1440, "height": 900},
+        )
+        page = context.new_page()
+        recorder = NetworkRecorder(page)
+
+        try:
+            do_login(page, cfg, log)
+            page = open_sql_agent(page, cfg, log)
+            recorder = NetworkRecorder(page) if page is not context.new_page else recorder
+        except Exception as e:
+            log(f"[run] FATAL during setup: {e}")
+            (cfg.output_dir / "fatal_error.txt").write_text(traceback.format_exc())
+            context.close()
+            browser.close()
+            raise
+
+        all_results: list[QueryResult] = []
+        stopped = False
+        for row in cfg.questions:
+            # User-initiated abort — bail out before starting the next query.
+            if cfg.should_stop and cfg.should_stop():
+                log("[run] STOP requested — aborting before next query")
+                stopped = True
+                break
+            qr = QueryResult(
+                id=row["id"],
+                nl_query=row["natural_language_query"],
+                expected_sql=row.get("expected_sql", ""),
+                started_at=now_iso(),
+            )
+            log(f"\n[q{qr.id:02d}] {qr.nl_query[:80]}")
+            try:
+                start = now_iso()
+                submit_query(page, recorder, cfg, qr, screenshot_dir)
+                qr.calls = recorder.snapshot_after(start)
+                validate_query(qr)
+            except Exception as e:
+                qr.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                qr.overall_status = "FAIL"
+                qr.notes.append(f"unhandled: {e}")
+                qr.screenshots.append(_screenshot(page, screenshot_dir / f"q{qr.id:02d}_99_error.png"))
+
+            qr.finished_at = now_iso()
+            try:
+                qr.total_duration_ms = int(
+                    (datetime.fromisoformat(qr.finished_at) - datetime.fromisoformat(qr.started_at))
+                    .total_seconds() * 1000
+                )
+            except Exception:
+                pass
+            log(f"[q{qr.id:02d}] {qr.overall_status} ({qr.total_duration_ms} ms)")
+            save_query_result(qr, cfg.output_dir)
+            all_results.append(qr)
+
+            if qr.timed_out:
+                try:
+                    log(f"[q{qr.id:02d}] timed out — reloading SQL Agent")
+                    target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
+                    page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+                    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+                    page.wait_for_selector(
+                        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
+                        timeout=30_000,
+                    )
+                except Exception as e:
+                    log(f"[q{qr.id:02d}] reload failed: {e}")
+
+        agg = cfg.output_dir / "all_results.json"
+        agg.write_text(json.dumps([asdict(r) for r in all_results], indent=2, default=str))
+        log(f"\n[done] aggregate: {agg}")
+
+        context.close()
+        browser.close()
+
+    # Summary
+    counts: dict[str, int] = {}
+    for r in all_results:
+        counts[r.overall_status] = counts.get(r.overall_status, 0) + 1
+    return {
+        "total": len(all_results),
+        "status_counts": counts,
+        "output_dir": str(cfg.output_dir),
+        "stopped_by_user": stopped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI entry
+# ---------------------------------------------------------------------------
+def cli() -> None:
+    ap = argparse.ArgumentParser(prog="skylar-qa-runner")
+    ap.add_argument("--login-url", required=True, help="Full login URL e.g. https://host:8443/backoffice/?mid=100")
+    ap.add_argument("--username", required=True)
+    ap.add_argument("--password", required=True)
+    ap.add_argument("--questions", required=True, help="Path to .xlsx of questions (column A = NL question)")
+    ap.add_argument("--output-dir", required=True, help="Directory to write artefacts into")
+    ap.add_argument("--machine-id", default="100")
+    ap.add_argument("--sql-agent-path", default="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent")
+    ap.add_argument("--run-sql-timeout", type=int, default=120_000)
+    ap.add_argument("--gen-viz-timeout", type=int, default=120_000)
+    ap.add_argument("--headless", action="store_true", default=True)
+    ap.add_argument("--no-headless", dest="headless", action="store_false")
+    args = ap.parse_args()
+
+    from app.excel_reader import read_questions
+    questions = read_questions(args.questions)
+
+    cfg = RunConfig(
+        login_url=args.login_url,
+        username=args.username,
+        password=args.password,
+        questions=questions,
+        output_dir=Path(args.output_dir),
+        machine_id=args.machine_id,
+        sql_agent_path=args.sql_agent_path,
+        run_sql_timeout_ms=args.run_sql_timeout,
+        gen_viz_timeout_ms=args.gen_viz_timeout,
+        headless=args.headless,
+    )
+    try:
+        summary = run(cfg)
+        print("\n=== SUMMARY ===")
+        print(json.dumps(summary, indent=2))
+    except KeyboardInterrupt:
+        print("\n[abort] interrupted")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    cli()

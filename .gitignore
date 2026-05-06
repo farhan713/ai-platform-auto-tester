@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.local
+
+# Per-job runtime output (the tool generates this — never check it in)
+runs/
+
+# User-uploaded data persisted at runtime
+data/test_files/
+data/bundles/
+data/presets.json
+data/_preview_*
+
+# Postgres data volume (when using docker-compose)
+skylar_pgdata/
+
+# Legacy artefacts (from the original SQL-only prototype)
+reports/results/
+reports/all_results.json
+reports/REPORT.html
+reports/REPORT.md
+reports/SUMMARY.json
+reports/run.log
+network_logs/
+screenshots/q*.png
+screenshots/debug_*
+data/test_data.json
+
+# IDE / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Smoke-test artefacts
+tests/__pycache__/
+app/__pycache__/
+
+# Claude Code worktrees / local settings (history may contain credentials)
+.claude/
+
+# Local server logs
+/tmp/skylar_server.log
+*.log
+!docs/**/*.log
+
+# Cookie jars from local testing
+*.jar

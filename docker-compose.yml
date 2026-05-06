@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: skylar-qa-db
+    environment:
+      POSTGRES_USER: skylar
+      POSTGRES_PASSWORD: skylar
+      POSTGRES_DB: skylar
+    volumes:
+      - skylar_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skylar -d skylar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  skylar-qa:
+    build: .
+    image: skylar-qa:latest
+    container_name: skylar-qa
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=postgresql://skylar:skylar@db:5432/skylar
+      - SQA_SECRET_KEY=${SQA_SECRET_KEY:-please-set-a-real-secret-in-prod}
+      # Lock down public signups once your team has accounts:
+      - SQA_ALLOW_SIGNUP=${SQA_ALLOW_SIGNUP:-true}
+    restart: unless-stopped
+    shm_size: "1gb"
+
+volumes:
+  skylar_pgdata:

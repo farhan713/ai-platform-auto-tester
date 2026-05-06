@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Test pages{% endblock %}
+{% block header_title %}Test pages{% endblock %}
+{% block header_sub %}— Hosted ssLibrary bundles for users without a public URL{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>Upload a bundle</h2>
+    <p class="meta">
+      Upload your <code>ss-library.bundle.js</code> (or a zip of <code>dist/</code> with both the .js and .css).
+      We'll generate a wrapper page at a private URL so the QA runner can hit it directly — no tunnel needed.
+    </p>
+    <form id="upload-form" class="form" enctype="multipart/form-data">
+      <label>
+        <span class="label-text">Friendly name</span>
+        <input type="text" id="up-name" placeholder="e.g. Acme — staging bundle (Apr 2026)">
+        <small>Helps you recognise this bundle in the dropdown.</small>
+      </label>
+      <label>
+        <span class="label-text">File <em>required</em></span>
+        <input type="file" id="up-file" name="file" accept=".js,.zip" required>
+        <small>Accepts <code>.js</code> (single bundle) or <code>.zip</code> (bundle + CSS + assets).</small>
+      </label>
+      <button type="submit" class="btn btn-primary">↑ Upload bundle</button>
+    </form>
+    <div id="upload-status" class="meta" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Saved bundles</h2>
+    <p class="meta">Each bundle is private to your account. Only you ever see the test URL.</p>
+    <table class="table" id="bundles-table">
+      <thead><tr><th>Name</th><th>Files</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
+      <tbody><tr><td colspan="5" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadBundles() {
+  try {
+    const data = await SQA.fetchJSON('/api/hosted-bundles');
+    const tbody = document.querySelector('#bundles-table tbody');
+    if (!data.bundles.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No saved bundles yet — upload one on the left.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.bundles.map(b => `
+      <tr>
+        <td><b>${SQA.escapeHtml(b.name)}</b><br><span class="meta">${SQA.escapeHtml(b.original_filename || '')}</span><br><span class="meta" style="font-size:11px">main: <code>${SQA.escapeHtml(b.main_js)}</code>${b.main_css ? '  +  <code>'+SQA.escapeHtml(b.main_css)+'</code>' : ''}</span></td>
+        <td>${b.file_count}</td>
+        <td>${formatSize(b.size_bytes)}</td>
+        <td><span class="meta">${SQA.fmtDate(b.uploaded_at)}</span></td>
+        <td style="white-space:nowrap">
+          <a class="btn btn-sm" href="${SQA.escapeHtml(b.test_url)}" target="_blank">Open page ↗</a>
+          <a class="btn btn-sm btn-primary" href="/runs/new?bundle_id=${encodeURIComponent(b.id)}">Use →</a>
+          <button type="button" class="btn btn-sm btn-danger" data-id="${SQA.escapeHtml(b.id)}">Delete</button>
+        </td>
+      </tr>`).join('');
+    tbody.querySelectorAll('button[data-id]').forEach(btn => btn.addEventListener('click', async () => {
+      const name = btn.closest('tr').querySelector('b').textContent;
+      if (!confirm(`Delete bundle "${name}"?\nFiles already used in past runs are not affected.`)) return;
+      try {
+        await SQA.fetchJSON('/api/hosted-bundles/' + btn.dataset.id, { method: 'DELETE' });
+        SQA.toast('Bundle deleted', 'success'); loadBundles();
+      } catch (e) { SQA.toast(e.message, 'error'); }
+    }));
+  } catch (e) { SQA.toast(e.message, 'error'); }
+}
+
+document.getElementById('upload-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const file = document.getElementById('up-file').files[0];
+  if (!file) return;
+  const name = document.getElementById('up-name').value.trim() || file.name;
+  const status = document.getElementById('upload-status');
+  status.textContent = 'Uploading ' + file.name + '…';
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('name', name);
+  try {
+    const r = await SQA.fetchJSON('/api/hosted-bundles', { method: 'POST', body: fd });
+    status.innerHTML = `Saved <b>${SQA.escapeHtml(r.bundle.name)}</b> — <code>${SQA.escapeHtml(r.bundle.main_js)}</code> + ${r.bundle.main_css ? '<code>'+SQA.escapeHtml(r.bundle.main_css)+'</code>' : '(no CSS)'}.`;
+    document.getElementById('upload-form').reset();
+    SQA.toast('Bundle saved', 'success');
+    loadBundles();
+  } catch (err) {
+    status.innerHTML = '<span style="color:var(--fail)">Upload failed: ' + SQA.escapeHtml(err.message) + '</span>';
+  }
+});
+
+function formatSize(b) {
+  if (!b) return '—';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1024 / 1024).toFixed(1) + ' MB';
+}
+loadBundles();
+</script>
+{% endblock %}

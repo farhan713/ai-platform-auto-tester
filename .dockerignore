@@ -1,0 +1,26 @@
+# Skip everything not needed inside the image
+.git
+.gitignore
+.claude
+.vscode
+.idea
+
+# Per-job output never belongs in the image — mounted as a volume
+runs/
+
+# Python noise
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Docs and dev-only assets aren't needed at runtime
+docs/
+tests/legacy/
+*.docx
+USER_GUIDE.md
+SETUP.md

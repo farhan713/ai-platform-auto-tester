@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block header_title %}Runs{% endblock %}
+{% block header_sub %}— All QA runs, searchable{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="toolbar">
+    <input type="search" id="filter-q" placeholder="Search by URL, ID, status…">
+    <select id="filter-status">
+      <option value="">All statuses</option>
+      <option value="running">Running</option>
+      <option value="done">Done</option>
+      <option value="failed">Failed</option>
+      <option value="stopped">Stopped</option>
+      <option value="queued">Queued</option>
+    </select>
+    <span class="meta" id="result-count" style="margin-left:auto"></span>
+  </div>
+  <div style="overflow-x:auto">
+    <table class="table" id="runs-table">
+      <thead>
+        <tr>
+          <th>Run ID</th>
+          <th>Login URL</th>
+          <th>Started</th>
+          <th>Questions</th>
+          <th>Outcome</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="7" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let allRuns = [];
+
+async function loadRuns() {
+  try {
+    const data = await SQA.fetchJSON('/api/runs');
+    allRuns = data.runs || [];
+    render();
+  } catch (e) {
+    SQA.toast('Failed to load runs: ' + e.message, 'error');
+  }
+}
+function render() {
+  const q = (document.getElementById('filter-q').value || '').toLowerCase();
+  const st = document.getElementById('filter-status').value;
+  let rows = allRuns;
+  if (st) rows = rows.filter(r => (r.status||'').toLowerCase() === st);
+  if (q) rows = rows.filter(r =>
+    (r.id||'').toLowerCase().includes(q) ||
+    (r.login_url||'').toLowerCase().includes(q) ||
+    (r.username||'').toLowerCase().includes(q)
+  );
+
+  document.getElementById('result-count').textContent = `${rows.length} of ${allRuns.length}`;
+
+  const tbody = document.querySelector('#runs-table tbody');
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No matching runs.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const s = r.summary || {};
+    const total = (s.PASS||0)+(s.PARTIAL||0)+(s.FAIL||0)+(s.TIMEOUT||0);
+    const passPct = total ? ((s.PASS||0)/total*100).toFixed(0) : '—';
+    return `
+    <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(r.id)}'">
+      <td><code>${SQA.escapeHtml(r.id.slice(0, 22))}</code></td>
+      <td><span class="meta" style="word-break:break-all">${SQA.escapeHtml(r.login_url || '')}</span></td>
+      <td><span class="meta">${SQA.fmtDate(r.created_at)}</span></td>
+      <td>${r.question_count || '—'}</td>
+      <td>
+        <span style="color:var(--pass)">${s.PASS||0}P</span> ·
+        <span style="color:var(--partial)">${s.PARTIAL||0}W</span> ·
+        <span style="color:var(--fail)">${s.FAIL||0}F</span> ·
+        <span style="color:var(--timeout)">${s.TIMEOUT||0}T</span>
+        ${total ? `<span class="meta">(${passPct}%)</span>` : ''}
+      </td>
+      <td><span class="badge ${(r.status||'').toUpperCase()}">${SQA.escapeHtml(r.status||'?')}</span></td>
+      <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(r.id)}">Open →</a></td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('filter-q').addEventListener('input', render);
+document.getElementById('filter-status').addEventListener('change', render);
+loadRuns();
+</script>
+{% endblock %}

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}Sign in{% endblock %} — Skylar IQ QA Tool</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script>
+(function () {
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('skylar.theme') || 'light'); } catch (e) {}
+})();
+</script>
+<style>
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; background: var(--bg); }
+  .auth-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-md); padding: 32px; max-width: 420px; width: 100%; }
+  .auth-card h1 { margin-top: 0; font-size: 22px; color: var(--brand); }
+  .auth-card .brand-row { display:flex; align-items:center; gap:8px; margin-bottom: 16px; }
+  .auth-card .brand-row .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--pass); box-shadow:0 0 8px var(--pass); }
+  .err { background: #fee; border-left: 3px solid var(--fail); color: var(--fail); padding: 8px 12px; border-radius: 4px; font-size: 13px; margin-bottom: 12px; }
+  .ok  { background: #effaf0; border-left: 3px solid var(--pass); color: var(--pass); padding: 8px 12px; border-radius: 4px; font-size: 13px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="auth-card">
+  <div class="brand-row"><span class="dot"></span><b>Skylar IQ QA</b></div>
+  {% block content %}{% endblock %}
+</div>
+</body>
+</html>

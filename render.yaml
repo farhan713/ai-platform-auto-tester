@@ -1,0 +1,34 @@
+# One-click Render.com deployment.
+#
+# Usage: push this repo to a Git host (GitHub/GitLab), then in Render:
+#   New → Blueprint → connect your repo. Render reads this file and creates the service + disk.
+#
+# Free tier note: Render's free Web Service tier sleeps after 15 min idle and has only 512 MB RAM,
+# which is too little for Playwright/Chromium. Use the "Starter" plan ($7/mo) at minimum.
+databases:
+  - name: skylar-qa-db
+    plan: starter
+    databaseName: skylar
+    user: skylar
+
+services:
+  - type: web
+    name: skylar-qa
+    env: docker
+    plan: starter
+    region: oregon
+    healthCheckPath: /login
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: skylar-qa-db
+          property: connectionString
+      - key: SQA_SECRET_KEY
+        generateValue: true
+      - key: SQA_ALLOW_SIGNUP
+        value: "true"   # set to "false" after your admin has signed up
+    disk:
+      name: skylar-qa-data
+      mountPath: /app/runs
+      sizeGB: 5
