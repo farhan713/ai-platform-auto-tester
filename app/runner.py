@@ -258,6 +258,42 @@ class NetworkRecorder:
                 out.append(c)
         return out
 
+    def prune_before(self, cutoff_iso: str) -> int:
+        """Drop calls that started before ``cutoff_iso``.
+
+        Without this, ``self._calls`` accumulates every XHR/fetch (with full
+        parsed JSON bodies) for the entire run. After 5-6 SQL Agent queries a
+        single ``run-sql`` response can be megabytes, and the heap pressure
+        crashes the Chromium tab — which then makes every subsequent question
+        fail with ``TargetClosedError`` because the page is dead. Calling
+        this at the start of each iteration keeps memory bounded.
+        """
+        keep_calls: dict[str, CapturedCall] = {}
+        keep_order: list[str] = []
+        dropped = 0
+        for rid in self._order:
+            c = self._calls.get(rid)
+            if not c:
+                continue
+            if c.started_at >= cutoff_iso:
+                keep_calls[rid] = c
+                keep_order.append(rid)
+            else:
+                dropped += 1
+        self._calls = keep_calls
+        self._order = keep_order
+        return dropped
+
+    def detach(self) -> None:
+        """Detach event listeners — call before discarding a dead page so
+        Playwright can release the underlying CDP session."""
+        try:
+            self.page.remove_listener("request", self._on_request)
+            self.page.remove_listener("response", self._on_response)
+            self.page.remove_listener("requestfailed", self._on_failed)
+        except Exception:
+            pass
+
 
 # Celerant URL fixer — same mechanism as in runner_sitesearch.py. The Celerant
 # back-office SPA also calls /sql_agent/generate_sql/<id>/-1/<token> which now
@@ -815,28 +851,86 @@ def run(cfg: RunConfig) -> dict[str, Any]:
     log(f"[run] login_url={cfg.login_url}")
     log(f"[run] output_dir={cfg.output_dir}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=cfg.headless)
-        context = browser.new_context(
-            ignore_https_errors=True,
-            viewport={"width": 1440, "height": 900},
+    # How often to reload the SQL Agent page to flush the chat-history DOM
+    # (the SPA keeps every previous turn, including big tables and charts, in
+    # the page — that grows memory linearly per question).
+    RELOAD_EVERY = 5
+    # When the page or browser dies (Chromium tab crash from memory pressure,
+    # network blip, etc.) we re-launch from scratch instead of letting every
+    # remaining question fail with TargetClosedError.
+    MAX_RECOVERIES = 3
+
+    def _is_page_alive(pg: Page) -> bool:
+        try:
+            return not pg.is_closed()
+        except Exception:
+            return False
+
+    def _looks_like_target_closed(exc: BaseException) -> bool:
+        name = type(exc).__name__
+        msg = str(exc)
+        return (
+            "TargetClosedError" in name
+            or "Target page, context or browser has been closed" in msg
+            or "Browser has been closed" in msg
         )
-        page = context.new_page()
-        recorder = NetworkRecorder(page)
+
+    with sync_playwright() as p:
+        def _launch():
+            br = p.chromium.launch(headless=cfg.headless)
+            ctx = br.new_context(
+                ignore_https_errors=True,
+                viewport={"width": 1440, "height": 900},
+            )
+            pg = ctx.new_page()
+            rec = NetworkRecorder(pg)
+            return br, ctx, pg, rec
+
+        browser, context, page, recorder = _launch()
 
         try:
             do_login(page, cfg, log)
             page = open_sql_agent(page, cfg, log)
-            recorder = NetworkRecorder(page) if page is not context.new_page else recorder
         except Exception as e:
             log(f"[run] FATAL during setup: {e}")
             (cfg.output_dir / "fatal_error.txt").write_text(traceback.format_exc())
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
             raise
+
+        def _recover() -> tuple[Any, Any, Page, NetworkRecorder]:
+            """Tear down the dead browser and bring up a fresh one re-logged-in
+            on the SQL Agent page. Raises on failure."""
+            log("[recover] tearing down dead browser/context")
+            try:
+                recorder.detach()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            log("[recover] launching fresh browser + re-login")
+            br, ctx, pg, rec = _launch()
+            do_login(pg, cfg, log)
+            pg = open_sql_agent(pg, cfg, log)
+            log("[recover] ready")
+            return br, ctx, pg, rec
 
         all_results: list[QueryResult] = []
         stopped = False
+        recoveries_used = 0
+        successful_since_reload = 0
         for row in cfg.questions:
             # User-initiated abort — bail out before starting the next query.
             if cfg.should_stop and cfg.should_stop():
@@ -850,8 +944,45 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 started_at=now_iso(),
             )
             log(f"\n[q{qr.id:02d}] {qr.nl_query[:80]}")
+
+            # Liveness check — if the previous iteration killed the page,
+            # rebuild the browser before trying this question. Without this,
+            # every remaining question fails with TargetClosedError on the
+            # very first locator call.
+            if not _is_page_alive(page):
+                if recoveries_used >= MAX_RECOVERIES:
+                    qr.error = "page died and recovery budget exhausted"
+                    qr.overall_status = "FAIL"
+                    qr.notes.append(f"recoveries used: {recoveries_used}/{MAX_RECOVERIES}")
+                    qr.finished_at = now_iso()
+                    save_query_result(qr, cfg.output_dir)
+                    all_results.append(qr)
+                    continue
+                try:
+                    log(f"[q{qr.id:02d}] page is closed — recovering "
+                        f"(recovery {recoveries_used + 1}/{MAX_RECOVERIES})")
+                    browser, context, page, recorder = _recover()
+                    recoveries_used += 1
+                    successful_since_reload = 0
+                except Exception as e:
+                    log(f"[q{qr.id:02d}] recovery failed: {e}")
+                    qr.error = f"recovery failed: {type(e).__name__}: {e}"
+                    qr.overall_status = "FAIL"
+                    qr.notes.append("page died and recovery failed")
+                    qr.finished_at = now_iso()
+                    save_query_result(qr, cfg.output_dir)
+                    all_results.append(qr)
+                    continue
+
             try:
                 start = now_iso()
+                # Bound recorder memory: drop everything captured before this
+                # query started. The previous query's calls were already saved
+                # into qr.calls + serialized to disk, so we don't need them
+                # in the live buffer anymore.
+                dropped = recorder.prune_before(start)
+                if dropped:
+                    qr.notes.append(f"recorder pruned {dropped} stale calls")
                 submit_query(page, recorder, cfg, qr, screenshot_dir)
                 qr.calls = recorder.snapshot_after(start)
                 validate_query(qr)
@@ -859,7 +990,18 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 qr.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 qr.overall_status = "FAIL"
                 qr.notes.append(f"unhandled: {e}")
-                qr.screenshots.append(_screenshot(page, screenshot_dir / f"q{qr.id:02d}_99_error.png"))
+                # Page died during this query — leave the screenshot attempt
+                # off (it would just throw again) and let the next iteration
+                # trigger _recover().
+                if _looks_like_target_closed(e) or not _is_page_alive(page):
+                    qr.notes.append("page closed mid-query — will recover for next question")
+                else:
+                    try:
+                        qr.screenshots.append(
+                            _screenshot(page, screenshot_dir / f"q{qr.id:02d}_99_error.png")
+                        )
+                    except Exception:
+                        pass
 
             qr.finished_at = now_iso()
             try:
@@ -873,7 +1015,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             save_query_result(qr, cfg.output_dir)
             all_results.append(qr)
 
-            if qr.timed_out:
+            if qr.timed_out and _is_page_alive(page):
                 try:
                     log(f"[q{qr.id:02d}] timed out — reloading SQL Agent")
                     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
@@ -883,15 +1025,43 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                         'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
                         timeout=30_000,
                     )
+                    successful_since_reload = 0
                 except Exception as e:
                     log(f"[q{qr.id:02d}] reload failed: {e}")
+            elif qr.overall_status == "PASS" and _is_page_alive(page):
+                successful_since_reload += 1
+                # Periodic reload to flush the chat-history DOM. Without this,
+                # the SPA's accumulated turns (each with table + chart) keep
+                # eating memory until the tab crashes — typically around the
+                # 6th-7th question on tenants with large result sets.
+                if successful_since_reload >= RELOAD_EVERY:
+                    try:
+                        log(f"[mem] reloading SQL Agent after {successful_since_reload} "
+                            f"successful queries (flushing chat DOM)")
+                        target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
+                        page.goto(target, wait_until="domcontentloaded",
+                                  timeout=cfg.page_load_timeout_ms)
+                        page.wait_for_selector(
+                            'input[placeholder*="sales question" i], '
+                            'textarea[placeholder*="sales question" i]',
+                            timeout=30_000,
+                        )
+                        successful_since_reload = 0
+                    except Exception as e:
+                        log(f"[mem] periodic reload failed: {e}")
 
         agg = cfg.output_dir / "all_results.json"
         agg.write_text(json.dumps([asdict(r) for r in all_results], indent=2, default=str))
         log(f"\n[done] aggregate: {agg}")
 
-        context.close()
-        browser.close()
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     # Summary
     counts: dict[str, int] = {}
