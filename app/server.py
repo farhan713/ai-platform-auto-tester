@@ -421,6 +421,49 @@ def _all_results_for_run(run_id: str) -> list[dict[str, Any]]:
     return [r["record"] for r in rows]
 
 
+def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
+    """Slim per-query summary used by the run dashboard tabs.
+
+    The full ``record`` JSONB carries every captured XHR/fetch (headers +
+    full response bodies, including multi-MB run-sql payloads). For runs
+    with hundreds of queries that adds up to hundreds of MB of JSON shipped
+    on every dashboard refresh, which freezes the browser before it can
+    even show the list. The dashboard only needs status, timing, validation
+    reasons, and a per-call classification/status/duration count for the
+    Network tab — so we project out exactly those fields here.
+    """
+    rows = db.fetch_all(
+        "SELECT record FROM query_results WHERE run_id = %s ORDER BY qid", (run_id,))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        rec = row["record"] or {}
+        v = rec.get("validations") or {}
+        rs = rec.get("run_sql_call") or {}
+        gv = rec.get("generate_viz_call") or {}
+        slim_calls = []
+        for c in (rec.get("calls") or []):
+            slim_calls.append({
+                "classification": c.get("classification"),
+                "status": c.get("status"),
+                "duration_ms": c.get("duration_ms"),
+            })
+        out.append({
+            "id": rec.get("id"),
+            "nl_query": rec.get("nl_query"),
+            "overall_status": rec.get("overall_status"),
+            "total_duration_ms": rec.get("total_duration_ms"),
+            "validations": {
+                "fail_reasons": v.get("fail_reasons") or [],
+                "warn_reasons": v.get("warn_reasons") or [],
+                "run_sql_row_count": v.get("run_sql_row_count"),
+            },
+            "run_sql_call": {"status": rs.get("status")} if rs else None,
+            "generate_viz_call": {"status": gv.get("status")} if gv else None,
+            "calls": slim_calls,
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Background runner
 # ---------------------------------------------------------------------------
@@ -743,6 +786,16 @@ def job_status(job_id: str):
 def job_results(job_id: str):
     if not _run_owned_by_current_user(job_id): abort(404)
     return jsonify({"results": _all_results_for_run(job_id)})
+
+
+@app.route("/jobs/<job_id>/results-summary")
+@auth.login_required
+def job_results_summary(job_id: str):
+    """Slim version of /results — used by the dashboard tabs (Overview,
+    All queries, Network) to keep payload size bounded for large runs.
+    Drops headers/bodies/etc; keeps the fields the UI actually renders."""
+    if not _run_owned_by_current_user(job_id): abort(404)
+    return jsonify({"results": _all_results_summary_for_run(job_id)})
 
 
 @app.route("/jobs/<job_id>/events")

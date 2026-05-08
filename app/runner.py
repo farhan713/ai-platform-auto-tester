@@ -853,12 +853,16 @@ def run(cfg: RunConfig) -> dict[str, Any]:
 
     # How often to reload the SQL Agent page to flush the chat-history DOM
     # (the SPA keeps every previous turn, including big tables and charts, in
-    # the page — that grows memory linearly per question).
-    RELOAD_EVERY = 5
+    # the page — that grows memory linearly per question). 3 is aggressive
+    # enough that we never let the chat get fat enough to crash on tenants
+    # with large run-sql results.
+    RELOAD_EVERY = 3
     # When the page or browser dies (Chromium tab crash from memory pressure,
     # network blip, etc.) we re-launch from scratch instead of letting every
-    # remaining question fail with TargetClosedError.
-    MAX_RECOVERIES = 3
+    # remaining question fail with TargetClosedError. Budget scales with the
+    # run size so a 1500-question run isn't capped at a handful of recoveries
+    # the way a flat constant would be.
+    MAX_RECOVERIES = max(20, len(cfg.questions) // 20)
 
     def _is_page_alive(pg: Page) -> bool:
         try:

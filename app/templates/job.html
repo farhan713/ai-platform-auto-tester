@@ -149,6 +149,16 @@ const headerStatus = document.getElementById('header-status');
 let outcomeChart = null;
 let allResults = [];   // every per-query JSON we've fetched
 let firstLoad = true;
+// In-flight guards. setInterval fires every 4s; if a previous fetch is still
+// pending (slow network, big run, server under load) we MUST NOT start
+// another one — Chromium has a per-origin connection cap (~6) and stacking
+// pending fetches blows past it, eventually returning ERR_INSUFFICIENT_RESOURCES
+// for every request including style.css. Seen in production on a 1538-query
+// run where the dashboard locked up after ~15 minutes.
+let _statusInFlight = false;
+let _resultsInFlight = false;
+let _resultsLastFetched = 0;
+const RESULTS_MIN_INTERVAL_MS = 8000;  // throttle big-payload endpoint
 
 // ---- Stop button -----------------------------------------------------------
 stopBtn.addEventListener('click', async () => {
@@ -161,6 +171,8 @@ stopBtn.addEventListener('click', async () => {
 
 // ---- Live status (counts + last5 + stop button visibility) -----------------
 function refreshStatus() {
+  if (_statusInFlight) return;  // skip tick if previous still pending
+  _statusInFlight = true;
   fetch(`/jobs/${jobId}/status`).then(r => r.json()).then(s => {
     document.getElementById('cnt-PASS').textContent = s.counts.PASS || 0;
     document.getElementById('cnt-PARTIAL').textContent = s.counts.PARTIAL || 0;
@@ -192,21 +204,34 @@ function refreshStatus() {
       dlf.textContent = '↓ Download failed queries (' + failCount + ')';
     }
     refreshAllResults();
-  }).catch(()=>{});
+  }).catch(()=>{}).finally(() => { _statusInFlight = false; });
 }
 
 // ---- Fetch all per-query results, populate Overview + All Queries tabs -----
 async function refreshAllResults() {
+  // Guard against pile-up: if a previous fetch is still in flight, or the
+  // last successful fetch was very recent, skip this call. Without this,
+  // a slow response stacks up additional fetches every 4s until Chromium
+  // exhausts its connection pool (ERR_INSUFFICIENT_RESOURCES).
+  if (_resultsInFlight) return;
+  if (Date.now() - _resultsLastFetched < RESULTS_MIN_INTERVAL_MS) return;
+  _resultsInFlight = true;
   try {
-    const r = await SQA.fetchJSON(`/jobs/${jobId}/results`);
+    // Use the slim summary endpoint — full /results carries every
+    // captured XHR with full response bodies, which is hundreds of MB
+    // for runs with hundreds of queries and freezes the browser.
+    const r = await SQA.fetchJSON(`/jobs/${jobId}/results-summary`);
     allResults = r.results || [];
     document.getElementById('t-queries-count').textContent = allResults.length;
     renderOverview();
     renderQueries();
     renderNetwork();
     if (firstLoad && allResults.length === 0) firstLoad = false;
+    _resultsLastFetched = Date.now();
   } catch (e) {
     // The endpoint may not exist on older runs — silently skip
+  } finally {
+    _resultsInFlight = false;
   }
 }
 
@@ -332,14 +357,30 @@ function renderNetwork() {
 }
 
 // ---- SSE event stream ------------------------------------------------------
+// Cap how much event-log text we keep in the DOM. A long run (1500+ queries)
+// emits ~10 lines per query — left unbounded the <pre> grows past 1MB and
+// scroll/render starts to stutter on the dashboard.
+const EVENTS_MAX_LINES = 5000;
+let _eventLineCount = 0;
 const es = new EventSource(`/jobs/${jobId}/events`);
 es.onmessage = (e) => {
   if (e.data === '[__end__]') { es.close(); refreshStatus(); SQA.toast('Run complete.', 'success'); return; }
   eventsEl.textContent += e.data + '\n';
+  _eventLineCount++;
+  if (_eventLineCount > EVENTS_MAX_LINES) {
+    // Trim from the top, keep the last ~80% of the cap. Done in chunks so
+    // we don't pay the splice cost on every single line.
+    const lines = eventsEl.textContent.split('\n');
+    const keep = Math.floor(EVENTS_MAX_LINES * 0.8);
+    eventsEl.textContent = '… (older lines trimmed)\n' + lines.slice(-keep).join('\n');
+    _eventLineCount = keep;
+  }
   eventsEl.scrollTop = eventsEl.scrollHeight;
-  if (/^\[q\d+\] (PASS|PARTIAL|FAIL|TIMEOUT)/.test(e.data)) refreshStatus();
+  // Note: no refreshStatus() here — the 4s interval covers it. Calling it
+  // per-query for a 1500-query run added 1500 redundant fetches that the
+  // in-flight guard would skip anyway.
 };
-es.onerror = () => { /* auto-reconnect */ };
+es.onerror = () => { /* auto-reconnect — EventSource paces this itself */ };
 
 refreshStatus();
 setInterval(refreshStatus, 4000);
