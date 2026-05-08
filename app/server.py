@@ -163,6 +163,19 @@ def _job_dir(run_id: str) -> Path:
 _event_queues: dict[str, queue.Queue[str]] = {}
 _stop_events: dict[str, threading.Event] = {}
 
+# Global concurrency cap. Each active run holds an open Playwright Chromium
+# (~600 MB - 1 GB resident with the SQL Agent SPA loaded) plus the Python
+# runner thread. Without a cap, N users clicking "Start" within the same
+# minute all spawn Chromium simultaneously and OOM the container — every
+# in-progress run then dies. Excess runs sit in 'queued' status (already
+# the DB default) until a slot opens.
+#
+# Default of 2 fits comfortably in a 4 GiB / 2 vCPU container; bump
+# SQA_MAX_CONCURRENT_RUNS if you size the container up. Setting it to 1
+# fully serialises runs (safest for tight memory).
+MAX_CONCURRENT_RUNS = max(1, int(os.environ.get("SQA_MAX_CONCURRENT_RUNS", "2")))
+_run_slot_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_RUNS)
+
 
 # ---------------------------------------------------------------------------
 # Hosted bundle helpers — uploaded ssLibrary builds for users without a public
@@ -469,8 +482,37 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 def _run_job(run_id: str, cfg: RunConfig) -> None:
     """Run the QA, persist per-query rows + events. Filesystem still holds
-    screenshots/REPORT/etc; DB holds run metadata + per-query JSONB."""
+    screenshots/REPORT/etc; DB holds run metadata + per-query JSONB.
+
+    Acquires a slot from the global semaphore before starting the actual
+    run. Excess concurrent submissions sit here in 'queued' status until
+    an active run finishes. The DB row was already inserted as 'queued'
+    by the /jobs POST handler so it shows up in the dashboard immediately,
+    just without a started_at timestamp until the slot opens.
+    """
+    # Surface "waiting for slot" feedback to the user — the run page is
+    # already loaded and listening on /events when this thread starts.
+    waiting_emitted = False
+    if not _run_slot_semaphore.acquire(blocking=False):
+        _emit(run_id, f"[queued] waiting for a free run slot "
+                      f"(cap = {MAX_CONCURRENT_RUNS} concurrent runs per replica)")
+        waiting_emitted = True
+        # Honour stop while queued — a user can cancel before the run starts.
+        ev = _stop_events.get(run_id)
+        while True:
+            if ev is not None and ev.is_set():
+                _emit(run_id, "[queued] cancelled before slot acquired")
+                db.execute(
+                    "UPDATE runs SET status = 'stopped', finished_at = NOW() WHERE id = %s",
+                    (run_id,),
+                )
+                _emit(run_id, "[__end__]")
+                return
+            if _run_slot_semaphore.acquire(timeout=2.0):
+                break
     try:
+        if waiting_emitted:
+            _emit(run_id, "[queued] slot acquired — starting")
         db.execute(
             "UPDATE runs SET status = 'running', started_at = NOW() WHERE id = %s",
             (run_id,),
@@ -535,6 +577,12 @@ def _run_job(run_id: str, cfg: RunConfig) -> None:
             (str(e), tb, run_id),
         )
     finally:
+        # Always release the slot, even on crash, so the next queued run
+        # can pick it up. BoundedSemaphore guards against double-release.
+        try:
+            _run_slot_semaphore.release()
+        except ValueError:
+            pass
         _emit(run_id, "[__end__]")
 
 
