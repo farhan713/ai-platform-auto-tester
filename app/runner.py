@@ -259,12 +259,58 @@ class NetworkRecorder:
         return out
 
 
+# Celerant URL fixer — same mechanism as in runner_sitesearch.py. The Celerant
+# back-office SPA also calls /sql_agent/generate_sql/<id>/-1/<token> which now
+# requires a trailing slash. Without this fix, the call gets 307'd and the
+# response never lands in the form the SPA expects, so the run-sql call
+# never fires and our runner times out.
+_CELERANT_URL_FIXER = r"""
+(() => {
+  // VERIFIED endpoints that need trailing slash. Adding it elsewhere causes
+  // 404s (run-sql is the canonical example: /backoffice/report/run-sql works,
+  // /backoffice/report/run-sql/ returns 404). Be conservative.
+  const NEEDS_SLASH = [
+    /\/console\/organization_validation\/[^\/?#]+$/,   // JWT exchange
+    /\/sql_agent\/generate_sql\/[^?#]*[^\/]$/,          // NL → SQL LLM call
+  ];
+  function fixURL(url) {
+    if (typeof url !== 'string') return url;
+    if (/[?#]/.test(url)) return url;
+    for (const re of NEEDS_SLASH) if (re.test(url)) return url + '/';
+    return url;
+  }
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    if (typeof input === 'string') input = fixURL(input);
+    else if (input && typeof input === 'object' && 'url' in input) {
+      const fixed = fixURL(input.url);
+      if (fixed !== input.url) input = new Request(fixed, input);
+    }
+    return _origFetch(input, init);
+  };
+  const _origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    return _origOpen.call(this, method, fixURL(url), ...rest);
+  };
+  console.log('[skylar-qa] Celerant URL fixer: trailing slash for /console/organization_validation/ + /sql_agent/generate_sql/ only');
+})();
+"""
+
+
 # ---------------------------------------------------------------------------
 # Login + navigation
 # ---------------------------------------------------------------------------
 def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
+    # Install the fetch/XHR URL fixer BEFORE navigating so it's in place when
+    # the back-office SPA's bundles register their first auth fetches.
+    page.add_init_script(_CELERANT_URL_FIXER)
+    log("[init] Celerant URL fixer installed")
+
     log(f"[login] navigating {cfg.login_url}")
-    page.goto(cfg.login_url, wait_until="load", timeout=cfg.page_load_timeout_ms)
+    # 'domcontentloaded' returns once HTML is parsed; we don't need every
+    # image/font to load before interacting. The previous 'load' event added
+    # ~30-60s on the Celerant login page (lots of static assets).
+    page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
     page.wait_for_selector("#userid", timeout=20_000)
 
     # Wait for jQuery's submit handler to be wired by RequireJS — without it the form does a
@@ -294,11 +340,15 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     except PWTimeoutError:
         page.locator("#btnLogin").click(force=True)
 
+    # Wait for redirect after login (max 30s — the actual redirect happens
+    # within ~5s on a healthy tenant). Don't fall back to networkidle: the
+    # Celerant SPA polls heartbeats so the network is never idle, and we
+    # were burning the full 60s timeout every run for no benefit.
     try:
-        page.wait_for_url(re.compile(r".*wrmsscreen.*"), timeout=cfg.page_load_timeout_ms)
+        page.wait_for_url(re.compile(r".*wrmsscreen.*"), timeout=30_000)
     except PWTimeoutError:
+        # Some tenants land elsewhere — fall through and verify by URL below
         pass
-    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
 
     url = page.url
     if "UserAuthenticationServlet" in url or url == cfg.login_url:
@@ -311,7 +361,8 @@ def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Pa
     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
     log(f"[nav] opening {target}")
     page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
-    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+    # Skip 'networkidle' here — the SPA polls heartbeats and never goes idle.
+    # The wait_for_selector below is a deterministic ready signal.
     page.wait_for_selector(
         'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
         timeout=60_000,
@@ -415,7 +466,7 @@ def submit_query(
     except Exception as e:
         qresult.notes.append(f"run-sql expect_response error: {type(e).__name__}: {e}")
 
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(500)
     # Capture both run-sql and generate-sql from the recorder. We accept calls
     # WITHOUT a finished response too — for TIMEOUT cases the request side has
     # been captured (URL, method, headers, body) and the user still needs to
@@ -444,7 +495,7 @@ def submit_query(
             qresult.generate_sql_call = c
             break
 
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(500)
     qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_02_runsql.png"))
 
     # Generate Visualization is conditional — UI omits it for non-chartable (single-column) results.
@@ -491,7 +542,7 @@ def submit_query(
     except Exception as e:
         qresult.notes.append(f"generate-viz expect_response error: {type(e).__name__}: {e}")
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(700)
     viz_snapshot = recorder.snapshot_after(viz_started_iso)
     if gen_viz_resp is not None:
         for c in viz_snapshot:
@@ -827,7 +878,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                     log(f"[q{qr.id:02d}] timed out — reloading SQL Agent")
                     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
                     page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
-                    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+                    # No networkidle here either — SPA never idles
                     page.wait_for_selector(
                         'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
                         timeout=30_000,

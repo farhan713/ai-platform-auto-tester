@@ -272,6 +272,47 @@ _CRYPTO_POLYFILL = r"""
 """
 
 
+# Celerant's API now requires specific trailing-slash conventions on certain
+# endpoints. The bundles (ssLibrary + SQL Agent SPA) still call the old URL
+# shapes, getting a 307 redirect. Browser fetch() doesn't reliably re-send the
+# POST body across the redirect for cross-origin auth'd requests, so the
+# bundle falls into its .catch and uses an expired hardcoded fallback token.
+# Then every subsequent authed call returns 401/403.
+#
+# Fix: monkey-patch fetch() and XMLHttpRequest so URLs are rewritten to the
+# new canonical shape BEFORE the request goes out — no redirect needed.
+_FETCH_URL_FIXER = r"""
+(() => {
+  // VERIFIED endpoints that require a trailing slash. Adding it elsewhere
+  // causes 404s, so be conservative.
+  const NEEDS_SLASH = [
+    /\/console\/organization_validation\/[^\/?#]+$/,   // JWT exchange
+    /\/sql_agent\/generate_sql\/[^?#]*[^\/]$/,          // NL → SQL LLM call
+  ];
+  function fixURL(url) {
+    if (typeof url !== 'string') return url;
+    if (/[?#]/.test(url)) return url;
+    for (const re of NEEDS_SLASH) if (re.test(url)) return url + '/';
+    return url;
+  }
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    if (typeof input === 'string') input = fixURL(input);
+    else if (input && typeof input === 'object' && 'url' in input) {
+      const fixed = fixURL(input.url);
+      if (fixed !== input.url) input = new Request(fixed, input);
+    }
+    return _origFetch(input, init);
+  };
+  const _origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    return _origOpen.call(this, method, fixURL(url), ...rest);
+  };
+  console.log('[skylar-qa] Celerant URL fixer: trailing slash for /console/organization_validation/ + /sql_agent/generate_sql/ only');
+})();
+"""
+
+
 _INIT_OVERRIDE_TEMPLATE = r"""
 (() => {
   // Override config supplied by the QA tool — injected before the page bundle runs.
@@ -330,6 +371,11 @@ def _install_ss_override(page: Page, cfg: RunConfig, log: Callable[[str], None])
 def open_search_page(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     # Always install the crypto polyfill — site_search runs on HTTP fail without it
     page.add_init_script(_CRYPTO_POLYFILL)
+    # And the Celerant URL fixer (their API gained trailing-slash requirements
+    # on some endpoints; the bundle's old URL shape gets 307 redirected which
+    # doesn't survive fetch's POST-with-credentials handling).
+    page.add_init_script(_FETCH_URL_FIXER)
+    log("[init] Celerant URL fixer installed (auto trailing-slash for affected endpoints)")
     _install_ss_override(page, cfg, log)
     log(f"[nav] opening {cfg.login_url}")
     page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
@@ -344,7 +390,8 @@ def open_search_page(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> 
             log("[init] JWT token obtained")
         except PWTimeoutError:
             log("[init] WARN: JWT token did not arrive within 30s — continuing anyway")
-    page.wait_for_load_state("networkidle", timeout=cfg.page_load_timeout_ms)
+    # Skip 'networkidle' — the page polls + the JWT fetch we already waited for
+    # is enough. The selector wait below is the real ready signal.
     page.wait_for_selector(cfg.search_input_selector, timeout=30_000)
     log(f"[nav] search input '{cfg.search_input_selector}' ready")
 

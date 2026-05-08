@@ -48,6 +48,14 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(results)
     status_counts = Counter(r.get("overall_status", "UNKNOWN") for r in results)
 
+    # Detect test type so the summary uses the right per-endpoint counts
+    is_site_search = any(
+        r.get("search_keywords_call") or r.get("search_results_call")
+        or any(c.get("classification") in ("search-keywords", "search-results")
+               for c in (r.get("calls") or []))
+        for r in results
+    )
+
     rs_present = sum(1 for r in results if r.get("run_sql_call"))
     rs_ok = sum(1 for r in results if r.get("validations", {}).get("run_sql_status_ok"))
     rs_rows = sum(1 for r in results if r.get("validations", {}).get("run_sql_has_rows"))
@@ -55,6 +63,12 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     gv_present = sum(1 for r in results if r.get("generate_viz_call"))
     gv_ok = sum(1 for r in results if r.get("validations", {}).get("generate_viz_status_ok"))
     gv_chart = sum(1 for r in results if r.get("validations", {}).get("generate_viz_has_chart"))
+
+    sk_present = sum(1 for r in results if r.get("search_keywords_call"))
+    sk_ok = sum(1 for r in results if r.get("validations", {}).get("search_keywords_status_ok"))
+    sr_present = sum(1 for r in results if r.get("search_results_call"))
+    sr_ok = sum(1 for r in results if r.get("validations", {}).get("search_results_status_ok"))
+    sr_with_products = sum(1 for r in results if (r.get("validations", {}).get("search_results_count") or 0) > 0)
 
     cs = sum(1 for r in results if r.get("validations", {}).get("columns_synced_run_sql_vs_generate_viz") is True)
     cu = sum(1 for r in results if r.get("validations", {}).get("columns_synced_run_sql_vs_generate_viz") is False)
@@ -85,8 +99,11 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "total_queries": total,
         "status_breakdown": dict(status_counts),
+        "test_type": "site_search" if is_site_search else "sql_agent",
         "run_sql": {"present": rs_present, "http_ok": rs_ok, "with_rows": rs_rows},
         "generate_viz": {"present": gv_present, "http_ok": gv_ok, "with_chart": gv_chart},
+        "search_keywords": {"present": sk_present, "http_ok": sk_ok},
+        "search_results": {"present": sr_present, "http_ok": sr_ok, "with_products": sr_with_products},
         "column_sync": {"synced": cs, "unsynced": cu},
         "performance_ms": {"avg": avg, "max": mx},
         "failing_queries": failing,
@@ -98,8 +115,10 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def render_md(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
     sb = summary["status_breakdown"]
+    is_site_search = summary.get("test_type") == "site_search"
+    title_suffix = "Site Search" if is_site_search else "SQL AI Engine"
     lines: list[str] = []
-    lines.append("# Skylar IQ SQL Agent — Automation QA Report")
+    lines.append(f"# Skylar IQ {title_suffix} — Automation QA Report")
     lines.append(f"_Generated: {summary['generated_at']}_")
     lines.append("")
     lines.append("## 1. Executive Summary")
@@ -115,14 +134,19 @@ def render_md(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
     lines.append("| Endpoint | Captured | HTTP 2xx | Usable payload |")
     lines.append("|---|---|---|---|")
     t = summary["total_queries"]
-    rs = summary["run_sql"]
-    gv = summary["generate_viz"]
-    lines.append(f"| `run-sql` | {rs['present']}/{t} | {rs['http_ok']}/{t} | {rs['with_rows']}/{t} (rows>0) |")
-    lines.append(f"| `generate-viz` | {gv['present']}/{t} | {gv['http_ok']}/{t} | {gv['with_chart']}/{t} (chart) |")
+    if is_site_search:
+        sk = summary["search_keywords"]; sr = summary["search_results"]
+        lines.append(f"| `search-keywords` | {sk['present']}/{t} | {sk['http_ok']}/{t} | — |")
+        lines.append(f"| `search-results` | {sr['present']}/{t} | {sr['http_ok']}/{t} | {sr['with_products']}/{t} (products>0) |")
+    else:
+        rs = summary["run_sql"]; gv = summary["generate_viz"]
+        lines.append(f"| `run-sql` | {rs['present']}/{t} | {rs['http_ok']}/{t} | {rs['with_rows']}/{t} (rows>0) |")
+        lines.append(f"| `generate-viz` | {gv['present']}/{t} | {gv['http_ok']}/{t} | {gv['with_chart']}/{t} (chart) |")
     lines.append("")
-    cs = summary["column_sync"]
-    lines.append(f"### Column-name sync\n- Synced: **{cs['synced']}**, Unsynced: **{cs['unsynced']}**")
-    lines.append("")
+    if not is_site_search:
+        cs = summary["column_sync"]
+        lines.append(f"### Column-name sync\n- Synced: **{cs['synced']}**, Unsynced: **{cs['unsynced']}**")
+        lines.append("")
 
     if summary["failing_queries"]:
         lines.append("## 2. Failing queries")
@@ -149,11 +173,17 @@ def render_md(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
         lines.append(f"### q{r['id']:02d} — {r['nl_query']}")
         lines.append(f"- Status: `{r['overall_status']}` — Duration: {r.get('total_duration_ms')} ms")
         v = r.get("validations", {}) or {}
-        rs_call = r.get("run_sql_call") or {}
-        gv_call = r.get("generate_viz_call") or {}
-        lines.append(f"- run-sql: `{rs_call.get('url','-')}` HTTP {rs_call.get('status','n/a')}, columns={v.get('run_sql_columns')}, rows={v.get('run_sql_row_count')}")
-        lines.append(f"- generate-viz: `{gv_call.get('url','-')}` HTTP {gv_call.get('status','n/a')}, chart_type={v.get('generate_viz_chart_type')}, axes=({v.get('generate_viz_x_axis')}, {v.get('generate_viz_y_axis')})")
-        lines.append(f"- columns_synced: {v.get('columns_synced_run_sql_vs_generate_viz')}")
+        if is_site_search:
+            sk_call = r.get("search_keywords_call") or {}
+            sr_call = r.get("search_results_call") or {}
+            lines.append(f"- search-keywords: `{sk_call.get('url','-')}` HTTP {sk_call.get('status','n/a')}, returned {v.get('search_keywords_count','?')} keyword(s)")
+            lines.append(f"- search-results: `{sr_call.get('url','-')}` HTTP {sr_call.get('status','n/a')}, returned {v.get('search_results_count','?')} product(s)")
+        else:
+            rs_call = r.get("run_sql_call") or {}
+            gv_call = r.get("generate_viz_call") or {}
+            lines.append(f"- run-sql: `{rs_call.get('url','-')}` HTTP {rs_call.get('status','n/a')}, columns={v.get('run_sql_columns')}, rows={v.get('run_sql_row_count')}")
+            lines.append(f"- generate-viz: `{gv_call.get('url','-')}` HTTP {gv_call.get('status','n/a')}, chart_type={v.get('generate_viz_chart_type')}, axes=({v.get('generate_viz_x_axis')}, {v.get('generate_viz_y_axis')})")
+            lines.append(f"- columns_synced: {v.get('columns_synced_run_sql_vs_generate_viz')}")
         if v.get("fail_reasons"):
             lines.append(f"- fail: {v['fail_reasons']}")
         if v.get("warn_reasons"):
@@ -187,7 +217,7 @@ HTML_TMPL = """<!doctype html>
  .num{{font-size:26px;font-weight:700;color:#1a3a6e}}
 </style></head>
 <body>
-<h1>Skylar IQ SQL Agent — Automation QA Report</h1>
+<h1>Skylar IQ {report_title_suffix} — Automation QA Report</h1>
 <p class="meta">Generated: {generated_at}</p>
 
 <h2>1. Executive Summary</h2>
@@ -202,13 +232,7 @@ HTML_TMPL = """<!doctype html>
 </div>
 
 <h3>API health</h3>
-<table>
-<tr><th>Endpoint</th><th>Captured</th><th>HTTP 2xx</th><th>Usable payload</th></tr>
-<tr><td><code>run-sql</code></td><td>{rs_present}/{total}</td><td>{rs_ok}/{total}</td><td>{rs_rows}/{total} (rows&gt;0)</td></tr>
-<tr><td><code>generate-viz</code></td><td>{gv_present}/{total}</td><td>{gv_ok}/{total}</td><td>{gv_chart}/{total} (chart)</td></tr>
-</table>
-<h3>Column-name sync</h3>
-<p>Synced: <b>{cols_synced}</b> &nbsp;|&nbsp; Unsynced: <b>{cols_unsynced}</b></p>
+{api_health_table}
 
 <h2>2. Failing queries ({fail_n})</h2>{fail_list}
 <h2>3. Partial / warnings ({partial_n})</h2>{partial_list}
@@ -336,11 +360,25 @@ def render_html(results: list[dict[str, Any]], summary: dict[str, Any], job_dir:
         for t in summary["timeout_queries"]
     ) + "</ul>" if summary["timeout_queries"] else "<p><i>None.</i></p>"
 
+    # Detect the test type from the first record that has any captured calls.
+    # Site-search runs populate search_keywords_call / search_results_call;
+    # SQL Agent runs populate run_sql_call / generate_viz_call.
+    is_site_search = False
+    for r in results:
+        if r.get("search_keywords_call") or r.get("search_results_call"):
+            is_site_search = True; break
+        for c in r.get("calls") or []:
+            if c.get("classification") in ("search-keywords", "search-results"):
+                is_site_search = True; break
+        if is_site_search: break
+
     parts: list[str] = []
     for r in results:
         v = r.get("validations", {}) or {}
         rs_call = r.get("run_sql_call") or {}
         gv_call = r.get("generate_viz_call") or {}
+        sk_call = r.get("search_keywords_call") or {}
+        sr_call = r.get("search_results_call") or {}
         status = r.get("overall_status", "PENDING")
 
         # Screenshots — emit as relative URLs ("screenshots/qNN_*.png"). When
@@ -405,28 +443,69 @@ def render_html(results: list[dict[str, Any]], summary: dict[str, Any], job_dir:
                 f"{rows}</table></details>"
             )
 
+        # Per-query summary rows — different fields for site_search vs sql_agent
+        if is_site_search:
+            summary_rows = (
+                f"<tr><th>Status</th><td><span class='badge {status}'>{status}</span> &nbsp;Duration: {r.get('total_duration_ms','?')} ms &nbsp;Started: <span class='meta'>{html.escape(str(r.get('started_at') or '-'))}</span></td></tr>"
+                f"<tr><th>search-keywords summary</th><td>HTTP {sk_call.get('status','-')}, returned {v.get('search_keywords_count','-')} keyword(s)</td></tr>"
+                f"<tr><th>search-results summary</th><td>HTTP {sr_call.get('status','-')}, returned {v.get('search_results_count','-')} product(s)</td></tr>"
+                f"<tr><th>fail/warn</th><td>{html.escape(json.dumps(v.get('fail_reasons')))} / {html.escape(json.dumps(v.get('warn_reasons')))}</td></tr>"
+            )
+            call_blocks = (
+                f"{_render_call_block('search-keywords', sk_call, 'Autocomplete keywords endpoint — fires on every keystroke')}"
+                f"{_render_call_block('search-results', sr_call, 'Product results endpoint — fires after keywords resolve')}"
+            )
+        else:
+            summary_rows = (
+                f"<tr><th>Status</th><td><span class='badge {status}'>{status}</span> &nbsp;Duration: {r.get('total_duration_ms','?')} ms &nbsp;Started: <span class='meta'>{html.escape(str(r.get('started_at') or '-'))}</span></td></tr>"
+                f"<tr><th>run-sql summary</th><td>columns: <code>{html.escape(json.dumps(v.get('run_sql_columns')))}</code> rows: {v.get('run_sql_row_count','-')}</td></tr>"
+                f"<tr><th>generate-viz summary</th><td>chart_type: <code>{html.escape(str(v.get('generate_viz_chart_type')))}</code>, axes (<code>{html.escape(str(v.get('generate_viz_x_axis')))}</code>, <code>{html.escape(str(v.get('generate_viz_y_axis')))}</code>)</td></tr>"
+                f"<tr><th>columns synced</th><td><code>{v.get('columns_synced_run_sql_vs_generate_viz')}</code></td></tr>"
+                f"<tr><th>fail/warn</th><td>{html.escape(json.dumps(v.get('fail_reasons')))} / {html.escape(json.dumps(v.get('warn_reasons')))}</td></tr>"
+            )
+            call_blocks = (
+                f"{_render_call_block('generate-sql', r.get('generate_sql_call'), 'NL → SQL conversion (LLM call to celerantai.com)')}"
+                f"{_render_call_block('run-sql', rs_call, 'SQL execution against the tenant database')}"
+                f"{_render_call_block('generate-viz', gv_call, 'Chart generation (LLM call) — fired only when the user clicks Generate Visualization')}"
+            )
+
         parts.append(f"""
 <details {'open' if status != 'PASS' else ''}>
 <summary><span class="badge {status}">{status}</span> <b>q{r['id']:02d}</b> — {html.escape(r['nl_query'])} <span class="meta">({r.get('total_duration_ms','?')} ms)</span></summary>
-<table>
-<tr><th>Status</th><td><span class="badge {status}">{status}</span> &nbsp;Duration: {r.get('total_duration_ms','?')} ms &nbsp;Started: <span class="meta">{html.escape(str(r.get('started_at') or '-'))}</span></td></tr>
-<tr><th>run-sql summary</th><td>columns: <code>{html.escape(json.dumps(v.get('run_sql_columns')))}</code> rows: {v.get('run_sql_row_count','-')}</td></tr>
-<tr><th>generate-viz summary</th><td>chart_type: <code>{html.escape(str(v.get('generate_viz_chart_type')))}</code>, axes (<code>{html.escape(str(v.get('generate_viz_x_axis')))}</code>, <code>{html.escape(str(v.get('generate_viz_y_axis')))}</code>)</td></tr>
-<tr><th>columns synced</th><td><code>{v.get('columns_synced_run_sql_vs_generate_viz')}</code></td></tr>
-<tr><th>fail/warn</th><td>{html.escape(json.dumps(v.get('fail_reasons')))} / {html.escape(json.dumps(v.get('warn_reasons')))}</td></tr>
-</table>
+<table>{summary_rows}</table>
 {error_block}
-{_render_call_block('generate-sql', r.get('generate_sql_call'), 'NL → SQL conversion (LLM call to celerantai.com)')}
-{_render_call_block('run-sql', rs_call, 'SQL execution against the tenant database')}
-{_render_call_block('generate-viz', gv_call, 'Chart generation (LLM call) — fired only when the user clicks Generate Visualization')}
+{call_blocks}
 {notes_block}
 {calls_table}
 {('<details><summary><b>Screenshots</b> ('+str(len(r.get('screenshots') or []))+')</summary>'+screenshot_imgs+'</details>') if screenshot_imgs else ''}
 </details>
 """)
 
+    # Build the right API-health table for the test type
+    t = summary["total_queries"]
+    if is_site_search:
+        sk = summary["search_keywords"]; sr = summary["search_results"]
+        api_health_table = (
+            "<table>"
+            "<tr><th>Endpoint</th><th>Captured</th><th>HTTP 2xx</th><th>Usable payload</th></tr>"
+            f"<tr><td><code>search-keywords</code></td><td>{sk['present']}/{t}</td><td>{sk['http_ok']}/{t}</td><td>—</td></tr>"
+            f"<tr><td><code>search-results</code></td><td>{sr['present']}/{t}</td><td>{sr['http_ok']}/{t}</td><td>{sr['with_products']}/{t} (products&gt;0)</td></tr>"
+            "</table>"
+        )
+    else:
+        rs = summary["run_sql"]; gv = summary["generate_viz"]; cs2 = summary["column_sync"]
+        api_health_table = (
+            "<table>"
+            "<tr><th>Endpoint</th><th>Captured</th><th>HTTP 2xx</th><th>Usable payload</th></tr>"
+            f"<tr><td><code>run-sql</code></td><td>{rs['present']}/{t}</td><td>{rs['http_ok']}/{t}</td><td>{rs['with_rows']}/{t} (rows&gt;0)</td></tr>"
+            f"<tr><td><code>generate-viz</code></td><td>{gv['present']}/{t}</td><td>{gv['http_ok']}/{t}</td><td>{gv['with_chart']}/{t} (chart)</td></tr>"
+            "</table>"
+            f"<h3>Column-name sync</h3><p>Synced: <b>{cs2['synced']}</b> &nbsp;|&nbsp; Unsynced: <b>{cs2['unsynced']}</b></p>"
+        )
+
     return HTML_TMPL.format(
         generated_at=summary["generated_at"],
+        report_title_suffix="Site Search" if is_site_search else "SQL AI Engine",
         total=summary["total_queries"],
         pass_n=sb.get("PASS", 0),
         partial_n=sb.get("PARTIAL", 0),
@@ -434,14 +513,7 @@ def render_html(results: list[dict[str, Any]], summary: dict[str, Any], job_dir:
         timeout_n=sb.get("TIMEOUT", 0),
         avg_ms=summary["performance_ms"]["avg"],
         max_ms=summary["performance_ms"]["max"],
-        rs_present=summary["run_sql"]["present"],
-        rs_ok=summary["run_sql"]["http_ok"],
-        rs_rows=summary["run_sql"]["with_rows"],
-        gv_present=summary["generate_viz"]["present"],
-        gv_ok=summary["generate_viz"]["http_ok"],
-        gv_chart=summary["generate_viz"]["with_chart"],
-        cols_synced=summary["column_sync"]["synced"],
-        cols_unsynced=summary["column_sync"]["unsynced"],
+        api_health_table=api_health_table,
         fail_list=fail_list,
         partial_list=partial_list,
         timeout_list=timeout_list,

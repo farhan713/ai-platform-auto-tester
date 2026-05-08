@@ -234,18 +234,27 @@ pre {
 .form label small { display: block; color: var(--text-muted); font-size: 11px; margin-top: 4px; }
 .form input[type="text"],
 .form input[type="url"],
+.form input[type="email"],
 .form input[type="password"],
 .form input[type="number"],
+.form input[type="search"],
 .form input[type="file"],
+.form input[type="tel"],
 .form select,
 .form textarea {
-  width: 100%; padding: 8px 10px; font-size: 13px;
+  width: 100%; padding: 10px 12px; font-size: 14px;
   border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
   background: var(--surface); color: var(--text);
   font-family: inherit;
+  transition: border-color .12s, box-shadow .12s;
+}
+.form input:hover:not(:focus), .form select:hover:not(:focus), .form textarea:hover:not(:focus) {
+  border-color: var(--brand-2);
 }
 .form input:focus, .form select:focus, .form textarea:focus {
-  outline: 2px solid var(--accent); outline-offset: -1px;
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
 }
 .form .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 

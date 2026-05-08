@@ -191,10 +191,14 @@ def _save_bundle(uploaded, original_name: str, friendly_name: str,
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 for member in zf.namelist():
-                    # Skip directories + drop any leading folder so paths are
-                    # relative to the bundle dir.
-                    if member.endswith("/"): continue
-                    if ".." in member: continue  # zip-slip safety
+                    if member.endswith("/"): continue       # skip dirs
+                    if ".." in member: continue             # zip-slip safety
+                    # Skip macOS / Windows metadata cruft that gets auto-added
+                    # to zips and confuses the main-file picker below.
+                    if "__MACOSX" in member.split("/"): continue
+                    base = member.rsplit("/", 1)[-1]
+                    if base.startswith("._"): continue       # AppleDouble resource forks
+                    if base in (".DS_Store", "Thumbs.db"): continue
                     parts = member.split("/")
                     rel = "/".join(parts[1:]) if len(parts) > 1 and parts[0].endswith("dist") else member
                     rel = rel.replace("..", "_")
@@ -208,9 +212,18 @@ def _save_bundle(uploaded, original_name: str, friendly_name: str,
             except Exception: pass
 
         # Find the main JS + CSS — prefer files with "bundle" in the name,
-        # otherwise the first .js / .css.
-        js_files = sorted(p for p in bundle_dir.rglob("*.js") if p.is_file())
-        css_files = sorted(p for p in bundle_dir.rglob("*.css") if p.is_file())
+        # otherwise the first .js / .css. Filter out macOS/Windows metadata
+        # paths even if they slipped through.
+        def _real_files(suffix: str) -> list:
+            return sorted(
+                p for p in bundle_dir.rglob(f"*{suffix}")
+                if p.is_file()
+                and "__MACOSX" not in p.parts
+                and not p.name.startswith("._")
+                and p.name not in (".DS_Store", "Thumbs.db")
+            )
+        js_files = _real_files(".js")
+        css_files = _real_files(".css")
         if js_files:
             preferred = [p for p in js_files if "bundle" in p.name.lower()]
             chosen = preferred[0] if preferred else js_files[0]
