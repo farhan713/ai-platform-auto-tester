@@ -33,6 +33,14 @@
   <progress id="progress" max="{{ meta.question_count or 100 }}" value="0"></progress>
 </div>
 
+<div id="run-alert" class="run-alert" style="display:none" role="status" aria-live="polite">
+  <div>
+    <strong id="run-alert-title">Attention needed</strong>
+    <p id="run-alert-message"></p>
+  </div>
+  <div id="run-alert-countdown" class="run-alert-countdown" style="display:none"></div>
+</div>
+
 <!-- Tabs -->
 <div class="tabs">
   <button class="tab active" data-tab="overview">Overview</button>
@@ -56,6 +64,29 @@
         <tbody><tr><td colspan="4" class="table-empty">Waiting…</td></tr></tbody>
       </table>
     </div>
+  </div>
+  <div class="card">
+    <h2>Current activity</h2>
+    <div class="activity-grid">
+      <div>
+        <span class="meta">Current query</span>
+        <strong id="activity-query">Waiting…</strong>
+      </div>
+      <div>
+        <span class="meta">Current step / API</span>
+        <strong id="activity-step">Waiting for runner events</strong>
+      </div>
+      <div>
+        <span class="meta">Last update</span>
+        <strong id="activity-updated">—</strong>
+      </div>
+      <div>
+        <span class="meta">Timer / wait limit</span>
+        <strong id="activity-timer">—</strong>
+      </div>
+    </div>
+    <p class="meta" id="activity-message" style="margin-top:10px">The latest question and API phase will appear here while the run is active.</p>
+    <p class="meta" id="activity-issue" style="margin-top:6px">Timeout / issue: —</p>
   </div>
   <div class="card">
     <h2>Top failure reasons (this run)</h2>
@@ -145,10 +176,22 @@ const progressEl = document.getElementById('progress');
 const reportLink = document.getElementById('report-link');
 const stopBtn = document.getElementById('stop-btn');
 const headerStatus = document.getElementById('header-status');
+const runAlert = document.getElementById('run-alert');
+const runAlertTitle = document.getElementById('run-alert-title');
+const runAlertMessage = document.getElementById('run-alert-message');
+const runAlertCountdown = document.getElementById('run-alert-countdown');
+const activityQuery = document.getElementById('activity-query');
+const activityStep = document.getElementById('activity-step');
+const activityUpdated = document.getElementById('activity-updated');
+const activityMessage = document.getElementById('activity-message');
+const activityTimer = document.getElementById('activity-timer');
+const activityIssue = document.getElementById('activity-issue');
 
 let outcomeChart = null;
 let allResults = [];   // every per-query JSON we've fetched
 let firstLoad = true;
+let recoveryCountdownTimer = null;
+let activityCountdownTimer = null;
 // In-flight guards. setInterval fires every 4s; if a previous fetch is still
 // pending (slow network, big run, server under load) we MUST NOT start
 // another one — Chromium has a per-origin connection cap (~6) and stacking
@@ -356,6 +399,230 @@ function renderNetwork() {
         </tr>`).join('');
 }
 
+// ---- Run-level alert --------------------------------------------------------
+function showRunAlert(kind, title, message, seconds) {
+  if (recoveryCountdownTimer) {
+    clearInterval(recoveryCountdownTimer);
+    recoveryCountdownTimer = null;
+  }
+  runAlert.className = `run-alert ${kind || 'info'}`;
+  runAlertTitle.textContent = title;
+  runAlertMessage.textContent = message;
+  runAlert.style.display = 'flex';
+
+  if (seconds) {
+    let remaining = seconds;
+    runAlertCountdown.style.display = 'block';
+    runAlertCountdown.textContent = `${remaining}s`;
+    recoveryCountdownTimer = setInterval(() => {
+      remaining = Math.max(0, remaining - 1);
+      runAlertCountdown.textContent = `${remaining}s`;
+      if (remaining <= 0) {
+        clearInterval(recoveryCountdownTimer);
+        recoveryCountdownTimer = null;
+      }
+    }, 1000);
+  } else {
+    runAlertCountdown.style.display = 'none';
+    runAlertCountdown.textContent = '';
+  }
+}
+
+function hideRunAlertSoon() {
+  if (recoveryCountdownTimer) {
+    clearInterval(recoveryCountdownTimer);
+    recoveryCountdownTimer = null;
+  }
+  setTimeout(() => {
+    runAlert.style.display = 'none';
+    runAlertCountdown.style.display = 'none';
+  }, 5000);
+}
+
+function clearActivityTimer(label) {
+  if (activityCountdownTimer) {
+    clearInterval(activityCountdownTimer);
+    activityCountdownTimer = null;
+  }
+  activityTimer.textContent = label || '—';
+}
+
+function startActivityCountdown(seconds) {
+  clearActivityTimer();
+  let remaining = seconds;
+  let elapsed = 0;
+  activityTimer.textContent = `${remaining}s left (0s elapsed)`;
+  activityCountdownTimer = setInterval(() => {
+    elapsed += 1;
+    remaining = Math.max(0, seconds - elapsed);
+    activityTimer.textContent = remaining > 0
+      ? `${remaining}s left (${elapsed}s elapsed)`
+      : `limit reached (${elapsed}s elapsed)`;
+    if (remaining <= 0) {
+      clearInterval(activityCountdownTimer);
+      activityCountdownTimer = null;
+    }
+  }, 1000);
+}
+
+function extractWaitSeconds(message) {
+  const m = String(message || '').match(/timeout\s+(\d+)s/i);
+  return m ? Number(m[1]) : null;
+}
+
+function updateActivity(query, step, message, opts = {}) {
+  if (query) activityQuery.textContent = query;
+  if (step) activityStep.textContent = step;
+  if (message) activityMessage.textContent = message;
+  if (opts.issue !== undefined) {
+    activityIssue.textContent = `Timeout / issue: ${opts.issue || '—'}`;
+  }
+  if (opts.waitSeconds) {
+    startActivityCountdown(opts.waitSeconds);
+  } else if (opts.clearTimer) {
+    clearActivityTimer(opts.timerLabel || '—');
+  }
+  activityUpdated.textContent = new Date().toLocaleTimeString();
+}
+
+function handleRunnerEvent(line) {
+  if (line.startsWith('[recover-input-start]')) {
+    const q = (line.match(/q\d+/) || ['Current question'])[0];
+    updateActivity(
+      q,
+      'Recovering SQL Agent input',
+      'Input disappeared. Reloading SQL Agent and retrying this question.',
+      { waitSeconds: 60, issue: 'The chat input was not visible before typing. Waiting for reload recovery.' }
+    );
+    showRunAlert(
+      'warning',
+      'SQL Agent input disappeared',
+      'The runner is reloading the SQL Agent page and retrying the same question. Please wait up to 60 seconds.',
+      60
+    );
+    SQA.toast('SQL Agent input disappeared. Retrying after reload...', 'info');
+  } else if (line.startsWith('[recover-input-ok]')) {
+    const q = (line.match(/q\d+/) || ['Current question'])[0];
+    updateActivity(
+      q,
+      'Recovered',
+      'SQL Agent input is visible again; continuing the run.',
+      { clearTimer: true, timerLabel: 'Recovered', issue: '' }
+    );
+    showRunAlert(
+      'success',
+      'SQL Agent recovered',
+      'The input box is visible again. The run is continuing with the same question.'
+    );
+    hideRunAlertSoon();
+  } else if (line.startsWith('[recover-input-failed]')) {
+    const q = (line.match(/q\d+/) || ['Current question'])[0];
+    updateActivity(
+      q,
+      'Recovery failed',
+      'SQL Agent input did not recover after reload.',
+      { clearTimer: true, timerLabel: 'Timed out', issue: 'SQL Agent input did not appear after reload.' }
+    );
+    showRunAlert(
+      'error',
+      'SQL Agent recovery failed',
+      'The page was reloaded, but the question input still did not appear. Check the current and previous question screenshots in the report.'
+    );
+  } else if (line.startsWith('[recover-browser-start]')) {
+    updateActivity(
+      null,
+      'Fresh browser recovery',
+      line.replace('[recover-browser-start]', '').trim() || 'Reopening browser and logging in again.',
+      { waitSeconds: 90, issue: 'The SQL Agent page crashed or reload failed. Starting a new browser session.' }
+    );
+    showRunAlert(
+      'warning',
+      'Browser crashed or reload failed',
+      'The runner is opening a fresh browser, logging in again, and will continue with the next question.',
+      90
+    );
+  } else if (line.startsWith('[recover-browser-step]')) {
+    const step = line.replace('[recover-browser-step]', '').trim();
+    updateActivity(
+      null,
+      'Recovery operation',
+      step,
+      { issue: 'Browser/session recovery is in progress. The runner is rebuilding the SQL Agent session.' }
+    );
+  } else if (line.startsWith('[recover-browser-ok]')) {
+    updateActivity(
+      null,
+      'Fresh browser ready',
+      'Fresh browser is ready; continuing with next question.',
+      { clearTimer: true, timerLabel: 'Recovered', issue: '' }
+    );
+    showRunAlert('success', 'Fresh browser ready', 'The runner recovered and will continue with the next question.');
+    hideRunAlertSoon();
+  } else if (line.startsWith('[recover-browser-failed]')) {
+    updateActivity(
+      null,
+      'Fresh browser recovery failed',
+      line.replace('[recover-browser-failed]', '').trim(),
+      { clearTimer: true, timerLabel: 'Failed', issue: 'Could not relaunch browser and return to SQL Agent.' }
+    );
+    showRunAlert(
+      'error',
+      'Fresh browser recovery failed',
+      'The runner could not relaunch the browser and return to SQL Agent. Check credentials, tenant availability, and server memory.'
+    );
+  } else if (line.startsWith('[login-error]')) {
+    updateActivity(
+      null,
+      'Login failed',
+      line.replace('[login-error]', '').trim(),
+      { clearTimer: true, timerLabel: 'Failed', issue: 'Login failed. Check credentials, Machine ID, and tenant URL.' }
+    );
+    showRunAlert(
+      'error',
+      'Login failed',
+      line.replace('[login-error]', '').trim() || 'Login failed. Please check credentials, Machine ID, and tenant URL.'
+    );
+  } else if (line.startsWith('[page-error]')) {
+    updateActivity(
+      null,
+      'Page not accessible',
+      line.replace('[page-error]', '').trim(),
+      { clearTimer: true, timerLabel: 'Failed', issue: 'The target page could not be loaded or did not expose the expected UI.' }
+    );
+    showRunAlert(
+      'error',
+      'Page not accessible',
+      line.replace('[page-error]', '').trim() || 'The target page was not accessible from the runner.'
+    );
+  } else if (line.startsWith('[activity]')) {
+    const m = line.match(/^\[activity\]\s+(q\d+)\s+([^:]+):\s*(.*)$/);
+    if (m) {
+      const phase = m[2];
+      const message = m[3];
+      const waitSeconds = extractWaitSeconds(message);
+      const isTimeout = phase.includes('timeout');
+      const isError = phase.includes('error');
+      const isFinishedStep = /(responded|skipping|not shown|visible|typed)/i.test(message);
+      updateActivity(m[1], phase, message, {
+        waitSeconds,
+        clearTimer: !waitSeconds && isFinishedStep,
+        timerLabel: isFinishedStep ? 'Step complete' : undefined,
+        issue: (isTimeout || isError) ? message : '',
+      });
+    }
+  } else if (/^\[q\d+\]/.test(line)) {
+    const m = line.match(/^\[(q\d+)\]\s+(.*)$/);
+    if (m) {
+      const isStatus = /^(PASS|PARTIAL|FAIL|TIMEOUT)\b/.test(m[2]);
+      updateActivity(m[1], isStatus ? 'Completed' : 'Starting question', m[2], {
+        clearTimer: isStatus,
+        timerLabel: isStatus ? 'Question complete' : undefined,
+        issue: isStatus && /^(FAIL|TIMEOUT)\b/.test(m[2]) ? 'Question ended with failure/timeout. See report details and screenshots.' : '',
+      });
+    }
+  }
+}
+
 // ---- SSE event stream ------------------------------------------------------
 // Cap how much event-log text we keep in the DOM. A long run (1500+ queries)
 // emits ~10 lines per query — left unbounded the <pre> grows past 1MB and
@@ -365,6 +632,7 @@ let _eventLineCount = 0;
 const es = new EventSource(`/jobs/${jobId}/events`);
 es.onmessage = (e) => {
   if (e.data === '[__end__]') { es.close(); refreshStatus(); SQA.toast('Run complete.', 'success'); return; }
+  handleRunnerEvent(e.data);
   eventsEl.textContent += e.data + '\n';
   _eventLineCount++;
   if (_eventLineCount > EVENTS_MAX_LINES) {

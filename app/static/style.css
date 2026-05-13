@@ -360,6 +360,55 @@ progress::-webkit-progress-value { background: var(--pass); border-radius: 6px; 
 .count-pill.FAIL b { color: var(--fail); }
 .count-pill.TIMEOUT b { color: var(--timeout); }
 
+/* Run-level alerts shown from live runner events */
+.run-alert {
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: 16px;
+}
+.run-alert strong { display: block; margin-bottom: 2px; }
+.run-alert p { margin: 0; color: var(--text-muted); }
+.run-alert.warning { border-left-color: var(--partial); }
+.run-alert.success { border-left-color: var(--pass); }
+.run-alert.error { border-left-color: var(--fail); }
+.run-alert.info { border-left-color: var(--accent); }
+.run-alert-countdown {
+  min-width: 56px;
+  text-align: center;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--partial);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+.activity-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.activity-grid > div {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.activity-grid strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 800px) { .activity-grid { grid-template-columns: 1fr; } }
+
 /* Event log */
 .events {
   background: var(--pre-bg); color: var(--pre-text); padding: 10px;

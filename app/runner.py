@@ -76,6 +76,10 @@ GEN_SQL_HINTS = ("generate_sql", "generate-sql")
 SS_KEYWORDS_HINTS = ("/search_keywords/",)
 SS_RESULTS_HINTS  = ("/search_results/", "/search_multi_keyword_and_results/", "/user_search_result")
 SS_AUTH_HINTS     = ("/organization_validation/", "/search_ui_styling_info")
+SQL_AGENT_INPUT_SELECTOR = (
+    'input.greeting-input, input.chat-input, '
+    'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -346,22 +350,47 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     # 'domcontentloaded' returns once HTML is parsed; we don't need every
     # image/font to load before interacting. The previous 'load' event added
     # ~30-60s on the Celerant login page (lots of static assets).
-    page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
-    page.wait_for_selector("#userid", timeout=20_000)
+    try:
+        page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+    except Exception as e:
+        msg = (
+            "Login page is not accessible. Check the Login URL, VPN/network access, "
+            f"and whether the tenant is reachable from this server. URL: {cfg.login_url}"
+        )
+        log(f"[page-error] {msg}")
+        raise RuntimeError(msg) from e
+    try:
+        page.wait_for_selector("#userid", timeout=20_000)
+    except PWTimeoutError as e:
+        msg = (
+            "Login page opened, but the expected username field (#userid) was not found. "
+            "This usually means the URL is not the Celerant Back Office login page, "
+            "the page is blocked, or the login screen changed."
+        )
+        log(f"[login-error] {msg}")
+        raise RuntimeError(msg) from e
 
     # Wait for jQuery's submit handler to be wired by RequireJS — without it the form does a
     # native POST that omits machineid and the server returns "Machine ID is empty".
     log("[login] waiting for jQuery submit handler to bind")
-    page.wait_for_function(
-        """
-        () => {
-            if (!window.jQuery) return false;
-            const events = jQuery._data(document.getElementById('loginform'), 'events');
-            return !!(events && events.submit && events.submit.length > 0);
-        }
-        """,
-        timeout=cfg.page_load_timeout_ms,
-    )
+    try:
+        page.wait_for_function(
+            """
+            () => {
+                if (!window.jQuery) return false;
+                const events = jQuery._data(document.getElementById('loginform'), 'events');
+                return !!(events && events.submit && events.submit.length > 0);
+            }
+            """,
+            timeout=cfg.page_load_timeout_ms,
+        )
+    except PWTimeoutError as e:
+        msg = (
+            "Login page loaded, but the login form did not finish initializing. "
+            "The tenant page may be slow, blocked, or missing required scripts."
+        )
+        log(f"[login-error] {msg}")
+        raise RuntimeError(msg) from e
     if cfg.machine_id:
         page.evaluate(
             "(mid) => window.localStorage.setItem('MACHINE_ID', mid)",
@@ -389,20 +418,38 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     url = page.url
     if "UserAuthenticationServlet" in url or url == cfg.login_url:
         body = page.content()[:300]
-        raise RuntimeError(f"Login failed at {url}: {body}")
+        msg = (
+            "Login failed. Please verify username, password, Machine ID, and tenant URL. "
+            f"The page stayed on the login/authentication screen: {url}"
+        )
+        log(f"[login-error] {msg}")
+        raise RuntimeError(f"{msg}\nPage preview: {body}")
     log(f"[login] success — {url}")
 
 
 def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Page:
     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
     log(f"[nav] opening {target}")
-    page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+    try:
+        page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+    except Exception as e:
+        msg = (
+            "SQL Agent page is not accessible. Check the SQL Agent path, user permissions, "
+            f"and network access. URL: {target}"
+        )
+        log(f"[page-error] {msg}")
+        raise RuntimeError(msg) from e
     # Skip 'networkidle' here — the SPA polls heartbeats and never goes idle.
     # The wait_for_selector below is a deterministic ready signal.
-    page.wait_for_selector(
-        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
-        timeout=60_000,
-    )
+    try:
+        page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=60_000)
+    except PWTimeoutError as e:
+        msg = (
+            "SQL Agent page opened, but the question input did not appear within 60 seconds. "
+            "The account may not have SQL Agent access, the path may be wrong, or the page is stuck loading."
+        )
+        log(f"[page-error] {msg}")
+        raise RuntimeError(msg) from e
     log("[nav] SQL Agent ready")
     return page
 
@@ -417,11 +464,63 @@ def submit_query(
     qresult: QueryResult,
     screenshot_dir: Path,
 ) -> None:
-    box = page.locator(
-        'input.greeting-input, input.chat-input, '
-        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]'
-    ).first
-    box.wait_for(state="visible", timeout=15_000)
+    def emit_activity(phase: str, message: str) -> None:
+        if cfg.on_event:
+            cfg.on_event(f"[activity] q{qresult.id:02d} {phase}: {message}")
+
+    def wait_for_chat_input():
+        box = page.locator(SQL_AGENT_INPUT_SELECTOR).first
+        try:
+            box.wait_for(state="visible", timeout=30_000)
+            return box
+        except PWTimeoutError as first_error:
+            try:
+                qresult.notes.append(f"chat input missing before submit; url={page.url!r}; title={page.title()!r}")
+            except Exception:
+                qresult.notes.append("chat input missing before submit; unable to read page url/title")
+            missing_shot = _screenshot(
+                page,
+                screenshot_dir / f"q{qresult.id:02d}_00_missing_input.png",
+            )
+            if missing_shot:
+                qresult.screenshots.append(missing_shot)
+
+            target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
+            qresult.notes.append("chat input missing — reloading SQL Agent and retrying this question once")
+            if cfg.on_event:
+                cfg.on_event(
+                    f"[recover-input-start] q{qresult.id:02d}: SQL Agent input disappeared. "
+                    "Reloading page and retrying this question; timeout 60s. "
+                    "Reason: the chat input was not visible before typing the question."
+                )
+            try:
+                page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+                page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=60_000)
+                recovered_shot = _screenshot(
+                    page,
+                    screenshot_dir / f"q{qresult.id:02d}_00_recovered_input.png",
+                )
+                if recovered_shot:
+                    qresult.screenshots.append(recovered_shot)
+                qresult.notes.append("chat input recovered after SQL Agent reload")
+                if cfg.on_event:
+                    cfg.on_event(f"[recover-input-ok] q{qresult.id:02d}: SQL Agent input recovered; continuing run.")
+                box = page.locator(SQL_AGENT_INPUT_SELECTOR).first
+                box.wait_for(state="visible", timeout=15_000)
+                return box
+            except Exception as reload_error:
+                if cfg.on_event:
+                    cfg.on_event(
+                        f"[recover-input-failed] q{qresult.id:02d}: SQL Agent input did not recover after reload."
+                    )
+                raise RuntimeError(
+                    "SQL Agent chat input was missing, and reload did not recover it. "
+                    f"Last URL: {getattr(page, 'url', '')}. "
+                    f"Original wait error: {first_error}. Reload error: {reload_error}"
+                ) from reload_error
+
+    box = wait_for_chat_input()
+    emit_activity("input", "SQL Agent input is visible; preparing question")
     # The chat input is disabled while the previous query is still being
     # processed by the SQL Agent. Without this wait, q02 onward fail with
     # "element is not enabled" because we click before the agent finishes.
@@ -450,6 +549,7 @@ def submit_query(
         qresult.notes.append("clicked input with force=True")
     box.fill("")
     box.type(qresult.nl_query, delay=6)
+    emit_activity("submit", "Question typed; sending to SQL Agent")
 
     qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_01_input.png"))
     started_iso = now_iso()
@@ -487,6 +587,11 @@ def submit_query(
     # run-sql wait via Playwright's event-driven API
     run_sql_resp = None
     try:
+        emit_activity(
+            "api",
+            f"Waiting for run-sql response (timeout {cfg.run_sql_timeout_ms // 1000}s). "
+            "If this times out, no run-sql API response was received before the limit.",
+        )
         with page.expect_response(
             lambda r: _is_run_sql_url(r.url),
             timeout=cfg.run_sql_timeout_ms,
@@ -494,13 +599,21 @@ def submit_query(
             click_send()
         run_sql_resp = info.value
         qresult.notes.append(f"run-sql HTTP {run_sql_resp.status} {run_sql_resp.url}")
+        emit_activity("api", f"run-sql responded HTTP {run_sql_resp.status}")
     except PWTimeoutError:
         qresult.notes.append(f"run-sql TIMEOUT after {cfg.run_sql_timeout_ms}ms")
+        emit_activity(
+            "api-timeout",
+            f"run-sql timed out after {cfg.run_sql_timeout_ms // 1000}s. "
+            "Reason: the SQL execution API did not return before the configured timeout. "
+            "Possible causes: broad/heavy question, slow tenant database, API/server issue, or network delay.",
+        )
         qresult.timed_out = True
         qresult.validations["timed_out_on"] = "run-sql"
         return
     except Exception as e:
         qresult.notes.append(f"run-sql expect_response error: {type(e).__name__}: {e}")
+        emit_activity("api-error", f"run-sql wait error: {type(e).__name__}: {e}")
 
     page.wait_for_timeout(500)
     # Capture both run-sql and generate-sql from the recorder. We accept calls
@@ -550,6 +663,7 @@ def submit_query(
     qresult.notes.append(f"Generate Visualization button count={gv_count}")
     if gv_count == 0:
         qresult.notes.append("Generate Visualization button not present (UI hides for non-chartable result)")
+        emit_activity("viz", "Generate Visualization button not shown; skipping chart step")
         qresult.validations["viz_button_present"] = False
         return
     qresult.validations["viz_button_present"] = True
@@ -557,6 +671,11 @@ def submit_query(
     viz_started_iso = now_iso()
     gen_viz_resp = None
     try:
+        emit_activity(
+            "api",
+            f"Waiting for generate-viz response (timeout {cfg.gen_viz_timeout_ms // 1000}s). "
+            "If this times out, no visualization API response was received before the limit.",
+        )
         with page.expect_response(
             lambda r: _is_gen_viz_url(r.url),
             timeout=cfg.gen_viz_timeout_ms,
@@ -571,12 +690,20 @@ def submit_query(
                 raise
         gen_viz_resp = gv_info.value
         qresult.notes.append(f"generate-viz HTTP {gen_viz_resp.status} {gen_viz_resp.url}")
+        emit_activity("api", f"generate-viz responded HTTP {gen_viz_resp.status}")
     except PWTimeoutError:
         qresult.notes.append(f"generate-viz TIMEOUT after {cfg.gen_viz_timeout_ms}ms")
+        emit_activity(
+            "api-timeout",
+            f"generate-viz timed out after {cfg.gen_viz_timeout_ms // 1000}s. "
+            "Reason: the chart/visualization API did not return before the configured timeout. "
+            "Possible causes: large result set, non-chartable data, API/server issue, or network delay.",
+        )
         qresult.timed_out = True
         qresult.validations["timed_out_on"] = "generate-viz"
     except Exception as e:
         qresult.notes.append(f"generate-viz expect_response error: {type(e).__name__}: {e}")
+        emit_activity("api-error", f"generate-viz wait error: {type(e).__name__}: {e}")
 
     page.wait_for_timeout(700)
     viz_snapshot = recorder.snapshot_after(viz_started_iso)
@@ -877,6 +1004,9 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             "TargetClosedError" in name
             or "Target page, context or browser has been closed" in msg
             or "Browser has been closed" in msg
+            or "Page crashed" in msg
+            or "page crashed" in msg.lower()
+            or "SQL Agent chat input was missing" in msg
         )
 
     with sync_playwright() as p:
@@ -912,6 +1042,8 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             """Tear down the dead browser and bring up a fresh one re-logged-in
             on the SQL Agent page. Raises on failure."""
             log("[recover] tearing down dead browser/context")
+            if cfg.on_event:
+                cfg.on_event("[recover-browser-step] Closing crashed browser/context")
             try:
                 recorder.detach()
             except Exception:
@@ -925,11 +1057,43 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             except Exception:
                 pass
             log("[recover] launching fresh browser + re-login")
+            if cfg.on_event:
+                cfg.on_event("[recover-browser-step] Launching fresh Chromium browser")
             br, ctx, pg, rec = _launch()
+            if cfg.on_event:
+                cfg.on_event("[recover-browser-step] Re-login started")
             do_login(pg, cfg, log)
+            if cfg.on_event:
+                cfg.on_event("[recover-browser-step] Login recovered; opening SQL Agent page")
             pg = open_sql_agent(pg, cfg, log)
             log("[recover] ready")
+            if cfg.on_event:
+                cfg.on_event("[recover-browser-step] SQL Agent ready after recovery")
             return br, ctx, pg, rec
+
+        def _recover_now(reason: str) -> bool:
+            """Immediately rebuild the browser so one crashed page does not
+            poison every remaining query."""
+            nonlocal browser, context, page, recorder, recoveries_used, successful_since_reload
+            if recoveries_used >= MAX_RECOVERIES:
+                log(f"[recover] skipped — recovery budget exhausted ({recoveries_used}/{MAX_RECOVERIES})")
+                return False
+            try:
+                log(f"[recover] {reason} — launching fresh browser "
+                    f"(recovery {recoveries_used + 1}/{MAX_RECOVERIES})")
+                if cfg.on_event:
+                    cfg.on_event(f"[recover-browser-start] {reason}. Reopening browser and logging in again.")
+                browser, context, page, recorder = _recover()
+                recoveries_used += 1
+                successful_since_reload = 0
+                if cfg.on_event:
+                    cfg.on_event("[recover-browser-ok] Fresh browser is ready; continuing with next question.")
+                return True
+            except Exception as recover_error:
+                log(f"[recover] fresh browser recovery failed: {recover_error}")
+                if cfg.on_event:
+                    cfg.on_event(f"[recover-browser-failed] Fresh browser recovery failed: {recover_error}")
+                return False
 
         all_results: list[QueryResult] = []
         stopped = False
@@ -994,11 +1158,11 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 qr.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 qr.overall_status = "FAIL"
                 qr.notes.append(f"unhandled: {e}")
-                # Page died during this query — leave the screenshot attempt
-                # off (it would just throw again) and let the next iteration
-                # trigger _recover().
+                # Page died during this query — recover immediately so a
+                # crashed/poisoned tab does not make every remaining query fail.
                 if _looks_like_target_closed(e) or not _is_page_alive(page):
-                    qr.notes.append("page closed mid-query — will recover for next question")
+                    qr.notes.append("page closed/crashed mid-query — recovering browser before next question")
+                    _recover_now(f"q{qr.id:02d} crashed or lost SQL Agent input")
                 else:
                     try:
                         qr.screenshots.append(
@@ -1025,13 +1189,12 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
                     page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
                     # No networkidle here either — SPA never idles
-                    page.wait_for_selector(
-                        'input[placeholder*="sales question" i], textarea[placeholder*="sales question" i]',
-                        timeout=30_000,
-                    )
+                    page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=30_000)
                     successful_since_reload = 0
                 except Exception as e:
                     log(f"[q{qr.id:02d}] reload failed: {e}")
+                    qr.notes.append(f"post-timeout SQL Agent reload failed: {e}")
+                    _recover_now(f"q{qr.id:02d} timeout reload failed")
             elif qr.overall_status == "PASS" and _is_page_alive(page):
                 successful_since_reload += 1
                 # Periodic reload to flush the chat-history DOM. Without this,
@@ -1045,14 +1208,11 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                         target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
                         page.goto(target, wait_until="domcontentloaded",
                                   timeout=cfg.page_load_timeout_ms)
-                        page.wait_for_selector(
-                            'input[placeholder*="sales question" i], '
-                            'textarea[placeholder*="sales question" i]',
-                            timeout=30_000,
-                        )
+                        page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=30_000)
                         successful_since_reload = 0
                     except Exception as e:
                         log(f"[mem] periodic reload failed: {e}")
+                        _recover_now("periodic SQL Agent reload failed")
 
         agg = cfg.output_dir / "all_results.json"
         agg.write_text(json.dumps([asdict(r) for r in all_results], indent=2, default=str))
