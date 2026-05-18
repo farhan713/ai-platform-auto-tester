@@ -178,6 +178,90 @@ def derive_sql_agent_url(login_url: str, sql_agent_path: str) -> str:
     return origin + sql_agent_path
 
 
+class BrowserLogCollector:
+    """Buffers everything the browser tells us — console.log/warn/error,
+    uncaught JS exceptions, and failed HTTP responses (4xx/5xx).
+
+    Why this exists: when the SQL Agent SPA fails to render the chat input,
+    the DOM looks normal (shell loaded, scripts present) but the actual
+    welcome screen never mounts. That's usually a RequireJS module hitting
+    a network error or an uncaught exception during boot — both invisible
+    without this collector, because Playwright doesn't surface browser
+    console output by default. Saving the buffer on setup-phase timeouts
+    gives us the precise failure reason instead of guesses.
+    """
+
+    def __init__(self, page: "Page") -> None:
+        self.page = page
+        self.entries: list[str] = []
+        self._attached = True
+        try:
+            page.on("console", self._on_console)
+            page.on("pageerror", self._on_pageerror)
+            page.on("response", self._on_response)
+            page.on("requestfailed", self._on_request_failed)
+        except Exception:
+            self._attached = False
+
+    def _ts(self) -> str:
+        return now_iso()
+
+    def _push(self, line: str) -> None:
+        # Hard cap so a chatty SPA can't blow up memory on long runs.
+        if len(self.entries) > 5000:
+            return
+        self.entries.append(f"{self._ts()} {line}")
+
+    def _on_console(self, msg) -> None:
+        try:
+            text = msg.text
+            self._push(f"console.{msg.type}: {text[:1000]}")
+        except Exception:
+            pass
+
+    def _on_pageerror(self, err) -> None:
+        try:
+            self._push(f"pageerror: {str(err)[:2000]}")
+        except Exception:
+            pass
+
+    def _on_response(self, resp) -> None:
+        # Only log non-2xx responses — successful loads are noise.
+        try:
+            status = resp.status
+            if status and (status >= 400):
+                self._push(f"http {status}: {resp.url[:300]}")
+        except Exception:
+            pass
+
+    def _on_request_failed(self, req) -> None:
+        try:
+            self._push(f"request_failed: {req.url[:300]} ({req.failure or 'unknown'})")
+        except Exception:
+            pass
+
+    def dump(self, path: "Path") -> int:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(self.entries[-3000:]))
+            return len(self.entries)
+        except Exception:
+            return 0
+
+    def detach(self) -> None:
+        if not self._attached:
+            return
+        for ev, fn in (("console", self._on_console),
+                       ("pageerror", self._on_pageerror),
+                       ("response", self._on_response),
+                       ("requestfailed", self._on_request_failed)):
+            try:
+                self.page.remove_listener(ev, fn)
+            except Exception:
+                pass
+        self._attached = False
+
+
 class StopRequested(Exception):
     """Raised when a user clicks Stop while a long-running wait is in flight.
 
@@ -516,14 +600,15 @@ SQL_AGENT_READY_TIMEOUT_MS = 180_000
 
 def _save_setup_forensics(page: Page, cfg: RunConfig, phase: str,
                           log: Callable[[str], None]) -> None:
-    """Save screenshot + page HTML + URL/title when a setup-phase wait times out.
+    """Save screenshot + page HTML + URL/title + browser console log when a
+    setup-phase wait times out.
 
     Setup-phase failures (login, SQL Agent navigation) historically saved nothing
     — just a bare Playwright TimeoutError. That left us unable to tell whether
     the page rendered a different view, a modal, an error banner, or just hadn't
-    finished loading. This function drops a screenshot AND the page HTML into
-    the run's output dir so the next failure tells us exactly what the headless
-    Chromium was seeing.
+    finished loading. This function drops a screenshot AND the page HTML AND
+    the browser console buffer (everything console.error / pageerror / failed
+    XHR captured since the page was created) into the run's output dir.
     """
     try:
         out = Path(cfg.output_dir) / "screenshots"
@@ -543,6 +628,17 @@ def _save_setup_forensics(page: Page, cfg: RunConfig, phase: str,
         except Exception as ce:
             log(f"[forensics] page.content() failed: {ce}")
 
+        # Dump the browser-side log buffer (console.log/error, pageerror,
+        # failed network responses) if a collector is attached to cfg.
+        collector = getattr(cfg, "_browser_log_collector", None)
+        if collector is not None:
+            try:
+                blog_path = Path(cfg.output_dir) / f"setup_{phase}_browser.log"
+                count = collector.dump(blog_path)
+                log(f"[forensics] saved browser log ({count} entries) -> {blog_path.name}")
+            except Exception as be:
+                log(f"[forensics] browser log dump failed: {be}")
+
         try:
             log(f"[forensics] url={page.url!r} title={page.title()!r}")
         except Exception:
@@ -554,8 +650,12 @@ def _save_setup_forensics(page: Page, cfg: RunConfig, phase: str,
 def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Page:
     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
     log(f"[nav] opening {target}")
-    try:
+
+    def _navigate() -> None:
         page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
+
+    try:
+        _navigate()
     except Exception as e:
         _save_setup_forensics(page, cfg, "sql_agent_goto", log)
         msg = (
@@ -565,40 +665,79 @@ def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Pa
         log(f"[page-error] {msg}")
         raise RuntimeError(msg) from e
 
-    # Wait for the SPA's root element to mount before checking for the input.
-    # On a cold-load headless Chromium the JS chunks take time to download +
-    # parse + run; without this we sometimes hit the input selector wait
-    # before any React component has rendered, then 60s wasn't enough.
-    try:
-        page.wait_for_function(
-            "() => !!document.querySelector('#root, #app, body > div')"
-            " && (document.body.innerText || '').length > 0",
-            timeout=60_000,
-        )
-        log("[nav] SPA root mounted")
-    except PWTimeoutError:
-        # Not fatal — fall through to the input wait, which has its own
-        # forensics. The SPA may use a non-standard root we don't recognise.
-        log("[nav] SPA root wait timed out — continuing to input check")
+    def _wait_for_input(timeout_ms: int) -> bool:
+        """Return True if the SQL Agent chat input becomes visible inside the
+        SPA's actual mount points within ``timeout_ms``."""
+        # Tighter SPA-mount detection: wait for the route container to have
+        # real content. The static HTML shell already has <div class="app">
+        # and <div class="screen-container"> empty — we need to know when
+        # the router has actually mounted the SQL Agent view INTO them.
+        # innerText length > 20 filters out empty wrappers / spinners.
+        try:
+            page.wait_for_function(
+                """() => {
+                    const candidates = [
+                        '.screen-container', '.app', '.home',
+                        '#root', '#app'
+                    ];
+                    for (const sel of candidates) {
+                        const el = document.querySelector(sel);
+                        if (el && (el.innerText || '').trim().length > 20) return true;
+                    }
+                    return false;
+                }""",
+                timeout=min(timeout_ms, 60_000),
+            )
+            log("[nav] SPA route mounted")
+        except PWTimeoutError:
+            log("[nav] SPA mount wait timed out — continuing to input check anyway")
+        # Now check for the input itself.
+        try:
+            page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=timeout_ms)
+            return True
+        except PWTimeoutError:
+            return False
 
-    # Skip 'networkidle' here — the SPA polls heartbeats and never goes idle.
-    # The wait_for_selector below is a deterministic ready signal.
+    # First attempt: half the budget. If we don't see the input, reload once
+    # and try again with the remainder — many SPA bootstrap hangs (a
+    # RequireJS module that lost a race, a stuck XHR, etc.) clear on a
+    # fresh navigation, and a reload is way cheaper than failing the run.
+    first_attempt_ms = SQL_AGENT_READY_TIMEOUT_MS // 2
+    if _wait_for_input(first_attempt_ms):
+        log("[nav] SQL Agent ready")
+        return page
+
+    log(f"[nav] input did not appear in {first_attempt_ms // 1000}s — reloading once")
+    if cfg.on_event:
+        cfg.on_event(f"[nav] SQL Agent input missing after "
+                     f"{first_attempt_ms // 1000}s; reloading the page once")
     try:
-        page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR,
-                               timeout=SQL_AGENT_READY_TIMEOUT_MS)
-    except PWTimeoutError as e:
-        _save_setup_forensics(page, cfg, "sql_agent_input", log)
-        msg = (
-            f"SQL Agent page opened, but the question input did not appear within "
-            f"{SQL_AGENT_READY_TIMEOUT_MS // 1000} seconds. "
-            "The account may not have SQL Agent access, the path may be wrong, "
-            "or the page is stuck loading. A screenshot of what the tool saw "
-            "has been saved alongside the run for diagnosis."
-        )
-        log(f"[page-error] {msg}")
-        raise RuntimeError(msg) from e
-    log("[nav] SQL Agent ready")
-    return page
+        _navigate()
+    except Exception as reload_err:
+        log(f"[nav] reload-recovery navigation failed: {reload_err}")
+        _save_setup_forensics(page, cfg, "sql_agent_reload_goto", log)
+        raise RuntimeError(
+            "SQL Agent reload-recovery failed: "
+            f"{type(reload_err).__name__}: {reload_err}"
+        ) from reload_err
+
+    remaining_ms = SQL_AGENT_READY_TIMEOUT_MS - first_attempt_ms
+    if _wait_for_input(remaining_ms):
+        log("[nav] SQL Agent ready (after reload-recovery)")
+        if cfg.on_event:
+            cfg.on_event("[nav] SQL Agent ready after one-shot reload-recovery")
+        return page
+
+    _save_setup_forensics(page, cfg, "sql_agent_input", log)
+    msg = (
+        f"SQL Agent page opened, but the question input did not appear within "
+        f"{SQL_AGENT_READY_TIMEOUT_MS // 1000} seconds even after a reload. "
+        "The account may not have SQL Agent access, the path may be wrong, "
+        "or the SPA failed to render. A screenshot, page HTML, and browser "
+        "console log have all been saved for diagnosis."
+    )
+    log(f"[page-error] {msg}")
+    raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1183,9 +1322,15 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             )
             pg = ctx.new_page()
             rec = NetworkRecorder(pg)
-            return br, ctx, pg, rec
+            # Attach a browser-side log collector so console errors, uncaught
+            # pageerrors, and failed XHR/fetch responses are all captured for
+            # the duration of this page's life. _save_setup_forensics dumps
+            # the buffer alongside the screenshot/HTML on any setup timeout.
+            log_collector = BrowserLogCollector(pg)
+            cfg._browser_log_collector = log_collector  # type: ignore[attr-defined]
+            return br, ctx, pg, rec, log_collector
 
-        browser, context, page, recorder = _launch()
+        browser, context, page, recorder, log_collector = _launch()
 
         try:
             do_login(page, cfg, log)
@@ -1203,7 +1348,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 pass
             raise
 
-        def _recover() -> tuple[Any, Any, Page, NetworkRecorder]:
+        def _recover() -> tuple[Any, Any, Page, NetworkRecorder, BrowserLogCollector]:
             """Tear down the dead browser and bring up a fresh one re-logged-in
             on the SQL Agent page. Raises on failure."""
             log("[recover] tearing down dead browser/context")
@@ -1211,6 +1356,10 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 cfg.on_event("[recover-browser-step] Closing crashed browser/context")
             try:
                 recorder.detach()
+            except Exception:
+                pass
+            try:
+                log_collector.detach()
             except Exception:
                 pass
             try:
@@ -1224,7 +1373,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             log("[recover] launching fresh browser + re-login")
             if cfg.on_event:
                 cfg.on_event("[recover-browser-step] Launching fresh Chromium browser")
-            br, ctx, pg, rec = _launch()
+            br, ctx, pg, rec, lc = _launch()
             if cfg.on_event:
                 cfg.on_event("[recover-browser-step] Re-login started")
             do_login(pg, cfg, log)
@@ -1234,12 +1383,12 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             log("[recover] ready")
             if cfg.on_event:
                 cfg.on_event("[recover-browser-step] SQL Agent ready after recovery")
-            return br, ctx, pg, rec
+            return br, ctx, pg, rec, lc
 
         def _recover_now(reason: str) -> bool:
             """Immediately rebuild the browser so one crashed page does not
             poison every remaining query."""
-            nonlocal browser, context, page, recorder, recoveries_used, successful_since_reload
+            nonlocal browser, context, page, recorder, log_collector, recoveries_used, successful_since_reload
             if recoveries_used >= MAX_RECOVERIES:
                 log(f"[recover] skipped — recovery budget exhausted ({recoveries_used}/{MAX_RECOVERIES})")
                 return False
@@ -1248,7 +1397,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                     f"(recovery {recoveries_used + 1}/{MAX_RECOVERIES})")
                 if cfg.on_event:
                     cfg.on_event(f"[recover-browser-start] {reason}. Reopening browser and logging in again.")
-                browser, context, page, recorder = _recover()
+                browser, context, page, recorder, log_collector = _recover()
                 recoveries_used += 1
                 successful_since_reload = 0
                 if cfg.on_event:
@@ -1294,7 +1443,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 try:
                     log(f"[q{qr.id:02d}] page is closed — recovering "
                         f"(recovery {recoveries_used + 1}/{MAX_RECOVERIES})")
-                    browser, context, page, recorder = _recover()
+                    browser, context, page, recorder, log_collector = _recover()
                     recoveries_used += 1
                     successful_since_reload = 0
                 except Exception as e:
