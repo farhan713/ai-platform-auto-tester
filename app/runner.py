@@ -353,6 +353,7 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     try:
         page.goto(cfg.login_url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
     except Exception as e:
+        _save_setup_forensics(page, cfg, "login_goto", log)
         msg = (
             "Login page is not accessible. Check the Login URL, VPN/network access, "
             f"and whether the tenant is reachable from this server. URL: {cfg.login_url}"
@@ -362,6 +363,7 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     try:
         page.wait_for_selector("#userid", timeout=20_000)
     except PWTimeoutError as e:
+        _save_setup_forensics(page, cfg, "login_userid", log)
         msg = (
             "Login page opened, but the expected username field (#userid) was not found. "
             "This usually means the URL is not the Celerant Back Office login page, "
@@ -385,6 +387,7 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
             timeout=cfg.page_load_timeout_ms,
         )
     except PWTimeoutError as e:
+        _save_setup_forensics(page, cfg, "login_jquery", log)
         msg = (
             "Login page loaded, but the login form did not finish initializing. "
             "The tenant page may be slow, blocked, or missing required scripts."
@@ -417,6 +420,7 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
 
     url = page.url
     if "UserAuthenticationServlet" in url or url == cfg.login_url:
+        _save_setup_forensics(page, cfg, "login_failed", log)
         body = page.content()[:300]
         msg = (
             "Login failed. Please verify username, password, Machine ID, and tenant URL. "
@@ -427,26 +431,95 @@ def do_login(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> None:
     log(f"[login] success — {url}")
 
 
+# How long to wait for the SQL Agent chat input to render after navigation.
+# Manual browsers benefit from cached JS chunks; the tool's headless Chromium
+# does a cold load every run, talks to a tenant with a self-signed cert
+# (extra TLS round trips), and waits on RequireJS to assemble dozens of
+# modules before the SPA mounts. 180s is enough headroom for slow tenants
+# without making genuine failures take forever to surface.
+SQL_AGENT_READY_TIMEOUT_MS = 180_000
+
+
+def _save_setup_forensics(page: Page, cfg: RunConfig, phase: str,
+                          log: Callable[[str], None]) -> None:
+    """Save screenshot + page HTML + URL/title when a setup-phase wait times out.
+
+    Setup-phase failures (login, SQL Agent navigation) historically saved nothing
+    — just a bare Playwright TimeoutError. That left us unable to tell whether
+    the page rendered a different view, a modal, an error banner, or just hadn't
+    finished loading. This function drops a screenshot AND the page HTML into
+    the run's output dir so the next failure tells us exactly what the headless
+    Chromium was seeing.
+    """
+    try:
+        out = Path(cfg.output_dir) / "screenshots"
+        out.mkdir(parents=True, exist_ok=True)
+        shot_path = out / f"setup_{phase}_timeout.png"
+        try:
+            page.screenshot(path=str(shot_path), full_page=True)
+            log(f"[forensics] saved screenshot: {shot_path.name}")
+        except Exception as se:
+            log(f"[forensics] screenshot failed: {se}")
+
+        html_path = Path(cfg.output_dir) / f"setup_{phase}_page.html"
+        try:
+            html = page.content()
+            html_path.write_text(html[:500_000])  # cap at 500 KB
+            log(f"[forensics] saved page HTML ({len(html)} bytes) -> {html_path.name}")
+        except Exception as ce:
+            log(f"[forensics] page.content() failed: {ce}")
+
+        try:
+            log(f"[forensics] url={page.url!r} title={page.title()!r}")
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"[forensics] unexpected error: {e}")
+
+
 def open_sql_agent(page: Page, cfg: RunConfig, log: Callable[[str], None]) -> Page:
     target = derive_sql_agent_url(cfg.login_url, cfg.sql_agent_path)
     log(f"[nav] opening {target}")
     try:
         page.goto(target, wait_until="domcontentloaded", timeout=cfg.page_load_timeout_ms)
     except Exception as e:
+        _save_setup_forensics(page, cfg, "sql_agent_goto", log)
         msg = (
             "SQL Agent page is not accessible. Check the SQL Agent path, user permissions, "
             f"and network access. URL: {target}"
         )
         log(f"[page-error] {msg}")
         raise RuntimeError(msg) from e
+
+    # Wait for the SPA's root element to mount before checking for the input.
+    # On a cold-load headless Chromium the JS chunks take time to download +
+    # parse + run; without this we sometimes hit the input selector wait
+    # before any React component has rendered, then 60s wasn't enough.
+    try:
+        page.wait_for_function(
+            "() => !!document.querySelector('#root, #app, body > div')"
+            " && (document.body.innerText || '').length > 0",
+            timeout=60_000,
+        )
+        log("[nav] SPA root mounted")
+    except PWTimeoutError:
+        # Not fatal — fall through to the input wait, which has its own
+        # forensics. The SPA may use a non-standard root we don't recognise.
+        log("[nav] SPA root wait timed out — continuing to input check")
+
     # Skip 'networkidle' here — the SPA polls heartbeats and never goes idle.
     # The wait_for_selector below is a deterministic ready signal.
     try:
-        page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR, timeout=60_000)
+        page.wait_for_selector(SQL_AGENT_INPUT_SELECTOR,
+                               timeout=SQL_AGENT_READY_TIMEOUT_MS)
     except PWTimeoutError as e:
+        _save_setup_forensics(page, cfg, "sql_agent_input", log)
         msg = (
-            "SQL Agent page opened, but the question input did not appear within 60 seconds. "
-            "The account may not have SQL Agent access, the path may be wrong, or the page is stuck loading."
+            f"SQL Agent page opened, but the question input did not appear within "
+            f"{SQL_AGENT_READY_TIMEOUT_MS // 1000} seconds. "
+            "The account may not have SQL Agent access, the path may be wrong, "
+            "or the page is stuck loading. A screenshot of what the tool saw "
+            "has been saved alongside the run for diagnosis."
         )
         log(f"[page-error] {msg}")
         raise RuntimeError(msg) from e
