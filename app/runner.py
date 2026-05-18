@@ -272,6 +272,15 @@ class StopRequested(Exception):
     """
 
 
+class UpstreamFailure(Exception):
+    """Raised when an upstream API short-circuits a wait — e.g., generate-sql
+    returns HTTP 422 while we're waiting for run-sql. There's no point
+    waiting the rest of the timeout because run-sql will never fire."""
+    def __init__(self, response):
+        self.response = response
+        super().__init__(f"upstream failure: {response.url} HTTP {response.status}")
+
+
 def _wait_for_response_interruptible(
     page: "Page",
     predicate,
@@ -280,26 +289,39 @@ def _wait_for_response_interruptible(
     should_stop,
     click_fn=None,
     poll_interval_ms: int = 1000,
+    fail_response_predicate=None,
 ):
     """Wait for the first response matching ``predicate``, but check
     ``should_stop()`` every ``poll_interval_ms`` so the run can be aborted
     promptly. Returns the captured Response, or raises StopRequested /
-    PWTimeoutError.
+    UpstreamFailure / PWTimeoutError.
+
+    If ``fail_response_predicate`` is provided and matches any response
+    while we're waiting, we raise UpstreamFailure carrying that response.
+    Use case: generate-sql 4xx means the LLM rejected the question and
+    run-sql will never fire — there's no point waiting the full 120s
+    for a response that's never coming.
 
     Why we don't use page.expect_response: that context manager blocks for
-    the full timeout in one go. We need to interleave stop-flag checks. We
-    register a page.on("response") listener BEFORE firing ``click_fn`` (so
-    we don't race the response), then poll in short ticks.
+    the full timeout in one go. We need to interleave stop-flag checks
+    and the upstream-failure short-circuit. We register a page.on("response")
+    listener BEFORE firing ``click_fn`` (so we don't race the response),
+    then poll in short ticks.
     """
-    captured: dict[str, Any] = {"resp": None}
+    captured: dict[str, Any] = {"resp": None, "fail": None}
 
     def _on_response(resp):
-        if captured["resp"] is None:
-            try:
-                if predicate(resp):
-                    captured["resp"] = resp
-            except Exception:
-                pass
+        try:
+            # Check for the success target first — if a single response
+            # satisfies both, prefer success.
+            if captured["resp"] is None and predicate(resp):
+                captured["resp"] = resp
+                return
+            if (captured["fail"] is None and fail_response_predicate
+                    and fail_response_predicate(resp)):
+                captured["fail"] = resp
+        except Exception:
+            pass
 
     page.on("response", _on_response)
     try:
@@ -311,6 +333,8 @@ def _wait_for_response_interruptible(
                 raise StopRequested("user requested stop while waiting for response")
             if captured["resp"] is not None:
                 return captured["resp"]
+            if captured["fail"] is not None:
+                raise UpstreamFailure(captured["fail"])
             # page.wait_for_timeout uses Playwright's event loop, which lets
             # the response handler fire while we're sleeping. Don't replace
             # this with time.sleep — that blocks Chromium's event delivery
@@ -874,7 +898,19 @@ def submit_query(
     # blocked for the FULL run_sql_timeout_ms (up to 10 minutes on slow
     # tenants), which meant a user clicking Stop sat with "Stopping…" for
     # that long because should_stop() was only checked between queries.
-    # The helper polls should_stop() every 1s while waiting.
+    # The helper polls should_stop() every 1s while waiting, and now also
+    # short-circuits if generate-sql returns 4xx (the LLM rejected the
+    # question, so run-sql will never fire — no point waiting 120s for
+    # a response that's not coming).
+    def _looks_like_genuine_gen_sql_failure(r) -> bool:
+        try:
+            url_low = r.url.lower()
+            return (any(h in url_low for h in GEN_SQL_HINTS)
+                    and r.status is not None
+                    and r.status >= 400)
+        except Exception:
+            return False
+
     run_sql_resp = None
     try:
         emit_activity(
@@ -888,6 +924,7 @@ def submit_query(
             timeout_ms=cfg.run_sql_timeout_ms,
             should_stop=cfg.should_stop,
             click_fn=click_send,
+            fail_response_predicate=_looks_like_genuine_gen_sql_failure,
         )
         qresult.notes.append(f"run-sql HTTP {run_sql_resp.status} {run_sql_resp.url}")
         emit_activity("api", f"run-sql responded HTTP {run_sql_resp.status}")
@@ -895,6 +932,23 @@ def submit_query(
         qresult.notes.append("run-sql wait aborted by Stop request")
         emit_activity("stop", "Stop requested — aborting run-sql wait")
         raise
+    except UpstreamFailure as uf:
+        # generate-sql returned a 4xx — the LLM couldn't generate SQL for
+        # this question (e.g. 422 Unprocessable Entity). run-sql is never
+        # going to fire. Surface this as the actual reason rather than
+        # waiting the full timeout and reporting a misleading "TIMEOUT".
+        gs_resp = uf.response
+        qresult.notes.append(
+            f"generate-sql HTTP {gs_resp.status} — Celerant LLM rejected the question; "
+            "skipping run-sql wait"
+        )
+        qresult.validations["generate_sql_failed_status"] = gs_resp.status
+        emit_activity(
+            "api-error",
+            f"generate-sql HTTP {gs_resp.status} — the LLM could not generate SQL for "
+            "this question. Fast-failing this query instead of waiting for run-sql.",
+        )
+        return
     except PWTimeoutError:
         qresult.notes.append(f"run-sql TIMEOUT after {cfg.run_sql_timeout_ms}ms")
         emit_activity(
@@ -1132,8 +1186,33 @@ def validate_query(qr: QueryResult) -> None:
 
     fails: list[str] = []
     warns: list[str] = []
+    # Informational observations — surfaced to the user in the report but
+    # NOT contributing to PARTIAL status. These are things the tool noticed
+    # about the upstream Celerant LLM output (alias bugs, column rename in
+    # the chart payload) that don't actually mean the query failed.
+    infos: list[str] = []
+
+    # If generate-sql came back with a 4xx, the LLM couldn't process the
+    # question. That's THE real failure reason — surface it before the
+    # downstream "run-sql call missing" message, which is just a symptom.
+    gs = qr.generate_sql_call
+    if gs and gs.status and gs.status >= 400:
+        fails.append(
+            f"generate-sql HTTP {gs.status} — Celerant LLM could not generate SQL "
+            "for this question"
+        )
+        # And clear the misleading timeout flag — this isn't a real timeout,
+        # we know exactly why nothing downstream happened.
+        if qr.timed_out and v.get("timed_out_on") in ("run-sql", "generate-viz"):
+            qr.timed_out = False
+            v["timed_out_on"] = None
+            v["reclassified_from_timeout"] = True
+
     if not v.get("run_sql_present"):
-        fails.append("run-sql call missing")
+        # Only flag as "missing" if there wasn't an upstream 4xx already
+        # accounting for it.
+        if not (gs and gs.status and gs.status >= 400):
+            fails.append("run-sql call missing")
     elif not v.get("run_sql_status_ok"):
         fails.append(f"run-sql HTTP {qr.run_sql_call.status if qr.run_sql_call else 'n/a'}")
     elif not v.get("run_sql_has_rows"):
@@ -1141,29 +1220,50 @@ def validate_query(qr: QueryResult) -> None:
 
     viz_button_present = v.get("viz_button_present")
     if viz_button_present is False:
-        v["viz_skipped_reason"] = "Generate Visualization button not rendered (single-column / non-chartable result)"
+        # The Celerant UI hides the Generate Visualization button for
+        # single-column / non-chartable results. This is the intended product
+        # behaviour — the data came back fine, there just isn't a meaningful
+        # chart to draw. Do NOT count this against the query.
+        v["viz_skipped_reason"] = "Generate Visualization button not rendered (single-column / non-chartable result by design)"
+        infos.append("Generate Visualization button intentionally hidden by Celerant UI for this result")
     elif not v.get("generate_viz_present"):
-        fails.append("generate-viz call missing")
+        # Only a real fail if there wasn't an upstream 4xx already.
+        if not (gs and gs.status and gs.status >= 400):
+            fails.append("generate-viz call missing")
     elif not v.get("generate_viz_status_ok"):
         fails.append(f"generate-viz HTTP {qr.generate_viz_call.status if qr.generate_viz_call else 'n/a'}")
     elif not v.get("generate_viz_has_chart"):
         warns.append("generate-viz returned no usable chart payload")
 
+    # "Columns differ" is almost always a false positive: run-sql's column
+    # name reflects the SQL alias (often empty when the LLM forgot AS), while
+    # generate-viz reports the raw SQL EXPRESSION ("COALESCE(...)" etc). They
+    # describe the same data, so this is informational only.
     if v.get("columns_synced_run_sql_vs_generate_viz") is False:
-        warns.append("columns differ between run-sql and generate-viz")
-    if v.get("run_sql_empty_named_columns"):
-        warns.append(f"run-sql returned {v['run_sql_empty_named_columns']} column(s) with empty/missing name (SQL aliasing bug)")
+        infos.append("columns labelled differently between run-sql and generate-viz "
+                     "(usually means the LLM omitted an AS alias in the generated SQL — "
+                     "data is the same)")
 
-    if qr.timed_out:
-        qr.overall_status = "TIMEOUT"
-    elif fails:
+    # Empty column name is a real upstream LLM/SQL issue worth flagging, but
+    # the data IS still usable. Informational only, not PARTIAL.
+    if v.get("run_sql_empty_named_columns"):
+        infos.append(
+            f"run-sql returned {v['run_sql_empty_named_columns']} column(s) with "
+            "empty/missing name — the LLM-generated SQL omitted an AS alias on one "
+            "or more expressions (e.g. COALESCE without alias). Data is still usable."
+        )
+
+    if fails:
         qr.overall_status = "FAIL"
+    elif qr.timed_out:
+        qr.overall_status = "TIMEOUT"
     elif warns:
         qr.overall_status = "PARTIAL"
     else:
         qr.overall_status = "PASS"
     v["fail_reasons"] = fails
     v["warn_reasons"] = warns
+    v["info_reasons"] = infos
 
 
 def extract_table_shape(body: Any) -> tuple[list[str], int, bool]:

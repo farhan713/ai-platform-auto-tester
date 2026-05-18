@@ -468,6 +468,7 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
             "validations": {
                 "fail_reasons": v.get("fail_reasons") or [],
                 "warn_reasons": v.get("warn_reasons") or [],
+                "info_reasons": v.get("info_reasons") or [],
                 "run_sql_row_count": v.get("run_sql_row_count"),
             },
             "run_sql_call": {"status": rs.get("status")} if rs else None,
