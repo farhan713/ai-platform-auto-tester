@@ -322,6 +322,23 @@ pre {
    ============================================================ */
 .meta { color: var(--text-muted); font-size: 12px; }
 .muted { color: var(--text-muted); }
+
+/* Inline reason cell shown in the All Queries table. */
+.reason {
+  display: inline-block;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border-left: 3px solid var(--border);
+  max-width: 360px;
+  white-space: normal;
+}
+.reason-fail { background: rgba(198, 40, 40, 0.08); border-left-color: var(--fail); color: var(--fail); }
+.reason-warn { background: rgba(212, 154, 0, 0.10); border-left-color: var(--partial); color: var(--partial); }
+.reason-info { background: var(--code-bg); border-left-color: var(--text-muted); color: var(--text-muted); }
+.http-bad   { color: var(--fail); font-weight: 600; }
+
 .empty {
   text-align: center; padding: 48px 16px;
   color: var(--text-muted); border: 1px dashed var(--border);

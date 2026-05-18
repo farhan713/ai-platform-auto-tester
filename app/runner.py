@@ -1086,10 +1086,50 @@ def submit_query(
     qresult.screenshots.append(_screenshot(page, screenshot_dir / f"q{qresult.id:02d}_03_viz.png"))
 
 
-def _screenshot(page: Page, path: Path) -> str:
+def _screenshot(page: Page, path: Path, *, focus_latest: bool = True) -> str:
+    """Save a screenshot of the page.
+
+    Previously this was ``full_page=True``, which captures the entire chat
+    history — including every previous query's result table and chart. By
+    q12 that means the screenshot is dominated by q01-q11 content; the
+    actual state for the current query is buried at the bottom and the file
+    is huge. Users reported "we are getting ss for wrong questions".
+
+    Fix: take a viewport screenshot (just what fits on a 1440x900 screen)
+    and scroll the latest chat turn into view first, so what's framed is
+    the current query's result or input — not the accumulated history.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(path), full_page=True)
+        if focus_latest:
+            try:
+                # Scroll the SPA's chat history container AND the window
+                # to the bottom so the most recent turn is in viewport.
+                # The Skylar IQ SPA uses a flex column where new turns
+                # append to the bottom; scrolling any reachable scroll
+                # container catches the case where it's not the window.
+                page.evaluate("""() => {
+                    try { window.scrollTo(0, document.body.scrollHeight); } catch(e) {}
+                    const sels = [
+                        '.chat-messages', '.chat-history', '.chat-body',
+                        '.screen-container', '.home', '.app',
+                        '[class*="chat"]', '[class*="message-list"]'
+                    ];
+                    for (const sel of sels) {
+                        document.querySelectorAll(sel).forEach(el => {
+                            try {
+                                if (el.scrollHeight > el.clientHeight) {
+                                    el.scrollTop = el.scrollHeight;
+                                }
+                            } catch(e) {}
+                        });
+                    }
+                }""")
+                # Small pause so the scroll lands before the screenshot.
+                page.wait_for_timeout(150)
+            except Exception:
+                pass
+        page.screenshot(path=str(path), full_page=False)
         return str(path)
     except Exception:
         return ""

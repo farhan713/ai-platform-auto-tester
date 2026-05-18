@@ -434,6 +434,48 @@ def _all_results_for_run(run_id: str) -> list[dict[str, Any]]:
     return [r["record"] for r in rows]
 
 
+# Warning patterns that are observations about the upstream LLM/SQL output,
+# not real test failures. v3.7.7 demoted these from warn_reasons → info_reasons
+# in the validator. Records saved BEFORE v3.7.7 still have them in warn_reasons,
+# which keeps showing them as PARTIAL. We re-classify them here on display so
+# the user sees consistent results across the whole history.
+_INFO_GRADE_WARN_PATTERNS = (
+    "empty/missing name",                                  # LLM forgot AS alias
+    "columns differ between run-sql and generate-viz",     # alias vs raw expression
+)
+
+
+def _reclassify_legacy_validations(v: dict[str, Any], stored_status: str) -> tuple[str, list[str], list[str], list[str]]:
+    """Re-apply v3.7.7 validation rules to a stored record.
+
+    Returns (overall_status, fail_reasons, warn_reasons, info_reasons).
+    For records saved before v3.7.7 the warning bucket contains entries that
+    are now considered informational; we promote them out of warn_reasons so
+    the status no longer reads PARTIAL just because the LLM forgot an alias.
+    """
+    fails = list(v.get("fail_reasons") or [])
+    warns_raw = list(v.get("warn_reasons") or [])
+    infos = list(v.get("info_reasons") or [])
+
+    promoted_warns: list[str] = []
+    real_warns: list[str] = []
+    for w in warns_raw:
+        if any(p in w for p in _INFO_GRADE_WARN_PATTERNS):
+            promoted_warns.append(w)
+        else:
+            real_warns.append(w)
+    # If info_reasons already had entries (v3.7.7+ run), don't duplicate.
+    for w in promoted_warns:
+        if w not in infos:
+            infos.append(w)
+
+    # Now compute the effective status. We only override DOWN-grade (PARTIAL→PASS),
+    # never up-grade — PASS stays PASS, FAIL stays FAIL, TIMEOUT stays TIMEOUT.
+    if stored_status == "PARTIAL" and not fails and not real_warns:
+        return "PASS", fails, real_warns, infos
+    return stored_status, fails, real_warns, infos
+
+
 def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
     """Slim per-query summary used by the run dashboard tabs.
 
@@ -444,6 +486,9 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
     even show the list. The dashboard only needs status, timing, validation
     reasons, and a per-call classification/status/duration count for the
     Network tab — so we project out exactly those fields here.
+
+    Also applies v3.7.7's relaxed validation rules to records saved by older
+    validators (see _reclassify_legacy_validations).
     """
     rows = db.fetch_all(
         "SELECT record FROM query_results WHERE run_id = %s ORDER BY qid", (run_id,))
@@ -453,6 +498,8 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
         v = rec.get("validations") or {}
         rs = rec.get("run_sql_call") or {}
         gv = rec.get("generate_viz_call") or {}
+        gs = rec.get("generate_sql_call") or {}
+
         slim_calls = []
         for c in (rec.get("calls") or []):
             slim_calls.append({
@@ -460,19 +507,27 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
                 "status": c.get("status"),
                 "duration_ms": c.get("duration_ms"),
             })
+
+        effective_status, fails, warns, infos = _reclassify_legacy_validations(
+            v, rec.get("overall_status") or ""
+        )
+
         out.append({
             "id": rec.get("id"),
             "nl_query": rec.get("nl_query"),
-            "overall_status": rec.get("overall_status"),
+            "overall_status": effective_status,
+            "stored_status": rec.get("overall_status"),  # original from DB, for debugging
             "total_duration_ms": rec.get("total_duration_ms"),
             "validations": {
-                "fail_reasons": v.get("fail_reasons") or [],
-                "warn_reasons": v.get("warn_reasons") or [],
-                "info_reasons": v.get("info_reasons") or [],
+                "fail_reasons": fails,
+                "warn_reasons": warns,
+                "info_reasons": infos,
                 "run_sql_row_count": v.get("run_sql_row_count"),
+                "run_sql_returned_sql": v.get("run_sql_returned_sql"),
             },
             "run_sql_call": {"status": rs.get("status")} if rs else None,
             "generate_viz_call": {"status": gv.get("status")} if gv else None,
+            "generate_sql_call": {"status": gs.get("status")} if gs else None,
             "calls": slim_calls,
         })
     return out
@@ -812,14 +867,24 @@ def job_query_view(job_id: str, qid: int):
 def job_status(job_id: str):
     run = _run_owned_by_current_user(job_id)
     if not run: abort(404)
+    # Pull the full record JSONB for the re-validation pass — without it we'd
+    # show stored PARTIALs that the v3.7.7 logic would consider PASS, which
+    # would disagree with the All Queries table that DOES re-validate.
     rows = db.fetch_all(
-        "SELECT qid, status, duration_ms, nl_query FROM query_results WHERE run_id = %s ORDER BY qid",
+        "SELECT qid, status, duration_ms, nl_query, record FROM query_results "
+        "WHERE run_id = %s ORDER BY qid",
         (job_id,))
     counts = {"PASS": 0, "PARTIAL": 0, "FAIL": 0, "TIMEOUT": 0, "PENDING": 0}
+    effective_by_qid: dict[int, str] = {}
     for r in rows:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        rec = r.get("record") or {}
+        v = rec.get("validations") or {}
+        effective, _, _, _ = _reclassify_legacy_validations(v, r["status"] or "")
+        effective_by_qid[r["qid"]] = effective
+        counts[effective] = counts.get(effective, 0) + 1
     last5 = [{"id": r["qid"], "nl_query": (r["nl_query"] or "")[:80],
-              "status": r["status"], "duration_ms": r["duration_ms"]} for r in rows[-5:]]
+              "status": effective_by_qid.get(r["qid"], r["status"]),
+              "duration_ms": r["duration_ms"]} for r in rows[-5:]]
     stop_requested = bool(_stop_events.get(job_id) and _stop_events[job_id].is_set())
     return jsonify({
         "job_id": job_id, "status": run["status"],
@@ -892,7 +957,22 @@ def job_result(job_id: str, qid: int):
     )
     if not row:
         return jsonify({"pending": True, "id": qid}), 202
-    return jsonify(row["record"])
+    rec = row["record"] or {}
+    # Apply the v3.7.7 re-validation so the detail page is consistent with
+    # the All Queries table — otherwise an older record would still read
+    # PARTIAL here even though the list view shows it as PASS.
+    v = rec.get("validations") or {}
+    effective, fails, warns, infos = _reclassify_legacy_validations(
+        v, rec.get("overall_status") or ""
+    )
+    if rec.get("overall_status") != effective:
+        rec["stored_status"] = rec.get("overall_status")
+        rec["overall_status"] = effective
+    v["fail_reasons"] = fails
+    v["warn_reasons"] = warns
+    v["info_reasons"] = infos
+    rec["validations"] = v
+    return jsonify(rec)
 
 
 @app.route("/jobs/<job_id>/screenshots/<path:rel>")

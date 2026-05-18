@@ -120,7 +120,7 @@
     <div style="overflow-x:auto">
       <table class="table" id="queries-tbl">
         <thead>
-          <tr><th>q</th><th>Status</th><th>Question</th><th>run-sql</th><th>generate-viz</th><th>Duration</th><th></th></tr>
+          <tr><th>q</th><th>Status</th><th>Question</th><th>generate-sql</th><th>run-sql</th><th>generate-viz</th><th>Reason</th><th>Duration</th><th></th></tr>
         </thead>
         <tbody><tr><td colspan="7" class="table-empty">Waiting for results…</td></tr></tbody>
       </table>
@@ -351,20 +351,44 @@ function renderQueries() {
 
   const tbody = document.querySelector('#queries-tbl tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No queries match.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No queries match.</td></tr>';
     return;
   }
+
+  // Pick the most informative reason for the inline cell. Order of preference:
+  //   1. First fail_reason (real failure — always worth surfacing)
+  //   2. First warn_reason (PARTIAL trigger)
+  //   3. First info_reason (informational — only shown if no fails/warns)
+  function pickReason(v) {
+    const fails = v.fail_reasons || [];
+    const warns = v.warn_reasons || [];
+    const infos = v.info_reasons || [];
+    if (fails.length) return { text: fails[0], kind: 'fail' };
+    if (warns.length) return { text: warns[0], kind: 'warn' };
+    if (infos.length) return { text: infos[0], kind: 'info' };
+    return null;
+  }
+
   tbody.innerHTML = rows.map(r => {
     const v = r.validations || {};
     const rs = r.run_sql_call || {};
     const gv = r.generate_viz_call || {};
+    const gs = r.generate_sql_call || {};
+    const reason = pickReason(v);
+    const reasonCell = reason
+      ? `<span class="reason reason-${reason.kind}" title="${SQA.escapeHtml(reason.text)}">${SQA.escapeHtml(reason.text.slice(0, 70))}${reason.text.length > 70 ? '…' : ''}</span>`
+      : '<span class="meta">—</span>';
+    // Color generate-sql HTTP 4xx red so the LLM-rejected questions stand out.
+    const gsStatusCls = gs.status && gs.status >= 400 ? 'http-bad' : '';
     return `
     <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(jobId)}/queries/${r.id}'">
       <td><b>q${String(r.id).padStart(2,'0')}</b></td>
       <td><span class="badge ${r.overall_status}">${r.overall_status}</span></td>
       <td>${SQA.escapeHtml((r.nl_query||'').slice(0,90))}${(r.nl_query||'').length > 90 ? '…' : ''}</td>
+      <td>${gs.status ? `<span class="${gsStatusCls}">HTTP ${gs.status}</span>` : '<span class="meta">—</span>'}</td>
       <td>${rs.status ? `HTTP ${rs.status}` : '<span class="meta">—</span>'} ${v.run_sql_row_count != null ? `<span class="meta">(${v.run_sql_row_count}r)</span>` : ''}</td>
       <td>${gv.status ? `HTTP ${gv.status}` : '<span class="meta">—</span>'}</td>
+      <td>${reasonCell}</td>
       <td>${SQA.fmtDuration(r.total_duration_ms)}</td>
       <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(jobId)}/queries/${r.id}" onclick="event.stopPropagation()">Open →</a></td>
     </tr>`;
