@@ -33,6 +33,7 @@ from app.runner import (
     RunConfig, QueryResult, NetworkRecorder, CapturedCall,
     _is_search_keywords_url, _is_search_results_url,
     now_iso, _screenshot, save_query_result, validate_query,
+    _wait_for_response_interruptible, StopRequested,
 )
 
 
@@ -137,20 +138,28 @@ def _submit_search_query(
     # Type the keyword. The ssLibrary widget binds to keyup, so each char fires.
     # We type, take an "input + keyword" screenshot, then wait for the response.
     sk_resp = sr_resp = None
+
+    def _type_keyword():
+        box.type(qr.nl_query, delay=15)
+        # Trigger keyup explicitly in case typing alone doesn't fire it
+        page.keyboard.press("End")
+        # Snap "input with keyword typed" — captures the user-action state
+        # before the popup has a chance to render over it
+        page.wait_for_timeout(150)
+        qr.screenshots.append(_screenshot(page, screenshot_dir / f"q{qr.id:02d}_01_input.png"))
+
     try:
-        with page.expect_response(
+        sk_resp = _wait_for_response_interruptible(
+            page,
             lambda r: _is_search_keywords_url(r.url),
-            timeout=cfg.run_sql_timeout_ms,
-        ) as info_kw:
-            box.type(qr.nl_query, delay=15)
-            # Trigger keyup explicitly in case typing alone doesn't fire it
-            page.keyboard.press("End")
-            # Snap "input with keyword typed" — captures the user-action state
-            # before the popup has a chance to render over it
-            page.wait_for_timeout(150)
-            qr.screenshots.append(_screenshot(page, screenshot_dir / f"q{qr.id:02d}_01_input.png"))
-        sk_resp = info_kw.value
+            timeout_ms=cfg.run_sql_timeout_ms,
+            should_stop=cfg.should_stop,
+            click_fn=_type_keyword,
+        )
         qr.notes.append(f"search_keywords HTTP {sk_resp.status} {sk_resp.url}")
+    except StopRequested:
+        qr.notes.append("search_keywords wait aborted by Stop request")
+        raise
     except PWTimeoutError:
         qr.notes.append(f"search_keywords TIMEOUT after {cfg.run_sql_timeout_ms}ms")
         qr.timed_out = True
@@ -161,24 +170,28 @@ def _submit_search_query(
         except Exception: pass
         return
     except Exception as e:
-        qr.notes.append(f"search_keywords expect_response error: {type(e).__name__}: {e}")
+        qr.notes.append(f"search_keywords interruptible wait error: {type(e).__name__}: {e}")
 
-    # Wait for the results call (search_multi_keyword_and_results OR search_results)
+    # Wait for the results call (search_multi_keyword_and_results OR search_results).
+    # No click_fn here: the ssLibrary widget chains keywords → results automatically.
     try:
-        with page.expect_response(
+        sr_resp = _wait_for_response_interruptible(
+            page,
             lambda r: _is_search_results_url(r.url),
-            timeout=cfg.gen_viz_timeout_ms,
-        ) as info_res:
-            # The ssLibrary widget chains keywords → results automatically. Just wait.
-            pass
-        sr_resp = info_res.value
+            timeout_ms=cfg.gen_viz_timeout_ms,
+            should_stop=cfg.should_stop,
+            click_fn=None,
+        )
         qr.notes.append(f"search_results HTTP {sr_resp.status} {sr_resp.url}")
+    except StopRequested:
+        qr.notes.append("search_results wait aborted by Stop request")
+        raise
     except PWTimeoutError:
         qr.notes.append(f"search_results TIMEOUT after {cfg.gen_viz_timeout_ms}ms")
         qr.timed_out = True
         qr.validations["timed_out_on"] = "search_results"
     except Exception as e:
-        qr.notes.append(f"search_results expect_response error: {type(e).__name__}: {e}")
+        qr.notes.append(f"search_results interruptible wait error: {type(e).__name__}: {e}")
 
     # CRITICAL: wait for the popup to actually render before screenshotting.
     # ssLibrary's .ss-popup wrapper holds the keyword-list + product results.
@@ -446,6 +459,13 @@ def run_sitesearch(cfg: RunConfig) -> dict[str, Any]:
                 _submit_search_query(page, recorder, cfg, qr, screenshot_dir)
                 qr.calls = recorder.snapshot_after(start)
                 _validate_sitesearch_query(qr)
+            except StopRequested:
+                # User clicked Stop while this query was mid-flight. Don't
+                # mark it FAIL — surface it as STOPPED and bail out of the
+                # outer loop after bookkeeping.
+                qr.overall_status = "STOPPED"
+                qr.notes.append("aborted by user Stop request mid-query")
+                stopped = True
             except Exception as e:
                 qr.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 qr.overall_status = "FAIL"
@@ -463,6 +483,11 @@ def run_sitesearch(cfg: RunConfig) -> dict[str, Any]:
             log(f"[q{qr.id:02d}] {qr.overall_status} ({qr.total_duration_ms} ms)")
             save_query_result(qr, cfg.output_dir)
             all_results.append(qr)
+
+            # Stop fired mid-query — exit immediately, skip post-query reload.
+            if stopped:
+                log("[run] stopping run after current query was aborted by user")
+                break
 
             if qr.timed_out:
                 # Reset by reloading the page

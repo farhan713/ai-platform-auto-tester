@@ -178,6 +178,80 @@ def derive_sql_agent_url(login_url: str, sql_agent_path: str) -> str:
     return origin + sql_agent_path
 
 
+class StopRequested(Exception):
+    """Raised when a user clicks Stop while a long-running wait is in flight.
+
+    The original blocking calls (page.expect_response with 600s timeout)
+    could not be cancelled from another thread, so the Stop button only
+    fired *between* queries. That meant "Stopping…" sat for up to 10
+    minutes if Stop was clicked while waiting on run-sql for a slow tenant.
+    """
+
+
+def _wait_for_response_interruptible(
+    page: "Page",
+    predicate,
+    timeout_ms: int,
+    *,
+    should_stop,
+    click_fn=None,
+    poll_interval_ms: int = 1000,
+):
+    """Wait for the first response matching ``predicate``, but check
+    ``should_stop()`` every ``poll_interval_ms`` so the run can be aborted
+    promptly. Returns the captured Response, or raises StopRequested /
+    PWTimeoutError.
+
+    Why we don't use page.expect_response: that context manager blocks for
+    the full timeout in one go. We need to interleave stop-flag checks. We
+    register a page.on("response") listener BEFORE firing ``click_fn`` (so
+    we don't race the response), then poll in short ticks.
+    """
+    captured: dict[str, Any] = {"resp": None}
+
+    def _on_response(resp):
+        if captured["resp"] is None:
+            try:
+                if predicate(resp):
+                    captured["resp"] = resp
+            except Exception:
+                pass
+
+    page.on("response", _on_response)
+    try:
+        if click_fn is not None:
+            click_fn()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            if should_stop and should_stop():
+                raise StopRequested("user requested stop while waiting for response")
+            if captured["resp"] is not None:
+                return captured["resp"]
+            # page.wait_for_timeout uses Playwright's event loop, which lets
+            # the response handler fire while we're sleeping. Don't replace
+            # this with time.sleep — that blocks Chromium's event delivery
+            # to our process.
+            remaining_ms = max(50, min(poll_interval_ms,
+                                       int((deadline - time.monotonic()) * 1000)))
+            try:
+                page.wait_for_timeout(remaining_ms)
+            except Exception:
+                # If the page died mid-wait (TargetClosedError), let the
+                # caller's existing handlers see it.
+                if captured["resp"] is not None:
+                    return captured["resp"]
+                raise
+        # Timed out without a response.
+        raise PWTimeoutError(
+            f"interruptible wait: no matching response within {timeout_ms}ms"
+        )
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # NetworkRecorder
 # ---------------------------------------------------------------------------
@@ -657,7 +731,11 @@ def submit_query(
         except Exception as e:
             qresult.notes.append(f"send Enter failed: {e}")
 
-    # run-sql wait via Playwright's event-driven API
+    # run-sql wait — interruptible. The previous page.expect_response(...)
+    # blocked for the FULL run_sql_timeout_ms (up to 10 minutes on slow
+    # tenants), which meant a user clicking Stop sat with "Stopping…" for
+    # that long because should_stop() was only checked between queries.
+    # The helper polls should_stop() every 1s while waiting.
     run_sql_resp = None
     try:
         emit_activity(
@@ -665,14 +743,19 @@ def submit_query(
             f"Waiting for run-sql response (timeout {cfg.run_sql_timeout_ms // 1000}s). "
             "If this times out, no run-sql API response was received before the limit.",
         )
-        with page.expect_response(
+        run_sql_resp = _wait_for_response_interruptible(
+            page,
             lambda r: _is_run_sql_url(r.url),
-            timeout=cfg.run_sql_timeout_ms,
-        ) as info:
-            click_send()
-        run_sql_resp = info.value
+            timeout_ms=cfg.run_sql_timeout_ms,
+            should_stop=cfg.should_stop,
+            click_fn=click_send,
+        )
         qresult.notes.append(f"run-sql HTTP {run_sql_resp.status} {run_sql_resp.url}")
         emit_activity("api", f"run-sql responded HTTP {run_sql_resp.status}")
+    except StopRequested:
+        qresult.notes.append("run-sql wait aborted by Stop request")
+        emit_activity("stop", "Stop requested — aborting run-sql wait")
+        raise
     except PWTimeoutError:
         qresult.notes.append(f"run-sql TIMEOUT after {cfg.run_sql_timeout_ms}ms")
         emit_activity(
@@ -685,7 +768,7 @@ def submit_query(
         qresult.validations["timed_out_on"] = "run-sql"
         return
     except Exception as e:
-        qresult.notes.append(f"run-sql expect_response error: {type(e).__name__}: {e}")
+        qresult.notes.append(f"run-sql interruptible wait error: {type(e).__name__}: {e}")
         emit_activity("api-error", f"run-sql wait error: {type(e).__name__}: {e}")
 
     page.wait_for_timeout(500)
@@ -743,27 +826,36 @@ def submit_query(
 
     viz_started_iso = now_iso()
     gen_viz_resp = None
+
+    def _click_viz_btn():
+        try:
+            target = gv_btn.last
+            target.scroll_into_view_if_needed(timeout=3000)
+            target.click(timeout=5000)
+            qresult.notes.append("clicked Generate Visualization")
+        except Exception as e:
+            qresult.notes.append(f"Generate Visualization click failed: {e}")
+            raise
+
     try:
         emit_activity(
             "api",
             f"Waiting for generate-viz response (timeout {cfg.gen_viz_timeout_ms // 1000}s). "
             "If this times out, no visualization API response was received before the limit.",
         )
-        with page.expect_response(
+        gen_viz_resp = _wait_for_response_interruptible(
+            page,
             lambda r: _is_gen_viz_url(r.url),
-            timeout=cfg.gen_viz_timeout_ms,
-        ) as gv_info:
-            try:
-                target = gv_btn.last
-                target.scroll_into_view_if_needed(timeout=3000)
-                target.click(timeout=5000)
-                qresult.notes.append("clicked Generate Visualization")
-            except Exception as e:
-                qresult.notes.append(f"Generate Visualization click failed: {e}")
-                raise
-        gen_viz_resp = gv_info.value
+            timeout_ms=cfg.gen_viz_timeout_ms,
+            should_stop=cfg.should_stop,
+            click_fn=_click_viz_btn,
+        )
         qresult.notes.append(f"generate-viz HTTP {gen_viz_resp.status} {gen_viz_resp.url}")
         emit_activity("api", f"generate-viz responded HTTP {gen_viz_resp.status}")
+    except StopRequested:
+        qresult.notes.append("generate-viz wait aborted by Stop request")
+        emit_activity("stop", "Stop requested — aborting generate-viz wait")
+        raise
     except PWTimeoutError:
         qresult.notes.append(f"generate-viz TIMEOUT after {cfg.gen_viz_timeout_ms}ms")
         emit_activity(
@@ -775,7 +867,7 @@ def submit_query(
         qresult.timed_out = True
         qresult.validations["timed_out_on"] = "generate-viz"
     except Exception as e:
-        qresult.notes.append(f"generate-viz expect_response error: {type(e).__name__}: {e}")
+        qresult.notes.append(f"generate-viz interruptible wait error: {type(e).__name__}: {e}")
         emit_activity("api-error", f"generate-viz wait error: {type(e).__name__}: {e}")
 
     page.wait_for_timeout(700)
@@ -1227,6 +1319,14 @@ def run(cfg: RunConfig) -> dict[str, Any]:
                 submit_query(page, recorder, cfg, qr, screenshot_dir)
                 qr.calls = recorder.snapshot_after(start)
                 validate_query(qr)
+            except StopRequested:
+                # User clicked Stop while this query was mid-flight. Mark the
+                # query as STOPPED (not FAIL) and exit the outer loop after
+                # the bookkeeping below — don't let the generic except below
+                # turn this into a confusing "FAIL: StopRequested" row.
+                qr.overall_status = "STOPPED"
+                qr.notes.append("aborted by user Stop request mid-query")
+                stopped = True
             except Exception as e:
                 qr.error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
                 qr.overall_status = "FAIL"
@@ -1255,6 +1355,13 @@ def run(cfg: RunConfig) -> dict[str, Any]:
             log(f"[q{qr.id:02d}] {qr.overall_status} ({qr.total_duration_ms} ms)")
             save_query_result(qr, cfg.output_dir)
             all_results.append(qr)
+
+            # If StopRequested fired mid-query, bail out NOW — don't bother
+            # with the post-query reload/recovery logic below, and don't
+            # iterate to the next question. The user wants out, immediately.
+            if stopped:
+                log("[run] stopping run after current query was aborted by user")
+                break
 
             if qr.timed_out and _is_page_alive(page):
                 try:
