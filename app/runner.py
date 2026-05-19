@@ -1248,17 +1248,38 @@ def validate_query(qr: QueryResult) -> None:
             v["timed_out_on"] = None
             v["reclassified_from_timeout"] = True
 
+    # Whether something upstream of generate-viz already explains why the viz
+    # call didn't fire. We must not blame "generate-viz call missing" when
+    # there's a clear preceding cause — that's the chain-of-blame bug users
+    # reported on run 54ad901a where q02-q05 timed out on run-sql, never got
+    # to check the viz button, and then got marked FAIL with "generate-viz
+    # call missing" instead of the real upstream timeout.
+    viz_button_present = v.get("viz_button_present")
+    upstream_gen_sql_4xx = bool(gs and gs.status and gs.status >= 400)
+    run_sql_timed_out = bool(qr.timed_out and v.get("timed_out_on") == "run-sql")
+    submit_query_bailed_before_viz_check = (viz_button_present is None)
+    run_sql_returned_empty = bool(v.get("run_sql_present") and not v.get("run_sql_has_rows"))
+    viz_blocked_by_upstream = (
+        upstream_gen_sql_4xx
+        or run_sql_timed_out
+        or submit_query_bailed_before_viz_check
+        or run_sql_returned_empty
+    )
+
     if not v.get("run_sql_present"):
         # Only flag as "missing" if there wasn't an upstream 4xx already
         # accounting for it.
-        if not (gs and gs.status and gs.status >= 400):
+        if not upstream_gen_sql_4xx:
             fails.append("run-sql call missing")
     elif not v.get("run_sql_status_ok"):
         fails.append(f"run-sql HTTP {qr.run_sql_call.status if qr.run_sql_call else 'n/a'}")
-    elif not v.get("run_sql_has_rows"):
+    elif not v.get("run_sql_has_rows") and not run_sql_timed_out:
+        # "no rows" is a real outcome ONLY when run-sql actually responded.
+        # When run-sql timed out and a later back-fill picked up a hollow
+        # response, the "no rows" warning is misleading — the real reason
+        # is the timeout, which we add as the primary warn further down.
         warns.append("run-sql returned no rows")
 
-    viz_button_present = v.get("viz_button_present")
     if viz_button_present is False:
         # The Celerant UI hides the Generate Visualization button for
         # single-column / non-chartable results. This is the intended product
@@ -1267,9 +1288,17 @@ def validate_query(qr: QueryResult) -> None:
         v["viz_skipped_reason"] = "Generate Visualization button not rendered (single-column / non-chartable result by design)"
         infos.append("Generate Visualization button intentionally hidden by Celerant UI for this result")
     elif not v.get("generate_viz_present"):
-        # Only a real fail if there wasn't an upstream 4xx already.
-        if not (gs and gs.status and gs.status >= 400):
+        # ONLY a real fail if no upstream cause already explains why viz
+        # never happened. Upstream causes include gen-sql 4xx, run-sql
+        # timeout (the viz check was skipped), run-sql returned 0 rows,
+        # or submit_query bailed before reaching the viz check.
+        if not viz_blocked_by_upstream:
             fails.append("generate-viz call missing")
+        elif submit_query_bailed_before_viz_check and not (upstream_gen_sql_4xx or run_sql_timed_out or run_sql_returned_empty):
+            # Defensive: viz check was skipped but we don't have a known
+            # upstream cause. Surface this as an info so we don't silently
+            # eat what might be a real bug.
+            infos.append("generate-viz step was not reached (submit_query exited early before the visualization check)")
     elif not v.get("generate_viz_status_ok"):
         fails.append(f"generate-viz HTTP {qr.generate_viz_call.status if qr.generate_viz_call else 'n/a'}")
     elif not v.get("generate_viz_has_chart"):
@@ -1292,6 +1321,19 @@ def validate_query(qr: QueryResult) -> None:
             "empty/missing name — the LLM-generated SQL omitted an AS alias on one "
             "or more expressions (e.g. COALESCE without alias). Data is still usable."
         )
+
+    # When the query timed out, give the user a clear, primary reason in the
+    # warns list — the inline "Reason" cell on the dashboard reads the first
+    # warn when there are no fails. Without this, a TIMEOUT row showed an
+    # empty Reason cell, leaving the user wondering what happened.
+    timed_out_on = v.get("timed_out_on")
+    if qr.timed_out and timed_out_on:
+        timeout_msg = (
+            f"{timed_out_on} did not respond within the configured timeout — "
+            "downstream steps (visualization, validation) were skipped"
+        )
+        if timeout_msg not in warns:
+            warns.insert(0, timeout_msg)
 
     if fails:
         qr.overall_status = "FAIL"

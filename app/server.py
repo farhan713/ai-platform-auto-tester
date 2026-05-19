@@ -446,17 +446,28 @@ _INFO_GRADE_WARN_PATTERNS = (
 
 
 def _reclassify_legacy_validations(v: dict[str, Any], stored_status: str) -> tuple[str, list[str], list[str], list[str]]:
-    """Re-apply v3.7.7 validation rules to a stored record.
+    """Re-apply v3.7.7 + v3.7.9 validation rules to a stored record.
 
     Returns (overall_status, fail_reasons, warn_reasons, info_reasons).
-    For records saved before v3.7.7 the warning bucket contains entries that
-    are now considered informational; we promote them out of warn_reasons so
-    the status no longer reads PARTIAL just because the LLM forgot an alias.
+
+    Two corrections applied on top of older validators:
+
+    1. Demoted warnings — "empty column name" / "columns differ between
+       run-sql and generate-viz" are observations about the LLM-generated
+       SQL, not test failures. Moved warn → info so they don't keep the
+       record showing PARTIAL.
+
+    2. Chain-of-blame fix — "generate-viz call missing" is a misleading
+       fail when there's a clear upstream cause (run-sql timed out and
+       submit_query bailed before checking the viz button, generate-sql
+       returned 4xx, run-sql returned 0 rows). Strip the symptom and
+       surface the real cause.
     """
     fails = list(v.get("fail_reasons") or [])
     warns_raw = list(v.get("warn_reasons") or [])
     infos = list(v.get("info_reasons") or [])
 
+    # ---- step 1: demote info-grade warnings ----
     promoted_warns: list[str] = []
     real_warns: list[str] = []
     for w in warns_raw:
@@ -464,16 +475,46 @@ def _reclassify_legacy_validations(v: dict[str, Any], stored_status: str) -> tup
             promoted_warns.append(w)
         else:
             real_warns.append(w)
-    # If info_reasons already had entries (v3.7.7+ run), don't duplicate.
     for w in promoted_warns:
         if w not in infos:
             infos.append(w)
 
-    # Now compute the effective status. We only override DOWN-grade (PARTIAL→PASS),
-    # never up-grade — PASS stays PASS, FAIL stays FAIL, TIMEOUT stays TIMEOUT.
-    if stored_status == "PARTIAL" and not fails and not real_warns:
-        return "PASS", fails, real_warns, infos
-    return stored_status, fails, real_warns, infos
+    # ---- step 2: chain-of-blame fix for "generate-viz call missing" ----
+    timed_out_on = v.get("timed_out_on")
+    gs_status = ((v.get("generate_sql_call") if False else None)
+                 or v.get("generate_sql_status_legacy"))  # placeholder
+    upstream_gen_sql_4xx = any(
+        "generate-sql HTTP 4" in f or "generate-sql HTTP 5" in f for f in fails
+    )
+    run_sql_timed_out = bool(timed_out_on == "run-sql")
+    run_sql_returned_empty = (v.get("run_sql_present") is True
+                              and v.get("run_sql_has_rows") is False)
+    viz_blocked_by_upstream = (
+        upstream_gen_sql_4xx or run_sql_timed_out or run_sql_returned_empty
+    )
+    if viz_blocked_by_upstream:
+        fails = [f for f in fails if f != "generate-viz call missing"]
+
+    # ---- step 3: add a primary timeout reason if missing ----
+    if stored_status == "TIMEOUT" and timed_out_on:
+        timeout_msg = (
+            f"{timed_out_on} did not respond within the configured timeout — "
+            "downstream steps (visualization, validation) were skipped"
+        )
+        if not any(timeout_msg in w for w in real_warns):
+            real_warns.insert(0, timeout_msg)
+
+    # ---- step 4: compute the effective status ----
+    # Re-derive status from scratch using the same rules as runner.validate_query.
+    if fails:
+        effective = "FAIL"
+    elif stored_status == "TIMEOUT" or timed_out_on:
+        effective = "TIMEOUT"
+    elif real_warns:
+        effective = "PARTIAL"
+    else:
+        effective = "PASS"
+    return effective, fails, real_warns, infos
 
 
 def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
