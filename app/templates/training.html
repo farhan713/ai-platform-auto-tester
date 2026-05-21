@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}Training{% endblock %}
+{% block header_title %}Training{% endblock %}
+{% block header_sub %}— Submit validated SQL examples to a Celerant tenant{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>Train SQL examples (backoffice-validated)</h2>
+    <p class="meta" style="margin-top:-4px">
+      Uploads a CSV of <code>sql_query</code> rows to the tenant's
+      <code>train_sql_examples_backoffice_validated</code> endpoint. Each row is
+      executed against the backoffice <code>run-sql</code> endpoint; only rows
+      whose response status is <b>success</b> are saved. Failed rows come back
+      in the result below and are <b>not</b> saved.
+    </p>
+
+    <form id="training-form" class="form" enctype="multipart/form-data">
+      <label>
+        <span class="label-text">Database ID <em>required</em></span>
+        <input type="text" name="database_id" id="t-database_id"
+               placeholder="e.g. fd39c82a-aabf-42fd-80fd-0c35b7dfc505" required>
+      </label>
+
+      <label>
+        <span class="label-text">SQL examples CSV</span>
+        <input type="file" name="sql_examples_file" id="t-file" accept=".csv,text/csv">
+        <span class="meta">Upload the CSV here, or use a server-side filepath below. One is required.</span>
+      </label>
+
+      <label>
+        <span class="label-text">…or server-side filepath <em>(optional)</em></span>
+        <input type="text" name="sql_examples_filepath" id="t-filepath"
+               placeholder="sql_examples_filepath (path on the Celerant server)">
+      </label>
+
+      <div class="grid-2">
+        <label>
+          <span class="label-text">skip_display_clean</span>
+          <select name="skip_display_clean" id="t-skip_display_clean">
+            <option value="">— (default)</option>
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+        <label>
+          <span class="label-text">skip_nlq_variants</span>
+          <select name="skip_nlq_variants" id="t-skip_nlq_variants">
+            <option value="">— (default)</option>
+            <option value="true">true</option>
+            <option value="false">false</option>
+          </select>
+        </label>
+      </div>
+
+      <details style="margin:4px 0 8px">
+        <summary class="meta" style="cursor:pointer">Advanced</summary>
+        <label style="margin-top:8px">
+          <span class="label-text">Console URL</span>
+          <input type="url" name="console_url" id="t-console_url"
+                 value="{{ default_console }}"
+                 placeholder="https://celerantai.com">
+          <span class="meta">Origin of the SQL-Agent API. Leave as-is for the default tenant.</span>
+        </label>
+        <label>
+          <span class="label-text">Bearer token <em>(optional)</em></span>
+          <input type="text" name="bearer_token" id="t-bearer_token"
+                 placeholder="only if the tenant enforces HTTPBearer auth" autocomplete="off">
+        </label>
+      </details>
+
+      <button type="submit" class="btn btn-primary" id="t-submit">▶ Submit training</button>
+      <span id="t-inline-status" class="meta" style="margin-left:10px"></span>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Result</h2>
+    <div id="t-result">
+      <p class="meta">Submit the form to call the training endpoint. The full
+      JSON response — including saved rows and any failed rows with their
+      reasons — will appear here.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const form = document.getElementById('training-form');
+const submitBtn = document.getElementById('t-submit');
+const inlineStatus = document.getElementById('t-inline-status');
+const resultEl = document.getElementById('t-result');
+
+function badge(ok, code) {
+  const cls = ok ? 'PASS' : 'FAIL';
+  return `<span class="badge ${cls}">HTTP ${code}</span>`;
+}
+
+// Try to pull a failed-rows array out of the (flexible) response shape so we
+// can show it as a table rather than burying it in raw JSON.
+function extractFailedRows(resp) {
+  if (!resp || typeof resp !== 'object') return null;
+  const keys = ['failed_rows', 'failed', 'failures', 'errors', 'skipped_rows'];
+  for (const k of keys) {
+    if (Array.isArray(resp[k]) && resp[k].length) return { key: k, rows: resp[k] };
+  }
+  return null;
+}
+
+function renderResult(data) {
+  if (!data) { resultEl.innerHTML = '<p class="meta">No response.</p>'; return; }
+  if (data.error) {
+    resultEl.innerHTML = `<div class="reason reason-fail">${SQA.escapeHtml(data.error)}</div>`;
+    return;
+  }
+  const resp = data.response;
+  let html = `<p>${badge(data.ok, data.status_code)} `
+           + `<span class="meta">${data.elapsed_ms != null ? (data.elapsed_ms + ' ms') : ''}</span></p>`;
+  html += `<p class="meta">POST <code>${SQA.escapeHtml(data.url)}</code></p>`;
+  if (data.params && Object.keys(data.params).length) {
+    html += `<p class="meta">query: <code>${SQA.escapeHtml(JSON.stringify(data.params))}</code></p>`;
+  }
+
+  const failed = extractFailedRows(resp);
+  if (failed) {
+    html += `<h3 style="color:var(--fail)">Failed rows (${failed.rows.length}) — not saved</h3>`;
+    const cols = (typeof failed.rows[0] === 'object' && failed.rows[0])
+      ? Object.keys(failed.rows[0]) : null;
+    if (cols) {
+      html += '<div style="overflow-x:auto"><table class="table"><thead><tr>'
+            + cols.map(c => `<th>${SQA.escapeHtml(c)}</th>`).join('')
+            + '</tr></thead><tbody>'
+            + failed.rows.map(r => '<tr>' + cols.map(c =>
+                `<td>${SQA.escapeHtml(String(r[c] == null ? '' : (typeof r[c] === 'object' ? JSON.stringify(r[c]) : r[c]))).slice(0,300)}</td>`
+              ).join('') + '</tr>').join('')
+            + '</tbody></table></div>';
+    } else {
+      html += `<pre>${SQA.escapeHtml(JSON.stringify(failed.rows, null, 2))}</pre>`;
+    }
+  }
+
+  html += '<h3>Full response</h3>';
+  html += `<pre style="max-height:480px; overflow:auto">${SQA.escapeHtml(
+    typeof resp === 'string' ? resp : JSON.stringify(resp, null, 2)
+  )}</pre>`;
+  resultEl.innerHTML = html;
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const dbId = document.getElementById('t-database_id').value.trim();
+  if (!dbId) { SQA.toast('Database ID is required.', 'error'); return; }
+  const hasFile = document.getElementById('t-file').files.length > 0;
+  const hasPath = document.getElementById('t-filepath').value.trim().length > 0;
+  if (!hasFile && !hasPath) {
+    SQA.toast('Provide a CSV file or a server-side filepath.', 'error');
+    return;
+  }
+
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Submitting…';
+  inlineStatus.textContent = 'Calling the training endpoint — this can take a while for large CSVs.';
+  resultEl.innerHTML = '<p class="meta">Waiting for the Celerant training endpoint to respond…</p>';
+
+  try {
+    const fd = new FormData(form);
+    const r = await fetch('{{ url_for("training_submit") }}', { method: 'POST', body: fd });
+    const data = await r.json();
+    renderResult(data);
+    if (data.ok) SQA.toast('Training call completed.', 'success');
+    else SQA.toast('Training call returned an error — see result.', 'error');
+  } catch (err) {
+    resultEl.innerHTML = `<div class="reason reason-fail">Request failed: ${SQA.escapeHtml(err.message)}</div>`;
+    SQA.toast('Request failed.', 'error');
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = '▶ Submit training';
+    inlineStatus.textContent = '';
+  }
+});
+</script>
+{% endblock %}

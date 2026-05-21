@@ -716,6 +716,112 @@ def test_pages_page():
     return render_template("test_pages.html", active="test_pages")
 
 
+# ---------------------------------------------------------------------------
+# Training — proxy to Celerant's train_sql_examples_backoffice_validated API.
+# Lets a QA user upload a CSV of validated SQL examples (or point at a server
+# filepath) and POST it to the tenant's training endpoint, then see which
+# rows were saved and which failed — all without leaving the tool or fighting
+# CORS (the call is made server-side).
+# ---------------------------------------------------------------------------
+CELERANT_TRAIN_BASE = "https://celerantai.com/sql_agent/train_sql_examples_backoffice_validated"
+
+
+@app.route("/training")
+@auth.login_required
+def training_page():
+    return render_template("training.html", active="training",
+                           default_console="https://celerantai.com")
+
+
+@app.route("/training/submit", methods=["POST"])
+@auth.login_required
+def training_submit():
+    """Proxy a training request to the Celerant SQL-Agent training endpoint.
+
+    The Celerant endpoint executes every CSV row's sql_query against the
+    tenant's run-sql endpoint and only persists rows whose response status
+    is 'success'; failed rows come back in the response. We run this call
+    server-side (long timeout, no browser CORS) and hand the JSON straight
+    back to the page.
+    """
+    import requests  # lazy import — only needed for this feature
+
+    database_id = (request.form.get("database_id") or "").strip().strip("/")
+    if not database_id:
+        return jsonify({"ok": False, "error": "Database ID is required."}), 400
+
+    # Optional console origin override (default celerantai.com).
+    console = (request.form.get("console_url") or "https://celerantai.com").strip().rstrip("/")
+    base = f"{console}/sql_agent/train_sql_examples_backoffice_validated"
+    url = f"{base}/{database_id}/"
+
+    # Query params — only send the ones the user actually set.
+    params: dict[str, str] = {}
+    filepath = (request.form.get("sql_examples_filepath") or "").strip()
+    if filepath:
+        params["sql_examples_filepath"] = filepath
+    for key in ("skip_display_clean", "skip_nlq_variants"):
+        val = request.form.get(key)
+        if val in ("true", "false"):
+            params[key] = val
+
+    # Optional CSV file upload (multipart). One of file/filepath is required.
+    files = None
+    upload = request.files.get("sql_examples_file")
+    if upload and upload.filename:
+        files = {
+            "sql_examples_file": (
+                upload.filename,
+                upload.read(),
+                upload.mimetype or "text/csv",
+            )
+        }
+    if not files and not filepath:
+        return jsonify({
+            "ok": False,
+            "error": "Provide either a CSV file to upload, or a server-side "
+                     "sql_examples_filepath. At least one is required.",
+        }), 400
+
+    # Optional bearer token — HTTPBearer is defined in the spec but not
+    # enforced for this endpoint; pass it through if the tenant requires it.
+    headers: dict[str, str] = {}
+    token = (request.form.get("bearer_token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    started = time.time()
+    try:
+        resp = requests.post(url, params=params, files=files, headers=headers,
+                             timeout=600)
+    except requests.exceptions.SSLError:
+        # Fall back to no-verify if the tenant uses a self-signed cert.
+        try:
+            resp = requests.post(url, params=params, files=files, headers=headers,
+                                 timeout=600, verify=False)
+        except Exception as e:
+            return jsonify({"ok": False, "url": url,
+                            "error": f"Request failed (SSL): {type(e).__name__}: {e}"}), 502
+    except Exception as e:
+        return jsonify({"ok": False, "url": url,
+                        "error": f"Request failed: {type(e).__name__}: {e}"}), 502
+    elapsed_ms = int((time.time() - started) * 1000)
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = (resp.text or "")[:100_000]
+
+    return jsonify({
+        "ok": 200 <= resp.status_code < 300,
+        "status_code": resp.status_code,
+        "url": url,
+        "params": params,
+        "elapsed_ms": elapsed_ms,
+        "response": body,
+    })
+
+
 @app.route("/settings")
 @auth.login_required
 def settings_page():
