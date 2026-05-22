@@ -47,32 +47,38 @@ function renderGroups(groups) {
   wrap.innerHTML = groups.map(g => {
     const rate = g.variant_count ? (g.matched / g.variant_count) : null;
     const rateCls = rate != null && rate >= 0.8 ? 'PASS' : (rate === 0 ? 'FAIL' : 'PARTIAL');
+    const oLabel = g.label || String(g.group_id);
+    const oHref = `/jobs/${jobId}/queries/${g.original_qid}`;
     const baseline = g.original_has_sql
       ? `<pre style="margin:6px 0; max-height:160px; overflow:auto">${esc(g.original_sql)}</pre>`
       : `<div class="reason reason-warn">Original produced no SQL (${esc(g.original_status || 'no status')}) — variants can't be compared to a baseline.</div>`;
     const rows = (g.variants || []).map(v => {
       const cell = v.matches_original
-        ? '<span class="badge PASS">✓ match</span>'
-        : '<span class="badge FAIL">✗ differs</span>';
-      return `<tr>
-        <td><b>q${String(v.qid).padStart(2,'0')}</b></td>
+        ? '<span class="badge PASS">✓ same SQL</span>'
+        : '<span class="badge FAIL">✗ different</span>';
+      const vHref = `/jobs/${jobId}/queries/${v.qid}`;
+      return `<tr class="clickable" onclick="location.href='${vHref}'">
+        <td><b>${esc(v.label)}</b></td>
         <td>${esc((v.nl_query||'').slice(0,90))}${(v.nl_query||'').length>90?'…':''}</td>
         <td>${statusBadge(v.status)}</td>
         <td>${g.original_has_sql ? cell : '<span class="meta">—</span>'}</td>
         <td>${v.sql ? `<pre style="margin:0; max-height:120px; overflow:auto">${esc(v.sql)}</pre>` : '<span class="meta">no SQL</span>'}</td>
+        <td><a class="btn btn-sm btn-ghost" href="${vHref}" onclick="event.stopPropagation()">Open →</a></td>
       </tr>`;
     }).join('');
     return `
     <div class="card">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
-        <h2 style="margin:0">Group ${g.group_id}${g.sheet ? ` <span class="meta">· ${esc(g.sheet)}</span>` : ''}</h2>
-        <span class="badge ${rateCls}">${g.matched} / ${g.variant_count} variants match · ${pct(rate)}</span>
+        <h2 style="margin:0">Question ${oLabel}${g.sheet ? ` <span class="meta">· ${esc(g.sheet)}</span>` : ''}</h2>
+        <span class="badge ${rateCls}">${g.matched} / ${g.variant_count} variants generated the same SQL · ${pct(rate)}</span>
       </div>
-      <p style="margin:8px 0 2px"><b>Original</b> (q${String(g.original_qid).padStart(2,'0')}) ${statusBadge(g.original_status)}: ${esc(g.original_text)}</p>
+      <p style="margin:8px 0 2px">
+        <a href="${oHref}"><b>Original (${esc(oLabel)})</b></a> ${statusBadge(g.original_status)}: ${esc(g.original_text)}
+      </p>
       ${baseline}
       <table class="table">
-        <thead><tr><th>q</th><th>Variant question</th><th>Status</th><th>SQL match</th><th>Generated SQL</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="5" class="table-empty">No variants in this group.</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>Variant question</th><th>Status</th><th>vs original SQL</th><th>Generated SQL</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6" class="table-empty">No variants in this group.</td></tr>'}</tbody>
       </table>
     </div>`;
   }).join('');

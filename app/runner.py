@@ -1183,7 +1183,13 @@ def validate_query(qr: QueryResult) -> None:
         v["run_sql_empty_named_columns"] = sum(1 for c in cols if not str(c).strip())
         v["run_sql_row_count"] = rc
         v["run_sql_has_rows"] = hr
-        v["run_sql_returned_sql"] = extract_returned_sql(rs.response_body)
+        # The generated SQL is returned by the GENERATE-SQL call
+        # (responseBody.data.generated_sql.sql), not run-sql (whose body is
+        # the executed rows). Prefer generate-sql, fall back to run-sql.
+        v["run_sql_returned_sql"] = (
+            extract_returned_sql(qr.generate_sql_call.response_body if qr.generate_sql_call else None)
+            or extract_returned_sql(rs.response_body)
+        )
         v["run_sql_response_keys"] = list(rs.response_body.keys()) if isinstance(rs.response_body, dict) else None
 
     gv = qr.generate_viz_call
@@ -1369,11 +1375,29 @@ def extract_table_shape(body: Any) -> tuple[list[str], int, bool]:
 
 
 def extract_returned_sql(body: Any) -> str | None:
-    if not isinstance(body, dict):
-        return None
-    for k in ("sql", "query", "sql_query", "executed_sql", "generated_sql"):
-        if isinstance(body.get(k), str):
-            return body[k]
+    """Find the generated SQL anywhere in a Celerant response body.
+
+    Celerant returns the generated SQL in the GENERATE-SQL response, nested
+    at responseBody.data.generated_sql.sql — not at the top level. This walks
+    the structure recursively so we don't depend on the exact wrapper shape.
+    """
+    if isinstance(body, dict):
+        gs = body.get("generated_sql")
+        if isinstance(gs, dict) and isinstance(gs.get("sql"), str) and gs["sql"].strip():
+            return gs["sql"]
+        for k in ("sql", "sql_query", "executed_sql", "query"):
+            v = body.get(k)
+            if isinstance(v, str) and "select" in v.lower():
+                return v
+        for v in body.values():
+            r = extract_returned_sql(v)
+            if r:
+                return r
+    elif isinstance(body, list):
+        for v in body:
+            r = extract_returned_sql(v)
+            if r:
+                return r
     return None
 
 

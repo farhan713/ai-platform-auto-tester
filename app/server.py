@@ -591,6 +591,34 @@ def _normalize_sql(sql: Any) -> str:
     return s.lower()
 
 
+def _extract_sql_deep(body: Any) -> str | None:
+    """Find the generated SQL string anywhere in a Celerant response body.
+
+    The SQL the agent produced lives in the GENERATE-SQL response at
+    responseBody.data.generated_sql.sql — nested several levels deep, not at
+    the top level, and on the generate-sql call (not run-sql, whose body is
+    the executed result rows). This walks the structure to find it robustly.
+    """
+    if isinstance(body, dict):
+        gs = body.get("generated_sql")
+        if isinstance(gs, dict) and isinstance(gs.get("sql"), str) and gs["sql"].strip():
+            return gs["sql"]
+        for k in ("sql", "sql_query", "executed_sql", "query"):
+            v = body.get(k)
+            if isinstance(v, str) and "select" in v.lower():
+                return v
+        for v in body.values():
+            r = _extract_sql_deep(v)
+            if r:
+                return r
+    elif isinstance(body, list):
+        for v in body:
+            r = _extract_sql_deep(v)
+            if r:
+                return r
+    return None
+
+
 def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, Any]:
     """Build the per-group SQL-consistency report from stored query records."""
     rows = db.fetch_all(
@@ -598,8 +626,18 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
     by_qid: dict[int, dict[str, Any]] = {r["qid"]: (r["record"] or {}) for r in rows}
 
     def sql_of(qid: int):
-        v = (by_qid.get(qid) or {}).get("validations") or {}
-        return v.get("run_sql_returned_sql")
+        rec = by_qid.get(qid) or {}
+        # 1) validator-populated field (newer runs)
+        s = (rec.get("validations") or {}).get("run_sql_returned_sql")
+        if s:
+            return s
+        # 2) deep-extract from the generate-sql call (then run-sql) for older
+        #    records whose validator didn't capture the nested SQL path.
+        for key in ("generate_sql_call", "run_sql_call"):
+            s = _extract_sql_deep((rec.get(key) or {}).get("response_body"))
+            if s:
+                return s
+        return None
 
     def status_of(qid: int):
         return (by_qid.get(qid) or {}).get("overall_status")
@@ -608,12 +646,15 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
     total_variants = matched_variants = 0
     groups_fully_consistent = 0
 
-    for g in (variant_groups.get("groups") or []):
+    # Hierarchical display numbers: original = "1", its variants = "1.1",
+    # "1.2", ...  (group index is 1-based and contiguous regardless of the
+    # stored group_id). The underlying qid is kept for drill-down links.
+    for gidx, g in enumerate((variant_groups.get("groups") or []), start=1):
         oqid = g["original_qid"]
         osql = sql_of(oqid)
         onorm = _normalize_sql(osql)
         variants = []
-        for vqid in g.get("variant_qids", []):
+        for vi, vqid in enumerate(g.get("variant_qids", []), start=1):
             vsql = sql_of(vqid)
             match = bool(onorm) and (_normalize_sql(vsql) == onorm)
             total_variants += 1
@@ -621,6 +662,7 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
                 matched_variants += 1
             rec = by_qid.get(vqid) or {}
             variants.append({
+                "label": f"{gidx}.{vi}",
                 "qid": vqid,
                 "nl_query": rec.get("nl_query"),
                 "status": status_of(vqid),
@@ -632,6 +674,7 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
         if n and nmatch == n:
             groups_fully_consistent += 1
         out_groups.append({
+            "label": str(gidx),
             "group_id": g["group_id"],
             "sheet": g.get("sheet"),
             "original_qid": oqid,
