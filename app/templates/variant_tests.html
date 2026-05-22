@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Variant Tests{% endblock %}
+{% block header_title %}Variant Tests{% endblock %}
+{% block header_sub %}— Check SQL consistency across re-phrased questions{% endblock %}
+
+{% block content %}
+<div class="grid-2">
+  <div class="card">
+    <h2>New variant-consistency run</h2>
+    <p class="meta" style="margin-top:-4px">
+      Upload an .xlsx where each <b>original</b> question is <b>bold</b> and its
+      3-5 re-phrased <b>variants</b> sit (not bold) in the rows directly below
+      it. Every question is run through the SQL AI Engine — full API capture and
+      screenshots — then we report how many variants generated the
+      <b>same SQL</b> as their original.
+    </p>
+
+    <form id="variant-form" class="form" method="POST"
+          action="{{ url_for('variant_tests_create') }}" enctype="multipart/form-data">
+      <label>
+        <span class="label-text">Login URL <em>required</em></span>
+        <input type="url" name="login_url" id="v-login_url"
+               placeholder="https://&lt;host&gt;:8443/backoffice/?mid=100" required>
+      </label>
+
+      <div class="grid-2">
+        <label>
+          <span class="label-text">Username <em>required</em></span>
+          <input type="text" name="username" id="v-username" autocomplete="username" required>
+        </label>
+        <label>
+          <span class="label-text">Password <em>required</em></span>
+          <input type="password" name="password" id="v-password" autocomplete="current-password" required>
+        </label>
+      </div>
+
+      <div class="grid-2">
+        <label>
+          <span class="label-text">Machine ID</span>
+          <input type="text" name="machine_id" id="v-machine_id" value="100">
+        </label>
+        <label>
+          <span class="label-text">SQL Agent path</span>
+          <input type="text" name="sql_agent_path" id="v-sql_agent_path"
+                 value="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent">
+        </label>
+      </div>
+
+      <label>
+        <span class="label-text">Variant questions (.xlsx) <em>required</em></span>
+        <input type="file" name="questions" id="v-file" accept=".xlsx" required>
+        <span class="meta">Bold row = original, non-bold rows below = its variants. Need the format? <a href="#" id="v-help">See the template layout.</a></span>
+      </label>
+
+      <details style="margin:4px 0 8px">
+        <summary class="meta" style="cursor:pointer">Advanced timeouts</summary>
+        <div class="grid-2" style="margin-top:8px">
+          <label>
+            <span class="label-text">run-sql timeout (ms)</span>
+            <input type="number" name="run_sql_timeout_ms" value="120000">
+          </label>
+          <label>
+            <span class="label-text">generate-viz timeout (ms)</span>
+            <input type="number" name="gen_viz_timeout_ms" value="120000">
+          </label>
+        </div>
+      </details>
+
+      <button type="submit" class="btn btn-primary">▶ Start variant run</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>How the report reads</h2>
+    <ul style="line-height:1.7; padding-left:18px">
+      <li><b>Per group</b> — the original question's SQL is the baseline.</li>
+      <li>Each variant is marked ✓ <b>match</b> if its generated SQL equals the
+          original's after normalizing (lowercase, collapsed whitespace, no
+          trailing semicolon), else ✗.</li>
+      <li>You get a <b>matched / total</b> count per group and an overall
+          consistency rate.</li>
+      <li>Full per-query detail (API calls, screenshots, validations) is on the
+          normal run page — this report sits on top of it.</li>
+    </ul>
+    <p class="meta">A group whose original failed / timed out (no baseline SQL)
+       is flagged so you know the variants couldn't be compared.</p>
+  </div>
+</div>
+
+<div id="tpl-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:50; align-items:center; justify-content:center">
+  <div class="card" style="max-width:560px; margin:20px">
+    <h2>Upload format</h2>
+    <table class="table">
+      <thead><tr><th>Column A</th></tr></thead>
+      <tbody>
+        <tr><td><b>Show SKUs that have a SKU of7 value populated</b> &nbsp;<span class="meta">(original — bold)</span></td></tr>
+        <tr><td>Show SKUs where the SKU value is populated as 7. <span class="meta">(variant)</span></td></tr>
+        <tr><td>Display all records that contain SKU number 7. <span class="meta">(variant)</span></td></tr>
+        <tr><td><b>Show styles that have a 'no coupon' restriction</b> &nbsp;<span class="meta">(next original — bold)</span></td></tr>
+        <tr><td>Display styles that have a "no coupon" restriction applied. <span class="meta">(variant)</span></td></tr>
+      </tbody>
+    </table>
+    <button type="button" class="btn btn-primary" id="v-close">Got it</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const modal = document.getElementById('tpl-modal');
+document.getElementById('v-help').addEventListener('click', (e) => { e.preventDefault(); modal.style.display = 'flex'; });
+document.getElementById('v-close').addEventListener('click', () => { modal.style.display = 'none'; });
+modal.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
+</script>
+{% endblock %}

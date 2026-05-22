@@ -64,6 +64,10 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS test_type TEXT NOT NULL DEFAULT 'sql_a
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS search_input_selector TEXT;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS site_search_config JSONB;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS bundle_id TEXT;
+-- variant_groups: for "Variant Tests" runs, the group structure
+-- (which qids are originals, which are their variants) used to build the
+-- SQL-consistency report. NULL for ordinary runs.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS variant_groups JSONB;
 ALTER TABLE presets ADD COLUMN IF NOT EXISTS site_search_config JSONB;
 
 CREATE TABLE IF NOT EXISTS hosted_bundles (

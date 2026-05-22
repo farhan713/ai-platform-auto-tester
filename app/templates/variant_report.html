@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Consistency report{% endblock %}
+{% block header_title %}Consistency report{% endblock %}
+{% block header_sub %}— How many variants generate the original's SQL{% endblock %}
+
+{% block content %}
+<div class="header-row" style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px">
+  <div>
+    <h1 style="margin:0">Variant consistency <code style="font-size:14px">{{ job_id }}</code></h1>
+    <p class="subtitle"><a href="{{ url_for('job_view', job_id=job_id) }}">← Back to run (API calls, screenshots, per-query detail)</a></p>
+  </div>
+</div>
+
+<!-- Headline totals -->
+<div class="card">
+  <div class="counts" id="totals" style="display:flex; gap:18px; flex-wrap:wrap">
+    <span class="meta">Loading…</span>
+  </div>
+</div>
+
+<div id="groups"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const jobId = {{ job_id|tojson }};
+
+function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
+function pct(x){ return x == null ? '—' : (Math.round(x * 1000) / 10) + '%'; }
+
+function renderTotals(t) {
+  const el = document.getElementById('totals');
+  el.innerHTML = `
+    <span class="count-pill">Groups<b>${t.groups}</b></span>
+    <span class="count-pill PASS">Fully consistent<b>${t.groups_fully_consistent}</b></span>
+    <span class="count-pill">Variants<b>${t.variants}</b></span>
+    <span class="count-pill PASS">Matched original SQL<b>${t.matched_variants}</b></span>
+    <span class="count-pill ${t.overall_match_rate != null && t.overall_match_rate >= 0.8 ? 'PASS' : 'PARTIAL'}">Overall match rate<b>${pct(t.overall_match_rate)}</b></span>
+  `;
+}
+
+function statusBadge(s){ return s ? `<span class="badge ${esc(s)}">${esc(s)}</span>` : '<span class="meta">—</span>'; }
+
+function renderGroups(groups) {
+  const wrap = document.getElementById('groups');
+  if (!groups.length) { wrap.innerHTML = '<div class="card"><p class="meta">No groups.</p></div>'; return; }
+  wrap.innerHTML = groups.map(g => {
+    const rate = g.variant_count ? (g.matched / g.variant_count) : null;
+    const rateCls = rate != null && rate >= 0.8 ? 'PASS' : (rate === 0 ? 'FAIL' : 'PARTIAL');
+    const baseline = g.original_has_sql
+      ? `<pre style="margin:6px 0; max-height:160px; overflow:auto">${esc(g.original_sql)}</pre>`
+      : `<div class="reason reason-warn">Original produced no SQL (${esc(g.original_status || 'no status')}) — variants can't be compared to a baseline.</div>`;
+    const rows = (g.variants || []).map(v => {
+      const cell = v.matches_original
+        ? '<span class="badge PASS">✓ match</span>'
+        : '<span class="badge FAIL">✗ differs</span>';
+      return `<tr>
+        <td><b>q${String(v.qid).padStart(2,'0')}</b></td>
+        <td>${esc((v.nl_query||'').slice(0,90))}${(v.nl_query||'').length>90?'…':''}</td>
+        <td>${statusBadge(v.status)}</td>
+        <td>${g.original_has_sql ? cell : '<span class="meta">—</span>'}</td>
+        <td>${v.sql ? `<pre style="margin:0; max-height:120px; overflow:auto">${esc(v.sql)}</pre>` : '<span class="meta">no SQL</span>'}</td>
+      </tr>`;
+    }).join('');
+    return `
+    <div class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
+        <h2 style="margin:0">Group ${g.group_id}${g.sheet ? ` <span class="meta">· ${esc(g.sheet)}</span>` : ''}</h2>
+        <span class="badge ${rateCls}">${g.matched} / ${g.variant_count} variants match · ${pct(rate)}</span>
+      </div>
+      <p style="margin:8px 0 2px"><b>Original</b> (q${String(g.original_qid).padStart(2,'0')}) ${statusBadge(g.original_status)}: ${esc(g.original_text)}</p>
+      ${baseline}
+      <table class="table">
+        <thead><tr><th>q</th><th>Variant question</th><th>Status</th><th>SQL match</th><th>Generated SQL</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="table-empty">No variants in this group.</td></tr>'}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+}
+
+async function load() {
+  try {
+    const data = await SQA.fetchJSON(`/jobs/${jobId}/variant-report`);
+    if (data.error) {
+      document.getElementById('totals').innerHTML = `<span class="reason reason-fail">${esc(data.error)}</span>`;
+      return;
+    }
+    renderTotals(data.totals);
+    renderGroups(data.groups);
+  } catch (e) {
+    document.getElementById('totals').innerHTML = `<span class="reason reason-fail">Could not load report: ${esc(e.message)}</span>`;
+  }
+}
+load();
+</script>
+{% endblock %}

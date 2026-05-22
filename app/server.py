@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import queue
+import re
 import secrets
 import sys
 import threading
@@ -575,6 +576,88 @@ def _all_results_summary_for_run(run_id: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Variant-consistency report
+# ---------------------------------------------------------------------------
+def _normalize_sql(sql: Any) -> str:
+    """Normalize SQL for 'same query' comparison: strip trailing semicolons,
+    collapse all whitespace to single spaces, lowercase. (User chose
+    'normalized exact match' — literals are NOT blanked, so WHERE x=7 and
+    WHERE x=9 are treated as different.)"""
+    if not sql:
+        return ""
+    s = str(sql).strip()
+    s = s.rstrip(";").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+
+def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, Any]:
+    """Build the per-group SQL-consistency report from stored query records."""
+    rows = db.fetch_all(
+        "SELECT qid, record FROM query_results WHERE run_id = %s", (run_id,))
+    by_qid: dict[int, dict[str, Any]] = {r["qid"]: (r["record"] or {}) for r in rows}
+
+    def sql_of(qid: int):
+        v = (by_qid.get(qid) or {}).get("validations") or {}
+        return v.get("run_sql_returned_sql")
+
+    def status_of(qid: int):
+        return (by_qid.get(qid) or {}).get("overall_status")
+
+    out_groups: list[dict[str, Any]] = []
+    total_variants = matched_variants = 0
+    groups_fully_consistent = 0
+
+    for g in (variant_groups.get("groups") or []):
+        oqid = g["original_qid"]
+        osql = sql_of(oqid)
+        onorm = _normalize_sql(osql)
+        variants = []
+        for vqid in g.get("variant_qids", []):
+            vsql = sql_of(vqid)
+            match = bool(onorm) and (_normalize_sql(vsql) == onorm)
+            total_variants += 1
+            if match:
+                matched_variants += 1
+            rec = by_qid.get(vqid) or {}
+            variants.append({
+                "qid": vqid,
+                "nl_query": rec.get("nl_query"),
+                "status": status_of(vqid),
+                "sql": vsql,
+                "matches_original": match,
+            })
+        n = len(g.get("variant_qids", []))
+        nmatch = sum(1 for v in variants if v["matches_original"])
+        if n and nmatch == n:
+            groups_fully_consistent += 1
+        out_groups.append({
+            "group_id": g["group_id"],
+            "sheet": g.get("sheet"),
+            "original_qid": oqid,
+            "original_text": g.get("original_text"),
+            "original_sql": osql,
+            "original_status": status_of(oqid),
+            "original_has_sql": bool(onorm),
+            "variant_count": n,
+            "matched": nmatch,
+            "match_rate": (nmatch / n) if n else None,
+            "variants": variants,
+        })
+
+    return {
+        "groups": out_groups,
+        "totals": {
+            "groups": len(out_groups),
+            "groups_fully_consistent": groups_fully_consistent,
+            "variants": total_variants,
+            "matched_variants": matched_variants,
+            "overall_match_rate": (matched_variants / total_variants) if total_variants else None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Background runner
 # ---------------------------------------------------------------------------
 def _run_job(run_id: str, cfg: RunConfig) -> None:
@@ -822,6 +905,100 @@ def training_submit():
     })
 
 
+# ---------------------------------------------------------------------------
+# Variant Tests — run an original question + its paraphrases through the SQL
+# AI Engine and report how many variants generate the same SQL as the original.
+# Reuses the SQL Agent runner; the run is tagged with a variant_groups map.
+# ---------------------------------------------------------------------------
+@app.route("/variant-tests")
+@auth.login_required
+def variant_tests_page():
+    return render_template("variant_tests.html", active="variant_tests")
+
+
+@app.route("/variant-tests", methods=["POST"])
+@auth.login_required
+def variant_tests_create():
+    from app.variant_reader import read_variant_questions
+
+    login_url = (request.form.get("login_url") or "").strip()
+    cred_username = (request.form.get("username") or "").strip()
+    cred_password = (request.form.get("password") or "")
+    machine_id = (request.form.get("machine_id") or "100").strip()
+    sql_agent_path = (request.form.get("sql_agent_path") or
+                      "/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent").strip()
+    run_sql_to = int(request.form.get("run_sql_timeout_ms") or 120_000)
+    gen_viz_to = int(request.form.get("gen_viz_timeout_ms") or 120_000)
+    f = request.files.get("questions")
+
+    if not login_url:
+        return ("Missing login_url", 400)
+    if login_url.lower().startswith("file:"):
+        return ("file:// URLs cannot be reached from inside the container. "
+                "Use http:// or https://.", 400)
+    if not (cred_username and cred_password):
+        return ("Variant runs need a username and password", 400)
+    if not f or not f.filename:
+        return ("Upload a variant-questions .xlsx file", 400)
+
+    run_id = uuid.uuid4().hex[:8] + "-" + datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    job = _job_dir(run_id)
+    job.mkdir(parents=True, exist_ok=True)
+    xlsx_path = job / "questions.xlsx"
+    f.save(str(xlsx_path))
+
+    try:
+        questions, groups = read_variant_questions(xlsx_path)
+    except Exception as e:
+        return (f"Failed to read variant-questions file: {e}", 400)
+
+    variant_groups = {"groups": groups}
+    db.execute(
+        """INSERT INTO runs (id, user_id, test_type, login_url, username, machine_id,
+                             sql_agent_path, search_input_selector, question_count,
+                             test_file_name, variant_groups, status)
+           VALUES (%s, %s, 'sql_agent', %s, %s, %s, %s, %s, %s, %s, %s, 'queued')""",
+        (run_id, auth.current_user_id(), login_url, cred_username, machine_id,
+         sql_agent_path, "#searchbox", len(questions),
+         (f.filename or "variant-questions.xlsx"),
+         db.jsonify(variant_groups)),
+    )
+
+    cfg = RunConfig(
+        login_url=login_url, username=cred_username, password=cred_password,
+        questions=questions, output_dir=job,
+        test_type="sql_agent",
+        machine_id=machine_id, sql_agent_path=sql_agent_path,
+        run_sql_timeout_ms=run_sql_to, gen_viz_timeout_ms=gen_viz_to,
+        headless=True,
+    )
+    _event_queues[run_id] = queue.Queue(maxsize=10_000)
+    _stop_events[run_id] = threading.Event()
+    threading.Thread(target=_run_job, args=(run_id, cfg), daemon=True).start()
+    return redirect(url_for("job_view", job_id=run_id))
+
+
+@app.route("/jobs/<job_id>/variant")
+@auth.login_required
+def job_variant_view(job_id: str):
+    run = _run_owned_by_current_user(job_id)
+    if not run or not run.get("variant_groups"):
+        abort(404)
+    return render_template("variant_report.html", job_id=job_id, active="runs")
+
+
+@app.route("/jobs/<job_id>/variant-report")
+@auth.login_required
+def job_variant_report_api(job_id: str):
+    run = _run_owned_by_current_user(job_id)
+    if not run:
+        abort(404)
+    vg = run.get("variant_groups")
+    if not vg:
+        return jsonify({"error": "This run is not a variant test."}), 400
+    return jsonify(_variant_report(job_id, vg))
+
+
 @app.route("/settings")
 @auth.login_required
 def settings_page():
@@ -986,6 +1163,7 @@ def job_view(job_id: str):
         "created_at": run["created_at"].isoformat() if run.get("created_at") else None,
         "started_at": run["started_at"].isoformat() if run.get("started_at") else None,
         "finished_at": run["finished_at"].isoformat() if run.get("finished_at") else None,
+        "is_variant": bool(run.get("variant_groups")),
     }
     return render_template("job.html", job_id=job_id, meta=meta, active="runs")
 

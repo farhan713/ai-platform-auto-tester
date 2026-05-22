@@ -11,6 +11,9 @@
   </div>
   <div style="display:flex; gap:8px; flex-wrap:wrap">
     <button id="stop-btn" type="button" class="btn btn-danger" style="display:none">⏹ Stop run</button>
+    {% if meta.is_variant %}
+    <a class="btn btn-primary" href="{{ url_for('job_variant_view', job_id=job_id) }}">🔀 Consistency report</a>
+    {% endif %}
     <a id="report-link" class="btn btn-primary" href="{{ url_for('job_report', job_id=job_id) }}" target="_blank" style="display:none">Open report ↗</a>
     <a id="dl-zip" class="btn" href="{{ url_for('job_download_zip', job_id=job_id) }}" style="display:none">↓ Download report (zip)</a>
     <a id="dl-failures" class="btn btn-danger" href="{{ url_for('job_export_failures_xlsx', job_id=job_id) }}" style="display:none">↓ Download failed queries (xlsx)</a>
