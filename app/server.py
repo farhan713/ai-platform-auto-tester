@@ -619,6 +619,70 @@ def _extract_sql_deep(body: Any) -> str | None:
     return None
 
 
+def _sql_structure(sql: Any) -> dict[str, Any] | None:
+    """Extract a structural fingerprint of a SQL query for semantic comparison:
+      - outputs: the set of output column aliases (AS [x] / AS x)
+      - tables:  the set of tables referenced after FROM / JOIN
+      - where:   the WHERE predicate, normalized (alias prefixes stripped)
+      - groupby: the GROUP BY clause, normalized
+
+    This deliberately ignores HOW each output column is computed (the SELECT
+    expressions), so two queries that hit the same tables, apply the same
+    filter, and return the same columns are considered the same query even
+    if one title-cases a column and the other doesn't.
+    """
+    if not sql or "select" not in str(sql).lower():
+        return None
+    s = re.sub(r"\s+", " ", str(sql).strip().rstrip(";")).strip()
+    low = s.lower()
+
+    outputs: set[str] = set()
+    for m in re.findall(r"\bas\s+\[([^\]]+)\]", s, re.I):       # AS [Brand]
+        outputs.add(m.strip().lower())
+    for m in re.findall(r"\bas\s+([a-z_][\w]*)", s, re.I):      # AS Brand
+        outputs.add(m.strip().lower())
+
+    tables = set(t.lower() for t in re.findall(r"\b(?:from|join)\s+([a-z_][\w\.]*)", low))
+
+    def _strip_aliases(txt: str) -> str:
+        # remove "x." table-alias prefixes so s.sku_id == sku_id == t.sku_id
+        txt = re.sub(r"\b[a-z_][\w]*\.", "", txt)
+        return re.sub(r"\s+", " ", txt).strip()
+
+    where = ""
+    wm = re.search(r"\bwhere\b(.*?)(?:\bgroup\s+by\b|\border\s+by\b|\bhaving\b|$)", low)
+    if wm:
+        where = _strip_aliases(wm.group(1).strip())
+
+    groupby = ""
+    gm = re.search(r"\bgroup\s+by\b(.*?)(?:\border\s+by\b|\bhaving\b|$)", low)
+    if gm:
+        groupby = _strip_aliases(gm.group(1).strip())
+
+    return {"outputs": outputs, "tables": tables, "where": where, "groupby": groupby}
+
+
+def _semantic_compare(orig_sql: Any, var_sql: Any) -> tuple[bool | None, str]:
+    """Return (equivalent, reason). equivalent is None when we can't parse
+    one of the queries (e.g. the original produced no SQL)."""
+    a = _sql_structure(orig_sql)
+    b = _sql_structure(var_sql)
+    if a is None or b is None:
+        return None, "could not parse SQL for one of the queries"
+    diffs = []
+    if a["tables"] != b["tables"]:
+        diffs.append("different tables")
+    if a["where"] != b["where"]:
+        diffs.append("different WHERE filter")
+    if a["outputs"] != b["outputs"]:
+        diffs.append("different output columns")
+    if a["groupby"] != b["groupby"]:
+        diffs.append("different GROUP BY")
+    if not diffs:
+        return True, "same tables, filter, output columns & grouping — only column formatting differs"
+    return False, "; ".join(diffs)
+
+
 def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, Any]:
     """Build the per-group SQL-consistency report from stored query records."""
     rows = db.fetch_all(
@@ -643,8 +707,8 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
         return (by_qid.get(qid) or {}).get("overall_status")
 
     out_groups: list[dict[str, Any]] = []
-    total_variants = matched_variants = 0
-    groups_fully_consistent = 0
+    total_variants = matched_variants = equivalent_variants = 0
+    groups_fully_exact = groups_fully_equivalent = 0
 
     # Hierarchical display numbers: original = "1", its variants = "1.1",
     # "1.2", ...  (group index is 1-based and contiguous regardless of the
@@ -656,10 +720,18 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
         variants = []
         for vi, vqid in enumerate(g.get("variant_qids", []), start=1):
             vsql = sql_of(vqid)
-            match = bool(onorm) and (_normalize_sql(vsql) == onorm)
+            # Exact (literal) match — normalized whitespace/case.
+            exact = bool(onorm) and (_normalize_sql(vsql) == onorm)
+            # Semantic equivalence — same tables/filter/output columns.
+            equivalent, reason = _semantic_compare(osql, vsql)
+            # Exact match always implies equivalent.
+            if exact:
+                equivalent, reason = True, "identical SQL"
             total_variants += 1
-            if match:
+            if exact:
                 matched_variants += 1
+            if equivalent:
+                equivalent_variants += 1
             rec = by_qid.get(vqid) or {}
             variants.append({
                 "label": f"{gidx}.{vi}",
@@ -667,12 +739,17 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
                 "nl_query": rec.get("nl_query"),
                 "status": status_of(vqid),
                 "sql": vsql,
-                "matches_original": match,
+                "matches_original": exact,
+                "equivalent": equivalent,
+                "equivalent_reason": reason,
             })
         n = len(g.get("variant_qids", []))
-        nmatch = sum(1 for v in variants if v["matches_original"])
-        if n and nmatch == n:
-            groups_fully_consistent += 1
+        nexact = sum(1 for v in variants if v["matches_original"])
+        nequiv = sum(1 for v in variants if v["equivalent"])
+        if n and nexact == n:
+            groups_fully_exact += 1
+        if n and nequiv == n:
+            groups_fully_equivalent += 1
         out_groups.append({
             "label": str(gidx),
             "group_id": g["group_id"],
@@ -683,8 +760,10 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
             "original_status": status_of(oqid),
             "original_has_sql": bool(onorm),
             "variant_count": n,
-            "matched": nmatch,
-            "match_rate": (nmatch / n) if n else None,
+            "matched": nexact,
+            "equivalent_count": nequiv,
+            "match_rate": (nexact / n) if n else None,
+            "equivalent_rate": (nequiv / n) if n else None,
             "variants": variants,
         })
 
@@ -692,10 +771,13 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
         "groups": out_groups,
         "totals": {
             "groups": len(out_groups),
-            "groups_fully_consistent": groups_fully_consistent,
+            "groups_fully_consistent": groups_fully_exact,
+            "groups_fully_equivalent": groups_fully_equivalent,
             "variants": total_variants,
             "matched_variants": matched_variants,
+            "equivalent_variants": equivalent_variants,
             "overall_match_rate": (matched_variants / total_variants) if total_variants else None,
+            "overall_equivalent_rate": (equivalent_variants / total_variants) if total_variants else None,
         },
     }
 

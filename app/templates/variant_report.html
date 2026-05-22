@@ -30,12 +30,13 @@ function pct(x){ return x == null ? '—' : (Math.round(x * 1000) / 10) + '%'; }
 
 function renderTotals(t) {
   const el = document.getElementById('totals');
+  const eqRate = t.overall_equivalent_rate;
   el.innerHTML = `
     <span class="count-pill">Groups<b>${t.groups}</b></span>
-    <span class="count-pill PASS">Fully consistent<b>${t.groups_fully_consistent}</b></span>
     <span class="count-pill">Variants<b>${t.variants}</b></span>
-    <span class="count-pill PASS">Matched original SQL<b>${t.matched_variants}</b></span>
-    <span class="count-pill ${t.overall_match_rate != null && t.overall_match_rate >= 0.8 ? 'PASS' : 'PARTIAL'}">Overall match rate<b>${pct(t.overall_match_rate)}</b></span>
+    <span class="count-pill ${eqRate != null && eqRate >= 0.8 ? 'PASS' : 'PARTIAL'}">Equivalent SQL (logic)<b>${t.equivalent_variants} · ${pct(eqRate)}</b></span>
+    <span class="count-pill">Exact SQL match<b>${t.matched_variants} · ${pct(t.overall_match_rate)}</b></span>
+    <span class="count-pill PASS">Groups fully equivalent<b>${t.groups_fully_equivalent}</b></span>
   `;
 }
 
@@ -45,23 +46,36 @@ function renderGroups(groups) {
   const wrap = document.getElementById('groups');
   if (!groups.length) { wrap.innerHTML = '<div class="card"><p class="meta">No groups.</p></div>'; return; }
   wrap.innerHTML = groups.map(g => {
-    const rate = g.variant_count ? (g.matched / g.variant_count) : null;
-    const rateCls = rate != null && rate >= 0.8 ? 'PASS' : (rate === 0 ? 'FAIL' : 'PARTIAL');
+    const eqRate = g.variant_count ? (g.equivalent_count / g.variant_count) : null;
+    const rateCls = eqRate != null && eqRate >= 0.8 ? 'PASS' : (eqRate === 0 ? 'FAIL' : 'PARTIAL');
     const oLabel = g.label || String(g.group_id);
     const oHref = `/jobs/${jobId}/queries/${g.original_qid}`;
     const baseline = g.original_has_sql
       ? `<pre style="margin:6px 0; max-height:160px; overflow:auto">${esc(g.original_sql)}</pre>`
       : `<div class="reason reason-warn">Original produced no SQL (${esc(g.original_status || 'no status')}) — variants can't be compared to a baseline.</div>`;
     const rows = (g.variants || []).map(v => {
-      const cell = v.matches_original
-        ? '<span class="badge PASS">✓ same SQL</span>'
-        : '<span class="badge FAIL">✗ different</span>';
+      // Exact (literal) match
+      const exactCell = v.matches_original
+        ? '<span class="badge PASS">✓ exact</span>'
+        : '<span class="badge badge-soft">✗ differs</span>';
+      // Semantic equivalence (the meaningful verdict)
+      let eqCell;
+      if (!g.original_has_sql) {
+        eqCell = '<span class="meta">—</span>';
+      } else if (v.equivalent === true) {
+        eqCell = `<span class="badge PASS" title="${esc(v.equivalent_reason)}">✓ equivalent</span>`;
+      } else if (v.equivalent === false) {
+        eqCell = `<span class="badge FAIL" title="${esc(v.equivalent_reason)}">✗ ${esc(v.equivalent_reason)}</span>`;
+      } else {
+        eqCell = '<span class="meta">—</span>';
+      }
       const vHref = `/jobs/${jobId}/queries/${v.qid}`;
       return `<tr class="clickable" onclick="location.href='${vHref}'">
         <td><b>${esc(v.label)}</b></td>
         <td>${esc((v.nl_query||'').slice(0,90))}${(v.nl_query||'').length>90?'…':''}</td>
         <td>${statusBadge(v.status)}</td>
-        <td>${g.original_has_sql ? cell : '<span class="meta">—</span>'}</td>
+        <td>${eqCell}</td>
+        <td>${g.original_has_sql ? exactCell : '<span class="meta">—</span>'}</td>
         <td>${v.sql ? `<pre style="margin:0; max-height:120px; overflow:auto">${esc(v.sql)}</pre>` : '<span class="meta">no SQL</span>'}</td>
         <td><a class="btn btn-sm btn-ghost" href="${vHref}" onclick="event.stopPropagation()">Open →</a></td>
       </tr>`;
@@ -70,15 +84,15 @@ function renderGroups(groups) {
     <div class="card">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
         <h2 style="margin:0">Question ${oLabel}${g.sheet ? ` <span class="meta">· ${esc(g.sheet)}</span>` : ''}</h2>
-        <span class="badge ${rateCls}">${g.matched} / ${g.variant_count} variants generated the same SQL · ${pct(rate)}</span>
+        <span class="badge ${rateCls}">${g.equivalent_count} / ${g.variant_count} equivalent · ${pct(eqRate)}<span class="meta" style="margin-left:6px">(${g.matched} exact)</span></span>
       </div>
       <p style="margin:8px 0 2px">
         <a href="${oHref}"><b>Original (${esc(oLabel)})</b></a> ${statusBadge(g.original_status)}: ${esc(g.original_text)}
       </p>
       ${baseline}
       <table class="table">
-        <thead><tr><th>#</th><th>Variant question</th><th>Status</th><th>vs original SQL</th><th>Generated SQL</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="6" class="table-empty">No variants in this group.</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>Variant question</th><th>Status</th><th>Equivalent?</th><th>Exact</th><th>Generated SQL</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="table-empty">No variants in this group.</td></tr>'}</tbody>
       </table>
     </div>`;
   }).join('');
