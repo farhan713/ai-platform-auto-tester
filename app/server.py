@@ -683,6 +683,35 @@ def _semantic_compare(orig_sql: Any, var_sql: Any) -> tuple[bool | None, str]:
     return False, "; ".join(diffs)
 
 
+def _extract_question_understanding_deep(body: Any) -> str | None:
+    """Find generated_sql.question_understanding anywhere in a response body.
+    Its value is either the literal 'rag_semantic' (SQL retrieved from RAG /
+    trained examples) or a natural-language sentence (LLM-generated)."""
+    if isinstance(body, dict):
+        gs = body.get("generated_sql")
+        if isinstance(gs, dict) and isinstance(gs.get("question_understanding"), str):
+            return gs["question_understanding"]
+        if isinstance(body.get("question_understanding"), str):
+            return body["question_understanding"]
+        for v in body.values():
+            r = _extract_question_understanding_deep(v)
+            if r is not None:
+                return r
+    elif isinstance(body, list):
+        for v in body:
+            r = _extract_question_understanding_deep(v)
+            if r is not None:
+                return r
+    return None
+
+
+def _sql_source_from_qu(qu: Any) -> str | None:
+    """Map question_understanding to a source label: 'rag' or 'llm'."""
+    if not qu or not isinstance(qu, str):
+        return None
+    return "rag" if qu.strip().lower() == "rag_semantic" else "llm"
+
+
 def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, Any]:
     """Build the per-group SQL-consistency report from stored query records."""
     rows = db.fetch_all(
@@ -703,20 +732,44 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
                 return s
         return None
 
+    def understanding_of(qid: int) -> str | None:
+        rec = by_qid.get(qid) or {}
+        v = rec.get("validations") or {}
+        if v.get("question_understanding") is not None:
+            return v.get("question_understanding")
+        return _extract_question_understanding_deep(
+            (rec.get("generate_sql_call") or {}).get("response_body"))
+
+    def source_of(qid: int) -> str | None:
+        rec = by_qid.get(qid) or {}
+        v = rec.get("validations") or {}
+        if v.get("sql_source"):
+            return v.get("sql_source")
+        return _sql_source_from_qu(understanding_of(qid))
+
     def status_of(qid: int):
         return (by_qid.get(qid) or {}).get("overall_status")
 
     out_groups: list[dict[str, Any]] = []
     total_variants = matched_variants = equivalent_variants = 0
     groups_fully_exact = groups_fully_equivalent = 0
+    rag_count = llm_count = 0  # across all questions (originals + variants)
 
     # Hierarchical display numbers: original = "1", its variants = "1.1",
     # "1.2", ...  (group index is 1-based and contiguous regardless of the
     # stored group_id). The underlying qid is kept for drill-down links.
+    def _tally_source(src: str | None) -> None:
+        nonlocal rag_count, llm_count
+        if src == "rag":
+            rag_count += 1
+        elif src == "llm":
+            llm_count += 1
+
     for gidx, g in enumerate((variant_groups.get("groups") or []), start=1):
         oqid = g["original_qid"]
         osql = sql_of(oqid)
         onorm = _normalize_sql(osql)
+        _tally_source(source_of(oqid))
         variants = []
         for vi, vqid in enumerate(g.get("variant_qids", []), start=1):
             vsql = sql_of(vqid)
@@ -732,6 +785,7 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
                 matched_variants += 1
             if equivalent:
                 equivalent_variants += 1
+            _tally_source(source_of(vqid))
             rec = by_qid.get(vqid) or {}
             variants.append({
                 "label": f"{gidx}.{vi}",
@@ -742,6 +796,8 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
                 "matches_original": exact,
                 "equivalent": equivalent,
                 "equivalent_reason": reason,
+                "source": source_of(vqid),
+                "question_understanding": understanding_of(vqid),
             })
         n = len(g.get("variant_qids", []))
         nexact = sum(1 for v in variants if v["matches_original"])
@@ -759,6 +815,8 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
             "original_sql": osql,
             "original_status": status_of(oqid),
             "original_has_sql": bool(onorm),
+            "original_source": source_of(oqid),
+            "original_understanding": understanding_of(oqid),
             "variant_count": n,
             "matched": nexact,
             "equivalent_count": nequiv,
@@ -778,6 +836,8 @@ def _variant_report(run_id: str, variant_groups: dict[str, Any]) -> dict[str, An
             "equivalent_variants": equivalent_variants,
             "overall_match_rate": (matched_variants / total_variants) if total_variants else None,
             "overall_equivalent_rate": (equivalent_variants / total_variants) if total_variants else None,
+            "rag_count": rag_count,
+            "llm_count": llm_count,
         },
     }
 

@@ -37,7 +37,19 @@ function renderTotals(t) {
     <span class="count-pill ${eqRate != null && eqRate >= 0.8 ? 'PASS' : 'PARTIAL'}">Equivalent SQL (logic)<b>${t.equivalent_variants} · ${pct(eqRate)}</b></span>
     <span class="count-pill">Exact SQL match<b>${t.matched_variants} · ${pct(t.overall_match_rate)}</b></span>
     <span class="count-pill PASS">Groups fully equivalent<b>${t.groups_fully_equivalent}</b></span>
+    <span class="count-pill">SQL source<b>${t.rag_count} RAG · ${t.llm_count} LLM</b></span>
   `;
+}
+
+function sourceBadge(src, understanding) {
+  if (src === 'rag') {
+    return `<span class="badge badge-soft" title="question_understanding = rag_semantic — SQL retrieved from RAG / trained examples">RAG</span>`;
+  }
+  if (src === 'llm') {
+    const t = understanding ? esc(understanding) : 'LLM-generated SQL';
+    return `<span class="badge PARTIAL" title="${t}">LLM</span>`;
+  }
+  return '<span class="meta">—</span>';
 }
 
 function statusBadge(s){ return s ? `<span class="badge ${esc(s)}">${esc(s)}</span>` : '<span class="meta">—</span>'; }
@@ -74,6 +86,7 @@ function renderGroups(groups) {
         <td><b>${esc(v.label)}</b></td>
         <td>${esc((v.nl_query||'').slice(0,90))}${(v.nl_query||'').length>90?'…':''}</td>
         <td>${statusBadge(v.status)}</td>
+        <td>${sourceBadge(v.source, v.question_understanding)}</td>
         <td>${eqCell}</td>
         <td>${g.original_has_sql ? exactCell : '<span class="meta">—</span>'}</td>
         <td>${v.sql ? `<pre style="margin:0; max-height:120px; overflow:auto">${esc(v.sql)}</pre>` : '<span class="meta">no SQL</span>'}</td>
@@ -87,12 +100,12 @@ function renderGroups(groups) {
         <span class="badge ${rateCls}">${g.equivalent_count} / ${g.variant_count} equivalent · ${pct(eqRate)}<span class="meta" style="margin-left:6px">(${g.matched} exact)</span></span>
       </div>
       <p style="margin:8px 0 2px">
-        <a href="${oHref}"><b>Original (${esc(oLabel)})</b></a> ${statusBadge(g.original_status)}: ${esc(g.original_text)}
+        <a href="${oHref}"><b>Original (${esc(oLabel)})</b></a> ${statusBadge(g.original_status)} ${sourceBadge(g.original_source, g.original_understanding)}: ${esc(g.original_text)}
       </p>
       ${baseline}
       <table class="table">
-        <thead><tr><th>#</th><th>Variant question</th><th>Status</th><th>Equivalent?</th><th>Exact</th><th>Generated SQL</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="table-empty">No variants in this group.</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>Variant question</th><th>Status</th><th>Source</th><th>Equivalent?</th><th>Exact</th><th>Generated SQL</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8" class="table-empty">No variants in this group.</td></tr>'}</tbody>
       </table>
     </div>`;
   }).join('');

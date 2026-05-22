@@ -1192,6 +1192,14 @@ def validate_query(qr: QueryResult) -> None:
         )
         v["run_sql_response_keys"] = list(rs.response_body.keys()) if isinstance(rs.response_body, dict) else None
 
+    # SQL source: question_understanding == 'rag_semantic' means the SQL was
+    # retrieved from RAG (trained examples); anything else (a sentence) means
+    # the LLM generated it. Lets users verify RAG vs LLM per query.
+    qu = extract_question_understanding(qr.generate_sql_call.response_body) if qr.generate_sql_call else None
+    if qu is not None:
+        v["question_understanding"] = qu
+        v["sql_source"] = "rag" if str(qu).strip().lower() == "rag_semantic" else "llm"
+
     gv = qr.generate_viz_call
     if not gv:
         v.update({
@@ -1397,6 +1405,28 @@ def extract_returned_sql(body: Any) -> str | None:
         for v in body:
             r = extract_returned_sql(v)
             if r:
+                return r
+    return None
+
+
+def extract_question_understanding(body: Any) -> str | None:
+    """Find generated_sql.question_understanding anywhere in a response body.
+    'rag_semantic' => SQL came from RAG (trained examples); a sentence =>
+    LLM-generated."""
+    if isinstance(body, dict):
+        gs = body.get("generated_sql")
+        if isinstance(gs, dict) and isinstance(gs.get("question_understanding"), str):
+            return gs["question_understanding"]
+        if isinstance(body.get("question_understanding"), str):
+            return body["question_understanding"]
+        for v in body.values():
+            r = extract_question_understanding(v)
+            if r is not None:
+                return r
+    elif isinstance(body, list):
+        for v in body:
+            r = extract_question_understanding(v)
+            if r is not None:
                 return r
     return None
 

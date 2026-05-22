@@ -73,6 +73,8 @@ function render(d) {
       <tr><th>run-sql rows</th><td>${v.run_sql_row_count != null ? v.run_sql_row_count : '—'}</td></tr>
       <tr><th>chart type</th><td><code>${SQA.escapeHtml(String(v.generate_viz_chart_type||'—'))}</code></td></tr>
       <tr><th>columns synced</th><td>${formatBool(v.columns_synced_run_sql_vs_generate_viz)}</td></tr>
+      <tr><th>SQL source</th><td>${v.sql_source === 'rag' ? '<span class="badge badge-soft" title="question_understanding = rag_semantic">RAG (trained example)</span>' : (v.sql_source === 'llm' ? '<span class="badge PARTIAL">LLM-generated</span>' : '<span class="meta">—</span>')}</td></tr>
+      ${v.question_understanding ? `<tr><th>question_understanding</th><td><code>${SQA.escapeHtml(v.question_understanding)}</code></td></tr>` : ''}
       <tr><th>fail reasons</th><td>${formatList(v.fail_reasons)}</td></tr>
       <tr><th>warn reasons</th><td>${formatList(v.warn_reasons)}</td></tr>
       <tr><th>info / observations</th><td>${formatList(v.info_reasons)}</td></tr>
