@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+{% block title %}Activity Logs{% endblock %}
+{% block header_title %}Activity Logs{% endblock %}
+{% block header_sub %}— Query history pulled from Celerant, grouped by organization{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Fetch history</h2>
+  <p class="meta" style="margin-top:-4px">
+    Paste one or more <b>Organization IDs</b> (one per line), pick a date range,
+    and the tool pulls each tenant's recent queries from Celerant. You'll get a
+    per-organization report with totals, LLM vs RAG split, status breakdown, and
+    a searchable record table.
+  </p>
+
+  <form id="al-form" class="form" enctype="application/x-www-form-urlencoded">
+    <label>
+      <span class="label-text">Organization IDs <em>required</em></span>
+      <textarea name="org_ids" id="al-org_ids" rows="3"
+                placeholder="fd39c82a-aabf-42fd-80fd-0c35b7dfc505&#10;another-org-id-here"
+                required style="font-family:var(--font-mono); font-size:13px"></textarea>
+      <span class="meta">One per line. Up to 25 organizations per request.</span>
+    </label>
+
+    <div class="grid-2">
+      <label>
+        <span class="label-text">From date <em>required</em></span>
+        <input type="date" name="from_date" id="al-from" required>
+      </label>
+      <label>
+        <span class="label-text">To date <em>required</em></span>
+        <input type="date" name="to_date" id="al-to" required>
+      </label>
+    </div>
+
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Records per organization</span>
+        <input type="number" name="limit" id="al-limit" value="100" min="1" max="1000">
+      </label>
+      <label>
+        <span class="label-text">Offset</span>
+        <input type="number" name="offset" id="al-offset" value="0" min="0">
+      </label>
+    </div>
+
+    <details style="margin:4px 0 8px">
+      <summary class="meta" style="cursor:pointer">Advanced</summary>
+      <label style="margin-top:8px">
+        <span class="label-text">Console URL</span>
+        <input type="url" name="console_url" id="al-console_url" value="{{ default_console }}">
+      </label>
+      <label>
+        <span class="label-text">Bearer token <em>(optional)</em></span>
+        <input type="text" name="bearer_token" id="al-bearer_token" autocomplete="off">
+      </label>
+    </details>
+
+    <button type="submit" class="btn btn-primary" id="al-submit">▶ Fetch logs</button>
+    <span id="al-status" class="meta" style="margin-left:10px"></span>
+  </form>
+</div>
+
+<div id="al-totals"></div>
+<div id="al-orgs"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const form = document.getElementById('al-form');
+const submitBtn = document.getElementById('al-submit');
+const statusEl = document.getElementById('al-status');
+const totalsEl = document.getElementById('al-totals');
+const orgsEl = document.getElementById('al-orgs');
+
+// Per-org search state, keyed by org id.
+const _filters = {};
+
+// Default dates: last 7 days through today.
+(function() {
+  const today = new Date();
+  const week  = new Date(); week.setDate(today.getDate() - 7);
+  const iso = d => d.toISOString().slice(0, 10);
+  document.getElementById('al-to').value   = iso(today);
+  document.getElementById('al-from').value = iso(week);
+})();
+
+function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
+function pct(x){ return x == null ? '—' : (Math.round(x * 1000) / 10) + '%'; }
+function badge(cls, text){ return `<span class="badge ${cls}">${esc(text)}</span>`; }
+function shortDate(s){ return s ? esc(String(s).slice(0,19).replace('T',' ')) : '—'; }
+
+function llmBadge(v){
+  if (v === true)  return badge('PARTIAL', 'LLM');
+  if (v === false) return badge('badge-soft', 'RAG');
+  return '<span class="meta">—</span>';
+}
+function statusBadgeFor(s){
+  if (!s) return '<span class="meta">—</span>';
+  const up = String(s).toUpperCase();
+  if (up === 'COMPLETE') return badge('PASS', 'complete');
+  if (up === 'FAILED')   return badge('FAIL', 'failed');
+  return badge('badge-soft', s);
+}
+
+function renderTotals(t) {
+  totalsEl.innerHTML = `
+    <div class="card">
+      <div class="counts" style="display:flex; gap:18px; flex-wrap:wrap">
+        <span class="count-pill">Organizations<b>${t.orgs}</b></span>
+        <span class="count-pill">Total queries<b>${t.queries}</b></span>
+        <span class="count-pill PARTIAL">LLM<b>${t.llm}</b></span>
+        <span class="count-pill">RAG<b>${t.rag}</b></span>
+        <span class="count-pill PASS">Complete<b>${t.complete}</b></span>
+        <span class="count-pill FAIL">Failed<b>${t.failed}</b></span>
+      </div>
+    </div>`;
+}
+
+function renderRecordsTable(org) {
+  const f = (_filters[org.org_id] || '').toLowerCase();
+  let rows = org.records || [];
+  if (f) {
+    rows = rows.filter(r => {
+      const blob = [r.natural_language_query, r.login_name, r.query_status, r.session_id, r.user_id].join(' ').toLowerCase();
+      return blob.includes(f);
+    });
+  }
+  rows.sort((a,b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  if (!rows.length) return '<div class="table-empty">No records match.</div>';
+  const trs = rows.map(r => `
+    <tr>
+      <td>${shortDate(r.created_at)}</td>
+      <td>${esc(r.login_name || '')}<br><span class="meta">${esc(r.user_id || '')}</span></td>
+      <td>${statusBadgeFor(r.query_status)}</td>
+      <td>${llmBadge(r.llm_invoked)}</td>
+      <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
+      <td><span class="meta">${esc(r.session_id || '')}</span></td>
+      <td style="text-align:right">${esc(r.sequence_number != null ? r.sequence_number : '')}</td>
+    </tr>`).join('');
+  return `<div style="overflow-x:auto"><table class="table">
+    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Source</th><th>Question</th><th>Session</th><th style="text-align:right">Seq</th></tr></thead>
+    <tbody>${trs}</tbody>
+  </table></div>`;
+}
+
+// 0-based index assigned at render time so dashed org IDs don't break selectors.
+let _orgByIdx = [];
+
+function renderOrg(org, idx) {
+  if (!org.ok) {
+    return `<div class="card">
+      <h2 style="margin:0 0 6px">${esc(org.org_id)} ${badge('FAIL', 'failed')}</h2>
+      <p class="meta">HTTP ${org.status_code != null ? org.status_code : '—'} · <code>${esc(org.url)}</code></p>
+      <div class="reason reason-fail">${esc(org.error || 'Request failed')}</div>
+    </div>`;
+  }
+  const s = org.stats || {};
+  const total = org.count;
+  const llmPct = total ? s.llm / total : null;
+  return `<div class="card" data-org-idx="${idx}">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
+      <h2 style="margin:0">${esc(org.org_id)}</h2>
+      <span class="meta">Records: <b>${total}</b>${org.history_count != null && org.history_count !== total ? ` · history_count ${org.history_count}` : ''}</span>
+    </div>
+    <div class="counts" style="display:flex; gap:14px; flex-wrap:wrap; margin:10px 0">
+      <span class="count-pill PARTIAL">LLM<b>${s.llm} · ${pct(llmPct)}</b></span>
+      <span class="count-pill">RAG<b>${s.rag}</b></span>
+      <span class="count-pill PASS">Complete<b>${s.complete}</b></span>
+      <span class="count-pill FAIL">Failed<b>${s.failed}</b></span>
+      <span class="count-pill">Users<b>${s.user_count}</b></span>
+      <span class="count-pill">Sessions<b>${s.session_count}</b></span>
+      <span class="count-pill">Range<b style="font-size:11px">${shortDate(s.first_ts)} → ${shortDate(s.last_ts)}</b></span>
+    </div>
+    <label style="margin:0 0 8px; display:block">
+      <span class="label-text">Filter within this organization</span>
+      <input type="text" class="al-filter"
+             placeholder="search question / user / status / session…"
+             value="${esc(_filters[org.org_id] || '')}">
+    </label>
+    <div class="al-records">${renderRecordsTable(org)}</div>
+  </div>`;
+}
+
+function renderResult(data) {
+  if (!data.ok) {
+    totalsEl.innerHTML = `<div class="card"><div class="reason reason-fail">${esc(data.error || 'Request failed')}</div></div>`;
+    orgsEl.innerHTML = '';
+    return;
+  }
+  renderTotals(data.totals);
+  _orgByIdx = data.organizations.slice();
+  orgsEl.innerHTML = _orgByIdx.map((o, i) => renderOrg(o, i)).join('');
+  // Wire up per-org filter inputs.
+  orgsEl.querySelectorAll('[data-org-idx]').forEach(card => {
+    const idx = parseInt(card.getAttribute('data-org-idx'), 10);
+    const org = _orgByIdx[idx];
+    const input = card.querySelector('.al-filter');
+    const recordsDiv = card.querySelector('.al-records');
+    if (input && recordsDiv && org) {
+      input.addEventListener('input', () => {
+        _filters[org.org_id] = input.value;
+        recordsDiv.innerHTML = renderRecordsTable(org);
+      });
+    }
+  });
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const ids = document.getElementById('al-org_ids').value.trim();
+  if (!ids) { SQA.toast('Paste at least one Organization ID.', 'error'); return; }
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Fetching…';
+  statusEl.textContent = 'Calling Celerant for each org…';
+  totalsEl.innerHTML = '';
+  orgsEl.innerHTML = '<div class="card"><p class="meta">Waiting for the history endpoint…</p></div>';
+  try {
+    const fd = new FormData(form);
+    const r = await fetch('{{ url_for("activity_logs_fetch") }}', { method: 'POST', body: new URLSearchParams(fd) });
+    const data = await r.json();
+    renderResult(data);
+    statusEl.textContent = '';
+    if (data.ok) SQA.toast(`Fetched ${data.totals.queries} queries across ${data.totals.orgs} organization(s).`, 'success');
+    else SQA.toast('Fetch returned an error.', 'error');
+  } catch (err) {
+    orgsEl.innerHTML = `<div class="card"><div class="reason reason-fail">Request failed: ${esc(err.message)}</div></div>`;
+    SQA.toast('Request failed.', 'error');
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = '▶ Fetch logs';
+  }
+});
+</script>
+{% endblock %}

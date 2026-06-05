@@ -1091,6 +1091,156 @@ def training_submit():
 
 
 # ---------------------------------------------------------------------------
+# Activity Logs — pull /sql_agent/history_data/{org_id}/{offset}/{limit}/ for
+# one or more tenants and present a per-org report (totals, LLM vs RAG split,
+# status breakdown, searchable record list). The call is proxied server-side
+# so the browser doesn't fight CORS and we can fan out across N orgs.
+# ---------------------------------------------------------------------------
+CELERANT_HISTORY_BASE = "https://celerantai.com/sql_agent/history_data"
+
+
+def _yyyy_mm_dd_to_mm_dd_yyyy(s: str) -> str | None:
+    """Convert HTML5 date input (YYYY-MM-DD) to the API's MM-DD-YYYY format."""
+    if not s:
+        return None
+    s = s.strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
+    if m:
+        y, mo, d = m.groups()
+        return f"{mo}-{d}-{y}"
+    # Already MM-DD-YYYY?
+    if re.match(r"^\d{2}-\d{2}-\d{4}$", s):
+        return s
+    return None
+
+
+@app.route("/activity-logs")
+@auth.login_required
+def activity_logs_page():
+    return render_template("activity_logs.html", active="activity_logs",
+                           default_console="https://celerantai.com")
+
+
+@app.route("/activity-logs/fetch", methods=["POST"])
+@auth.login_required
+def activity_logs_fetch():
+    """Fetch history for each org id (one per line) and return a combined
+    per-org report. No data is stored — this is a live proxy."""
+    import requests
+
+    raw_ids = (request.form.get("org_ids") or "").strip()
+    org_ids = [s.strip() for s in re.split(r"[\s,]+", raw_ids) if s.strip()]
+    if not org_ids:
+        return jsonify({"ok": False, "error": "Provide at least one Organization ID."}), 400
+    if len(org_ids) > 25:
+        return jsonify({"ok": False, "error": "Up to 25 organizations per request."}), 400
+
+    from_d = _yyyy_mm_dd_to_mm_dd_yyyy(request.form.get("from_date") or "")
+    to_d   = _yyyy_mm_dd_to_mm_dd_yyyy(request.form.get("to_date") or "")
+    if not from_d or not to_d:
+        return jsonify({"ok": False, "error": "Provide both from_date and to_date (YYYY-MM-DD)."}), 400
+
+    try:
+        offset = max(0, int(request.form.get("offset") or 0))
+        limit  = min(1000, max(1, int(request.form.get("limit") or 100)))
+    except ValueError:
+        return jsonify({"ok": False, "error": "offset and limit must be integers."}), 400
+
+    console = (request.form.get("console_url") or "https://celerantai.com").strip().rstrip("/")
+    base = f"{console}/sql_agent/history_data"
+    headers: dict[str, str] = {}
+    token = (request.form.get("bearer_token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    def _stats(records: list[dict[str, Any]]) -> dict[str, Any]:
+        llm = sum(1 for r in records if r.get("llm_invoked") is True)
+        rag = sum(1 for r in records if r.get("llm_invoked") is False)
+        statuses: dict[str, int] = {}
+        users: set[str] = set()
+        sessions: set[str] = set()
+        first = last = None
+        for r in records:
+            s = (r.get("query_status") or "unknown").lower()
+            statuses[s] = statuses.get(s, 0) + 1
+            ln = r.get("login_name")
+            if ln:
+                users.add(str(ln))
+            sid = r.get("session_id")
+            if sid:
+                sessions.add(str(sid))
+            ts = r.get("created_at")
+            if ts:
+                first = ts if (first is None or ts < first) else first
+                last  = ts if (last  is None or ts > last)  else last
+        return {
+            "llm": llm, "rag": rag,
+            "complete": statuses.get("complete", 0),
+            "failed":   statuses.get("failed", 0),
+            "status_breakdown": statuses,
+            "users":    sorted(users),
+            "user_count": len(users),
+            "session_count": len(sessions),
+            "first_ts": first, "last_ts": last,
+        }
+
+    out_orgs: list[dict[str, Any]] = []
+    grand = {"orgs": 0, "queries": 0, "llm": 0, "rag": 0, "complete": 0, "failed": 0}
+    for org_id in org_ids:
+        url = f"{base}/{org_id}/{offset}/{limit}/"
+        try:
+            resp = requests.get(url, params={"from_date": from_d, "to_date": to_d},
+                                headers=headers, timeout=120)
+            try:
+                body = resp.json()
+            except Exception:
+                body = (resp.text or "")[:50_000]
+            records = []
+            history_count = None
+            if isinstance(body, dict):
+                rb = body.get("responseBody") or {}
+                data = rb.get("data") if isinstance(rb, dict) else None
+                if isinstance(data, dict):
+                    records = data.get("history_records") or []
+                    history_count = data.get("history_count")
+            entry = {
+                "org_id": org_id,
+                "ok": 200 <= resp.status_code < 300,
+                "status_code": resp.status_code,
+                "url": url,
+                "history_count": history_count,
+                "count": len(records),
+                "records": records,
+                "stats": _stats(records),
+                "error": None if 200 <= resp.status_code < 300 else (
+                    body.get("responseHeader", {}).get("message") if isinstance(body, dict) else str(body)[:200]
+                ),
+            }
+        except Exception as e:
+            entry = {
+                "org_id": org_id, "ok": False, "status_code": None,
+                "url": url, "error": f"{type(e).__name__}: {e}",
+                "count": 0, "records": [], "stats": _stats([]),
+            }
+        out_orgs.append(entry)
+        if entry["ok"]:
+            grand["orgs"] += 1
+            grand["queries"] += entry["count"]
+            grand["llm"] += entry["stats"]["llm"]
+            grand["rag"] += entry["stats"]["rag"]
+            grand["complete"] += entry["stats"]["complete"]
+            grand["failed"] += entry["stats"]["failed"]
+
+    return jsonify({
+        "ok": True,
+        "from_date": from_d, "to_date": to_d,
+        "offset": offset, "limit": limit,
+        "totals": grand,
+        "organizations": out_orgs,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Variant Tests — run an original question + its paraphrases through the SQL
 # AI Engine and report how many variants generate the same SQL as the original.
 # Reuses the SQL Agent runner; the run is tagged with a variant_groups map.
