@@ -1035,15 +1035,31 @@ def training_submit():
 
     # Optional CSV file upload (multipart). One of file/filepath is required.
     files = None
+    parsed_questions: list[dict[str, str]] = []
     upload = request.files.get("sql_examples_file")
     if upload and upload.filename:
+        csv_bytes = upload.read()
         files = {
             "sql_examples_file": (
                 upload.filename,
-                upload.read(),
+                csv_bytes,
                 upload.mimetype or "text/csv",
             )
         }
+        # Parse the CSV into questions so the page can offer a follow-up
+        # "test these same questions on the SQL Agent" run after training succeeds.
+        try:
+            text = csv_bytes.decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                nl = (row.get("natural_language_query") or "").strip()
+                sql = (row.get("sql_query") or "").strip()
+                if nl:
+                    parsed_questions.append(
+                        {"natural_language_query": nl, "expected_sql": sql}
+                    )
+        except Exception:
+            parsed_questions = []
     if not files and not filepath:
         return jsonify({
             "ok": False,
@@ -1087,7 +1103,94 @@ def training_submit():
         "params": params,
         "elapsed_ms": elapsed_ms,
         "response": body,
+        # Parsed from the uploaded CSV so the page can offer a follow-up
+        # "test these on the SQL Agent" run without re-uploading.
+        "uploaded_questions": parsed_questions,
     })
+
+
+@app.route("/training/test-run", methods=["POST"])
+@auth.login_required
+def training_test_run():
+    """Create a normal SQL Agent run using the questions that were just
+    uploaded to the training endpoint. Lets the tester immediately verify
+    that asking those same NL questions through the SQL Agent now returns
+    the trained SQL.
+    """
+    login_url = (request.form.get("login_url") or "").strip()
+    cred_username = (request.form.get("username") or "").strip()
+    cred_password = (request.form.get("password") or "")
+    machine_id = (request.form.get("machine_id") or "100").strip()
+    sql_agent_path = (request.form.get("sql_agent_path") or
+                      "/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent").strip()
+    try:
+        run_sql_to = int(request.form.get("run_sql_timeout_ms") or 120_000)
+        gen_viz_to = int(request.form.get("gen_viz_timeout_ms") or 120_000)
+    except ValueError:
+        return ("Timeout fields must be integers.", 400)
+
+    if not login_url:
+        return ("Missing login_url.", 400)
+    if login_url.lower().startswith("file:"):
+        return ("file:// URLs cannot be reached from inside the container.", 400)
+    if not (cred_username and cred_password):
+        return ("Username and password are required.", 400)
+
+    qjson = request.form.get("questions_json") or "[]"
+    try:
+        raw = json.loads(qjson)
+    except Exception:
+        return ("questions_json must be a JSON array.", 400)
+    questions: list[dict[str, Any]] = []
+    for i, q in enumerate(raw):
+        nl = (q.get("natural_language_query") if isinstance(q, dict) else "") or ""
+        sql = (q.get("expected_sql") if isinstance(q, dict) else "") or ""
+        nl = str(nl).strip()
+        if nl:
+            questions.append({
+                "id": len(questions) + 1,
+                "natural_language_query": nl,
+                "expected_sql": str(sql).strip(),
+            })
+    if not questions:
+        return ("No valid questions to run.", 400)
+
+    run_id = uuid.uuid4().hex[:8] + "-" + datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    job = _job_dir(run_id)
+    job.mkdir(parents=True, exist_ok=True)
+    # Write an xlsx mirror of the question list so the run zip includes it
+    # alongside everything else, matching what a normal run looks like.
+    try:
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["natural_language_query", "expected_sql"])
+        for q in questions:
+            ws.append([q["natural_language_query"], q["expected_sql"]])
+        wb.save(str(job / "questions.xlsx"))
+    except Exception as e:
+        return (f"Failed to write questions.xlsx: {e}", 500)
+
+    db.execute(
+        """INSERT INTO runs (id, user_id, test_type, login_url, username, machine_id,
+                             sql_agent_path, search_input_selector, question_count,
+                             test_file_name, status)
+           VALUES (%s, %s, 'sql_agent', %s, %s, %s, %s, %s, %s, %s, 'queued')""",
+        (run_id, auth.current_user_id(), login_url, cred_username, machine_id,
+         sql_agent_path, "#searchbox", len(questions),
+         "training-test-run.xlsx"),
+    )
+    cfg = RunConfig(
+        login_url=login_url, username=cred_username, password=cred_password,
+        questions=questions, output_dir=job, test_type="sql_agent",
+        machine_id=machine_id, sql_agent_path=sql_agent_path,
+        run_sql_timeout_ms=run_sql_to, gen_viz_timeout_ms=gen_viz_to,
+        headless=True,
+    )
+    _event_queues[run_id] = queue.Queue(maxsize=10_000)
+    _stop_events[run_id] = threading.Event()
+    threading.Thread(target=_run_job, args=(run_id, cfg), daemon=True).start()
+    return redirect(url_for("job_view", job_id=run_id))
 
 
 # ---------------------------------------------------------------------------

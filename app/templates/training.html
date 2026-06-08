@@ -89,6 +89,63 @@
     </div>
   </div>
 </div>
+
+<!-- Revealed after a successful training upload — runs the same NL questions
+     through the SQL Agent so the tester can verify the trained SQL comes back. -->
+<div class="card" id="t-test-run-card" style="display:none">
+  <h2>Test these questions on the SQL Agent</h2>
+  <p class="meta" style="margin-top:-4px">
+    <span id="t-test-count">0</span> question(s) parsed from the CSV you just uploaded.
+    Provide tenant login details and we'll run them through the SQL Agent — full
+    API capture and screenshots — so you can verify the trained SQL is actually returned.
+  </p>
+  <form id="t-test-form" class="form" method="POST"
+        action="{{ url_for('training_test_run') }}">
+    <input type="hidden" name="questions_json" id="t-test-questions_json" value="[]">
+
+    <label>
+      <span class="label-text">Login URL <em>required</em></span>
+      <input type="url" name="login_url" id="t-test-login_url"
+             placeholder="https://&lt;host&gt;:8443/backoffice/?mid=100" required>
+    </label>
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Username <em>required</em></span>
+        <input type="text" name="username" id="t-test-username" autocomplete="username" required>
+      </label>
+      <label>
+        <span class="label-text">Password <em>required</em></span>
+        <input type="password" name="password" id="t-test-password" autocomplete="current-password" required>
+      </label>
+    </div>
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Machine ID</span>
+        <input type="text" name="machine_id" value="100">
+      </label>
+      <label>
+        <span class="label-text">SQL Agent path</span>
+        <input type="text" name="sql_agent_path"
+               value="/backoffice/mv-assets/index-modern.html#/listScreen/sqlagent">
+      </label>
+    </div>
+    <details style="margin:4px 0 8px">
+      <summary class="meta" style="cursor:pointer">Advanced timeouts</summary>
+      <div class="grid-2" style="margin-top:8px">
+        <label>
+          <span class="label-text">run-sql timeout (ms)</span>
+          <input type="number" name="run_sql_timeout_ms" value="120000">
+        </label>
+        <label>
+          <span class="label-text">generate-viz timeout (ms)</span>
+          <input type="number" name="gen_viz_timeout_ms" value="120000">
+        </label>
+      </div>
+    </details>
+    <button type="submit" class="btn btn-primary">▶ Run test against SQL Agent</button>
+    <span class="meta" style="margin-left:10px">You'll be taken to the run page (live progress + screenshots).</span>
+  </form>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -174,6 +231,20 @@ form.addEventListener('submit', async (e) => {
     const r = await fetch('{{ url_for("training_submit") }}', { method: 'POST', body: fd });
     const data = await r.json();
     renderResult(data);
+    // On a successful training call AND when the CSV parsed cleanly, reveal
+    // the follow-up "test these on the SQL Agent" form pre-loaded with the
+    // questions we parsed server-side.
+    const testCard = document.getElementById('t-test-run-card');
+    const qs = (data && data.uploaded_questions) || [];
+    if (data.ok && qs.length > 0) {
+      document.getElementById('t-test-count').textContent = qs.length;
+      document.getElementById('t-test-questions_json').value = JSON.stringify(qs);
+      testCard.style.display = '';
+      // Make sure the tester sees the card.
+      testCard.scrollIntoView({behavior: 'smooth', block: 'start'});
+    } else {
+      testCard.style.display = 'none';
+    }
     if (data.ok) SQA.toast('Training call completed.', 'success');
     else SQA.toast('Training call returned an error — see result.', 'error');
   } catch (err) {
