@@ -15,22 +15,14 @@
 
   <form id="al-form" class="form" enctype="application/x-www-form-urlencoded">
     <label>
-      <span class="label-text">Organizations <em>required</em></span>
-      <div id="al-orgs-loading" class="meta">Loading organizations from <code>/sql_agent/all_orgs/</code>…</div>
-      <div id="al-orgs-wrap" style="display:none">
-        <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px">
-          <input type="text" id="al-org-search" placeholder="Filter by name or ID…"
-                 style="flex:1; padding:6px 8px; font-size:13px">
-          <button type="button" class="btn btn-sm" id="al-org-all">Select all</button>
-          <button type="button" class="btn btn-sm" id="al-org-none">Clear</button>
-          <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent/all_orgs/">⟳</button>
-        </div>
-        <div id="al-orgs-list"
-             style="max-height:260px; overflow-y:auto; border:1px solid var(--border);
-                    border-radius:4px; padding:6px 8px; background:var(--surface)"></div>
-        <span class="meta"><span id="al-orgs-selected">0</span> selected · up to 25 per request</span>
+      <span class="label-text">Organization <em>required</em></span>
+      <div style="display:flex; gap:8px; align-items:center">
+        <select name="org_ids" id="al-org-select" required style="flex:1">
+          <option value="">— loading organizations… —</option>
+        </select>
+        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent/all_orgs/">⟳</button>
       </div>
-      <input type="hidden" name="org_ids" id="al-org_ids" required>
+      <span class="meta" id="al-orgs-status"></span>
     </label>
 
     <div class="grid-2">
@@ -88,86 +80,38 @@ const orgsEl = document.getElementById('al-orgs');
 const _filters = {};
 
 // Cache of orgs from /sql_agent/all_orgs/. dbId -> {name, organization_id, database_id}
+// Kept so the per-org report header can show the friendly name.
 const _orgsByDbId = {};
-let _orgsList = [];                  // sorted by name (server-side)
-const _selectedDbIds = new Set();    // currently checked database_ids
-let _orgSearchTerm = '';
 
 function orgLabel(dbId) {
   const o = _orgsByDbId[dbId];
   return o ? o.name : dbId;
 }
 
-function rerenderOrgList() {
-  const wrap = document.getElementById('al-orgs-list');
-  const term = _orgSearchTerm.toLowerCase().trim();
-  const visible = _orgsList.filter(o => !term
-    || (o.name || '').toLowerCase().includes(term)
-    || (o.database_id || '').toLowerCase().includes(term)
-    || (o.organization_id || '').toLowerCase().includes(term));
-  if (!visible.length) {
-    wrap.innerHTML = '<div class="meta" style="padding:8px">No organizations match your filter.</div>';
-    return;
-  }
-  wrap.innerHTML = visible.map(o => {
-    const checked = _selectedDbIds.has(o.database_id) ? ' checked' : '';
-    return `<label style="display:flex; align-items:center; gap:8px; padding:4px 2px; cursor:pointer; border-bottom:1px solid var(--border)">
-      <input type="checkbox" class="al-org-cb" value="${SQA.escapeHtml(o.database_id)}"${checked}>
-      <span style="flex:1">
-        <b>${SQA.escapeHtml(o.name || '(no name)')}</b>
-        <span class="meta" style="font-family:var(--font-mono); font-size:11px"> · ${SQA.escapeHtml(o.database_id)}</span>
-      </span>
-    </label>`;
-  }).join('');
-  wrap.querySelectorAll('.al-org-cb').forEach(cb => {
-    cb.addEventListener('change', () => {
-      if (cb.checked) _selectedDbIds.add(cb.value);
-      else _selectedDbIds.delete(cb.value);
-      syncSelection();
-    });
-  });
-}
-
-function syncSelection() {
-  document.getElementById('al-orgs-selected').textContent = _selectedDbIds.size;
-  document.getElementById('al-org_ids').value = Array.from(_selectedDbIds).join('\n');
-}
-
 async function loadOrgs() {
-  document.getElementById('al-orgs-loading').style.display = '';
-  document.getElementById('al-orgs-wrap').style.display = 'none';
+  const sel = document.getElementById('al-org-select');
+  const status = document.getElementById('al-orgs-status');
+  sel.innerHTML = '<option value="">— loading organizations… —</option>';
+  sel.disabled = true;
+  status.textContent = '';
   try {
     const r = await SQA.fetchJSON('{{ url_for("activity_logs_orgs") }}');
     if (!r.ok) throw new Error(r.error || 'Failed to load organizations');
-    _orgsList = r.orgs || [];
+    const orgs = r.orgs || [];
     for (const k of Object.keys(_orgsByDbId)) delete _orgsByDbId[k];
-    for (const o of _orgsList) _orgsByDbId[o.database_id] = o;
-    document.getElementById('al-orgs-loading').style.display = 'none';
-    document.getElementById('al-orgs-wrap').style.display = '';
-    rerenderOrgList();
-    syncSelection();
+    for (const o of orgs) _orgsByDbId[o.database_id] = o;
+    sel.innerHTML = '<option value="">— select an organization —</option>'
+      + orgs.map(o =>
+          `<option value="${SQA.escapeHtml(o.database_id)}">${SQA.escapeHtml(o.name || '(no name)')}</option>`
+        ).join('');
+    sel.disabled = false;
+    status.textContent = `${orgs.length} organization${orgs.length === 1 ? '' : 's'} loaded.`;
   } catch (e) {
-    document.getElementById('al-orgs-loading').innerHTML =
-      `<div class="reason reason-fail">Could not load organizations: ${SQA.escapeHtml(e.message)}.
-       Check the console URL in Advanced or click ⟳ to retry.</div>`;
-    document.getElementById('al-orgs-wrap').style.display = '';
+    sel.innerHTML = '<option value="">— failed to load —</option>';
+    status.innerHTML = `<span style="color:var(--fail)">Could not load organizations: ${SQA.escapeHtml(e.message)}. Click ⟳ to retry.</span>`;
   }
 }
 
-document.getElementById('al-org-search').addEventListener('input', (e) => {
-  _orgSearchTerm = e.target.value; rerenderOrgList();
-});
-document.getElementById('al-org-all').addEventListener('click', () => {
-  const term = _orgSearchTerm.toLowerCase().trim();
-  const visible = _orgsList.filter(o => !term
-    || (o.name || '').toLowerCase().includes(term)
-    || (o.database_id || '').toLowerCase().includes(term));
-  for (const o of visible) _selectedDbIds.add(o.database_id);
-  rerenderOrgList(); syncSelection();
-});
-document.getElementById('al-org-none').addEventListener('click', () => {
-  _selectedDbIds.clear(); rerenderOrgList(); syncSelection();
-});
 document.getElementById('al-org-reload').addEventListener('click', loadOrgs);
 loadOrgs();
 
@@ -243,11 +187,9 @@ function renderRecordsTable(org) {
 let _orgByIdx = [];
 
 function renderOrg(org, idx) {
+  // Show the friendly org name only — the database_id stays hidden from the UI.
   const friendlyName = orgLabel(org.org_id);
-  const hasFriendlyName = friendlyName !== org.org_id;
-  const header = hasFriendlyName
-    ? `<h2 style="margin:0">${esc(friendlyName)} <span class="meta" style="font-family:var(--font-mono); font-size:12px; font-weight:normal">${esc(org.org_id)}</span></h2>`
-    : `<h2 style="margin:0">${esc(org.org_id)}</h2>`;
+  const header = `<h2 style="margin:0">${esc(friendlyName)}</h2>`;
   if (!org.ok) {
     return `<div class="card">
       <div style="margin-bottom:6px">${header} ${badge('FAIL', 'failed')}</div>
@@ -308,10 +250,8 @@ function renderResult(data) {
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  if (_selectedDbIds.size === 0) { SQA.toast('Select at least one organization.', 'error'); return; }
-  if (_selectedDbIds.size > 25)  { SQA.toast('Pick at most 25 organizations.', 'error'); return; }
-  // Refresh the hidden input one last time in case selection state drifted.
-  syncSelection();
+  const sel = document.getElementById('al-org-select');
+  if (!sel.value) { SQA.toast('Select an organization.', 'error'); return; }
   submitBtn.disabled = true;
   submitBtn.textContent = 'Fetching…';
   statusEl.textContent = 'Calling Celerant for each org…';
