@@ -25,7 +25,13 @@
       <label>
         <span class="label-text">SQL examples CSV</span>
         <input type="file" name="sql_examples_file" id="t-file" accept=".csv,text/csv">
-        <span class="meta">Upload the CSV here, or use a server-side filepath below. One is required.</span>
+        <span class="meta">
+          Two columns required: <code>natural_language_query</code>, <code>sql_query</code>
+          (one example per row, header on row 1).
+          <a href="{{ url_for('static', filename='train-sql-examples-sample.csv') }}"
+             download="train_sql_examples_sample.csv">↓ Download sample CSV</a>.
+          Upload the CSV here, or use a server-side filepath below — one is required.
+        </span>
       </label>
 
       <label>
