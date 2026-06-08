@@ -1121,6 +1121,41 @@ def activity_logs_page():
                            default_console="https://celerantai.com")
 
 
+@app.route("/activity-logs/orgs")
+@auth.login_required
+def activity_logs_orgs():
+    """Proxy to GET {console}/sql_agent/all_orgs/ so the dropdown can be
+    populated server-side (no CORS, no Celerant token leak to the browser).
+    Returns the list verbatim from responseBody.data, sorted by name."""
+    import requests
+    console = (request.args.get("console_url") or "https://celerantai.com").strip().rstrip("/")
+    url = f"{console}/sql_agent/all_orgs/"
+    headers: dict[str, str] = {}
+    token = (request.args.get("bearer_token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
+    if not (200 <= resp.status_code < 300):
+        return jsonify({"ok": False, "status_code": resp.status_code,
+                        "error": (resp.text or "")[:300]}), 502
+    try:
+        body = resp.json()
+    except Exception:
+        return jsonify({"ok": False, "error": "non-JSON response from all_orgs"}), 502
+    orgs = (body.get("responseBody") or {}).get("data") or []
+    # Project to the fields we actually use; sort by friendly name.
+    slim = sorted([{
+        "name": o.get("name") or "",
+        "database_id": o.get("database_id") or "",
+        "organization_id": o.get("organization_id") or "",
+    } for o in orgs if o.get("database_id")],
+        key=lambda o: (o["name"] or "").lower())
+    return jsonify({"ok": True, "count": len(slim), "orgs": slim})
+
+
 @app.route("/activity-logs/fetch", methods=["POST"])
 @auth.login_required
 def activity_logs_fetch():
