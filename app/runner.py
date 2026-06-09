@@ -1288,11 +1288,14 @@ def validate_query(qr: QueryResult) -> None:
     elif not v.get("run_sql_status_ok"):
         fails.append(f"run-sql HTTP {qr.run_sql_call.status if qr.run_sql_call else 'n/a'}")
     elif not v.get("run_sql_has_rows") and not run_sql_timed_out:
-        # "no rows" is a real outcome ONLY when run-sql actually responded.
-        # When run-sql timed out and a later back-fill picked up a hollow
-        # response, the "no rows" warning is misleading — the real reason
-        # is the timeout, which we add as the primary warn further down.
-        warns.append("run-sql returned no rows")
+        # An empty result set is NOT a test failure. The SQL ran successfully,
+        # the LLM understood the question, the database just doesn't have
+        # matching data. Client confirmed: "if data is not present it is not
+        # an issue." Surface it as info (visible in the report) without
+        # affecting the PASS status. Skipped entirely on run-sql timeouts
+        # — those get a clearer timeout reason elsewhere.
+        infos.append("run-sql returned 0 rows (the SQL ran successfully — "
+                     "this database simply has no matching data)")
 
     if viz_button_present is False:
         # The Celerant UI hides the Generate Visualization button for

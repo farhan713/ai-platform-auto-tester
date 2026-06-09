@@ -443,6 +443,7 @@ def _all_results_for_run(run_id: str) -> list[dict[str, Any]]:
 _INFO_GRADE_WARN_PATTERNS = (
     "empty/missing name",                                  # LLM forgot AS alias
     "columns differ between run-sql and generate-viz",     # alias vs raw expression
+    "returned no rows",                                    # empty result set is a valid outcome
 )
 
 
