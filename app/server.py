@@ -1290,14 +1290,25 @@ def _failed_questions_description(job_id: str) -> tuple[str, int]:
                 "status": effective, "reason": reason,
                 "duration_ms": r["duration_ms"],
             })
+    # Full external URL to the run page so the dev opening the minijira task
+    # can click straight through. url_for with _external uses the current
+    # request's Host header — works behind the Container Apps proxy.
+    try:
+        run_url = url_for("job_view", job_id=job_id, _external=True)
+    except Exception:
+        run_url = ""
     lines = [
         f"Run: {job_id}",
+    ]
+    if run_url:
+        lines.append(f"Run URL: {run_url}")
+    lines.extend([
         f"Tenant: {run.get('login_url') or ''}",
         f"Total failing queries: {len(bad)}",
         "",
         "Failed / partial / timeout queries:",
         "",
-    ]
+    ])
     for i, q in enumerate(bad, start=1):
         dur = f" ({q['duration_ms']} ms)" if q['duration_ms'] is not None else ""
         lines.append(f"{i}. q{q['qid']:02d} [{q['status']}]{dur}")
