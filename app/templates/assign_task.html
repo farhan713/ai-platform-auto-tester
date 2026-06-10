@@ -140,6 +140,15 @@ formEl.addEventListener('submit', async (e) => {
   result.style.display = 'none';
   try {
     const fd = new FormData(formEl);
+    // Pass the assignee's display name through so the Runs list can show
+    // initials without re-fetching from minijira.
+    const usel = document.getElementById('at-assignedTo');
+    const picked = usel.options[usel.selectedIndex];
+    if (picked && picked.value) {
+      // Strip the " · role" suffix we add in the option label.
+      const name = (picked.textContent || '').split(' · ')[0].trim();
+      fd.append('assignedToName', name);
+    }
     const r = await fetch(`/jobs/${jobId}/assign-task/create`, { method: 'POST', body: new URLSearchParams(fd) });
     const data = await r.json();
     if (data.ok) {

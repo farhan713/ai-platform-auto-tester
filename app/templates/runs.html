@@ -27,10 +27,11 @@
           <th>Questions</th>
           <th>Outcome</th>
           <th>Status</th>
+          <th>Assigned</th>
           <th></th>
         </tr>
       </thead>
-      <tbody><tr><td colspan="7" class="table-empty">Loading…</td></tr></tbody>
+      <tbody><tr><td colspan="8" class="table-empty">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -64,8 +65,24 @@ function render() {
 
   const tbody = document.querySelector('#runs-table tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No matching runs.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No matching runs.</td></tr>';
     return;
+  }
+  // Pick a stable colour per name so the same person looks the same across runs.
+  // Picks from a small, readable palette.
+  const _avatarPalette = ['#2563eb','#d97706','#059669','#7c3aed','#db2777','#0891b2','#65a30d','#dc2626'];
+  function avatarFor(name, taskId) {
+    if (!name) return '<span class="meta">—</span>';
+    const parts = String(name).trim().split(/\s+/).filter(Boolean);
+    const initials = (parts[0]?.[0] || '') + (parts[1]?.[0] || (parts[0]?.[1] || ''));
+    const text = initials.toUpperCase().slice(0, 2);
+    // Stable hash on the name.
+    let h = 0;
+    for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    const bg = _avatarPalette[h % _avatarPalette.length];
+    const tip = taskId ? `Assigned to ${SQA.escapeHtml(name)} · minijira task ${SQA.escapeHtml(taskId)}`
+                       : `Assigned to ${SQA.escapeHtml(name)}`;
+    return `<span class="avatar-initials" style="background:${bg}" title="${tip}">${SQA.escapeHtml(text)}</span>`;
   }
   tbody.innerHTML = rows.map(r => {
     const s = r.summary || {};
@@ -85,6 +102,7 @@ function render() {
         ${total ? `<span class="meta">(${passPct}%)</span>` : ''}
       </td>
       <td><span class="badge ${(r.status||'').toUpperCase()}">${SQA.escapeHtml(r.status||'?')}</span></td>
+      <td>${avatarFor(r.assigned_to_name, r.minijira_task_id)}</td>
       <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(r.id)}">Open →</a></td>
     </tr>`;
   }).join('');

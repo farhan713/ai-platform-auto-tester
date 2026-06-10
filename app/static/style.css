@@ -350,6 +350,28 @@ pre {
 .reason-info { background: var(--code-bg); border-left-color: var(--text-muted); color: var(--text-muted); }
 .http-bad   { color: var(--fail); font-weight: 600; }
 
+/* Circular initials avatar — used on the Runs list to show the assignee.
+   Hue is chosen by the initials so two distinct people get distinct colours,
+   while the same person always gets the same one. */
+.avatar-initials {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--brand);
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  font-family: var(--font, system-ui);
+  flex: 0 0 28px;
+  vertical-align: middle;
+  user-select: none;
+}
+.avatar-initials.muted { background: var(--text-muted); }
+
 .empty {
   text-align: center; padding: 48px 16px;
   color: var(--text-muted); border: 1px dashed var(--border);

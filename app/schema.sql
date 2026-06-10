@@ -68,6 +68,11 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS bundle_id TEXT;
 -- (which qids are originals, which are their variants) used to build the
 -- SQL-consistency report. NULL for ordinary runs.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS variant_groups JSONB;
+-- assignment to a minijira task (Assign Task flow). NULL when not yet assigned.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS assigned_to_name  TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS assigned_to_id    TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS assigned_at       TIMESTAMPTZ;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS minijira_task_id  TEXT;
 ALTER TABLE presets ADD COLUMN IF NOT EXISTS site_search_config JSONB;
 
 CREATE TABLE IF NOT EXISTS hosted_bundles (

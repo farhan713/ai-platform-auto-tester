@@ -1394,6 +1394,40 @@ def assign_task_create(job_id: str):
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
     ok = 200 <= status_code < 300
+
+    # Persist the assignment on the run so the Runs list can show the
+    # assignee's initials and link back to the minijira task.
+    if ok:
+        assignee_name = (request.form.get("assignedToName") or "").strip()
+        if not assignee_name:
+            # Fall back to looking the user up from /users/mentionable in case
+            # the page didn't forward the name (defence in depth).
+            try:
+                users = _minijira_get("/api/v1/users/mentionable")
+                u = next((u for u in users if u.get("id") == assigned_to), None)
+                if u:
+                    assignee_name = u.get("name") or u.get("email") or ""
+            except Exception:
+                pass
+        task_id = None
+        if isinstance(body, dict):
+            task_id = body.get("id") or body.get("_id") or body.get("taskId")
+        try:
+            db.execute(
+                """UPDATE runs
+                      SET assigned_to_name = %s,
+                          assigned_to_id   = %s,
+                          assigned_at      = NOW(),
+                          minijira_task_id = %s
+                    WHERE id = %s AND user_id = %s""",
+                (assignee_name or None, assigned_to or None,
+                 str(task_id) if task_id else None,
+                 job_id, auth.current_user_id()),
+            )
+        except Exception:
+            # Persistence is best-effort — don't block the success response.
+            pass
+
     return jsonify({
         "ok": ok, "status_code": status_code,
         "task": body if ok else None,
@@ -2104,6 +2138,7 @@ def _runs_for_user_query(user_filter_clause: str = "") -> str:
     SELECT r.id, r.user_id, r.login_url, r.username, r.machine_id, r.sql_agent_path,
            r.question_count, r.status, r.summary, r.created_at, r.started_at, r.finished_at,
            r.test_file_name,
+           r.assigned_to_name, r.assigned_to_id, r.assigned_at, r.minijira_task_id,
            COALESCE((SELECT COUNT(*) FROM query_results q WHERE q.run_id = r.id AND q.status = 'PASS'), 0)    AS pass_n,
            COALESCE((SELECT COUNT(*) FROM query_results q WHERE q.run_id = r.id AND q.status = 'PARTIAL'), 0) AS partial_n,
            COALESCE((SELECT COUNT(*) FROM query_results q WHERE q.run_id = r.id AND q.status = 'FAIL'), 0)    AS fail_n,
@@ -2131,6 +2166,10 @@ def _list_user_runs(limit: int | None = None) -> list[dict[str, Any]]:
             "started_at": r["started_at"].isoformat() if r["started_at"] else None,
             "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
             "test_file_name": r.get("test_file_name"),
+            "assigned_to_name":  r.get("assigned_to_name"),
+            "assigned_to_id":    r.get("assigned_to_id"),
+            "assigned_at":       r["assigned_at"].isoformat() if r.get("assigned_at") else None,
+            "minijira_task_id":  r.get("minijira_task_id"),
         })
     return out
 
