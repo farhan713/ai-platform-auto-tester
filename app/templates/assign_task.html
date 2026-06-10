@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% block title %}Assign Task{% endblock %}
+{% block header_title %}Assign Task{% endblock %}
+{% block header_sub %}— Send this run's failed questions to minijira{% endblock %}
+
+{% block content %}
+<div class="header-row" style="margin-bottom:12px">
+  <h1 style="margin:0">Assign task <code style="font-size:14px">{{ job_id }}</code></h1>
+  <p class="subtitle"><a href="{{ url_for('job_view', job_id=job_id) }}">← Back to run</a></p>
+</div>
+
+{% if not creds_configured %}
+<div class="card">
+  <div class="reason reason-fail">
+    minijira credentials are not configured on the server
+    (<code>SQA_MINIJIRA_EMAIL</code> + <code>SQA_MINIJIRA_PASSWORD</code> env vars).
+    The form below will fail to load users/projects until those are set.
+  </div>
+</div>
+{% endif %}
+
+<div class="card" id="at-card">
+  <h2>Create task</h2>
+  <p id="at-loading" class="meta">Loading users, projects, and failed-question details from this run…</p>
+
+  <form id="at-form" class="form" style="display:none">
+    <label>
+      <span class="label-text">Title <em>required</em></span>
+      <input type="text" name="title" id="at-title" required>
+    </label>
+
+    <label>
+      <span class="label-text">Description <em>auto-filled from the run — read-only</em></span>
+      <textarea id="at-description" rows="14" readonly
+                style="font-family:var(--font-mono); font-size:12px; background:var(--code-bg);
+                       white-space:pre; overflow:auto"></textarea>
+      <span class="meta">
+        Includes every FAIL / PARTIAL / TIMEOUT query with its reason.
+        <span id="at-failcount" class="badge badge-soft">0 failing queries</span>
+      </span>
+    </label>
+
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Priority <em>required</em></span>
+        <select name="priority" id="at-priority" required>
+          <option value="low">low</option>
+          <option value="medium" selected>medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+      <label>
+        <span class="label-text">Due date <em>required</em></span>
+        <input type="date" name="dueDate" id="at-dueDate" required>
+      </label>
+    </div>
+
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Assigned to <em>required</em></span>
+        <select name="assignedTo" id="at-assignedTo" required>
+          <option value="">— pick someone —</option>
+        </select>
+      </label>
+      <label>
+        <span class="label-text">Project <em>required</em></span>
+        <select name="projectId" id="at-projectId" required>
+          <option value="">— pick a project —</option>
+        </select>
+      </label>
+    </div>
+
+    <label>
+      <span class="label-text">Tags</span>
+      <input type="text" name="tags" id="at-tags" placeholder="qa-tool, failed-questions">
+      <span class="meta">Comma-separated. Leave blank to use the default <code>qa-tool</code>.</span>
+    </label>
+
+    <button type="submit" class="btn btn-primary" id="at-submit">📋 Create task in minijira</button>
+    <span id="at-inline" class="meta" style="margin-left:10px"></span>
+  </form>
+
+  <div id="at-result" style="display:none; margin-top:14px"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const jobId = {{ job_id|tojson }};
+const formEl  = document.getElementById('at-form');
+const loadEl  = document.getElementById('at-loading');
+const inline  = document.getElementById('at-inline');
+const submit  = document.getElementById('at-submit');
+const result  = document.getElementById('at-result');
+
+function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
+
+// Default due date = 7 days from today
+(function() {
+  const d = new Date(); d.setDate(d.getDate() + 7);
+  document.getElementById('at-dueDate').value = d.toISOString().slice(0,10);
+})();
+
+async function loadData() {
+  try {
+    const r = await SQA.fetchJSON(`/jobs/${jobId}/assign-task/data`);
+    if (!r.ok) throw new Error(r.error || 'Failed to load minijira data');
+    document.getElementById('at-title').value = r.title_suggestion || '';
+    document.getElementById('at-description').value = r.description || '';
+    document.getElementById('at-failcount').textContent =
+      `${r.failed_count} failing quer${r.failed_count === 1 ? 'y' : 'ies'}`;
+
+    const usel = document.getElementById('at-assignedTo');
+    usel.innerHTML = '<option value="">— pick someone —</option>'
+      + (r.users || []).map(u =>
+          `<option value="${esc(u.id)}">${esc(u.name || u.email || u.id)}${u.role ? ' · ' + esc(u.role) : ''}</option>`
+        ).join('');
+
+    const psel = document.getElementById('at-projectId');
+    psel.innerHTML = '<option value="">— pick a project —</option>'
+      + (r.projects || []).map(p =>
+          `<option value="${esc(p.id)}">${esc(p.name || p.id)}</option>`
+        ).join('');
+
+    loadEl.style.display = 'none';
+    formEl.style.display = '';
+    if (r.failed_count === 0) {
+      SQA.toast('No failing queries in this run — nothing to assign.', 'info');
+    }
+  } catch (e) {
+    loadEl.innerHTML = `<div class="reason reason-fail">Could not load minijira data: ${esc(e.message)}</div>`;
+  }
+}
+
+formEl.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  submit.disabled = true;
+  submit.textContent = 'Creating…';
+  inline.textContent = 'POSTing to /api/v1/tasks/ …';
+  result.style.display = 'none';
+  try {
+    const fd = new FormData(formEl);
+    const r = await fetch(`/jobs/${jobId}/assign-task/create`, { method: 'POST', body: new URLSearchParams(fd) });
+    const data = await r.json();
+    if (data.ok) {
+      const t = data.task || {};
+      result.innerHTML = `<div class="card" style="margin:0; border-left:3px solid var(--pass)">
+        <h3 style="margin-top:0; color:var(--pass)">✓ Task created (HTTP ${data.status_code})</h3>
+        <p>Linked ${data.failed_count} failing quer${data.failed_count === 1 ? 'y' : 'ies'} to the new task.</p>
+        ${t.id ? `<p class="meta">Task id: <code>${esc(t.id)}</code></p>` : ''}
+        ${t.title ? `<p><b>${esc(t.title)}</b></p>` : ''}
+        <details><summary class="meta" style="cursor:pointer">Full response</summary>
+          <pre style="margin-top:6px; max-height:280px; overflow:auto">${esc(JSON.stringify(data.task, null, 2))}</pre>
+        </details>
+      </div>`;
+      result.style.display = '';
+      SQA.toast('Task created.', 'success');
+    } else {
+      result.innerHTML = `<div class="reason reason-fail">${esc(data.error || 'Failed to create task')}${data.status_code ? ' (HTTP ' + data.status_code + ')' : ''}</div>`;
+      result.style.display = '';
+      SQA.toast('Failed to create task.', 'error');
+    }
+  } catch (err) {
+    result.innerHTML = `<div class="reason reason-fail">Request failed: ${esc(err.message)}</div>`;
+    result.style.display = '';
+    SQA.toast('Request failed.', 'error');
+  } finally {
+    submit.disabled = false;
+    submit.textContent = '📋 Create task in minijira';
+    inline.textContent = '';
+  }
+});
+
+loadData();
+</script>
+{% endblock %}

@@ -1195,6 +1195,215 @@ def training_test_run():
 
 
 # ---------------------------------------------------------------------------
+# Assign Task — push a run's failed/partial/timeout queries to minijira
+# (https://minijirabe-6fpw.onrender.com) as a task with the failed-question
+# detail as the description. Credentials live in env vars, never in source.
+# ---------------------------------------------------------------------------
+MINIJIRA_BASE = os.environ.get("SQA_MINIJIRA_BASE_URL", "https://minijirabe-6fpw.onrender.com").rstrip("/")
+_minijira_token: dict[str, Any] = {"value": None, "fetched_at": 0.0}
+_minijira_token_lock = threading.Lock()
+
+
+def _minijira_login_get_token(force: bool = False) -> str | None:
+    """Log in to minijira and cache the JWT in-process. Refreshes on force
+    or when the cached token is older than 30 minutes. Returns None if no
+    credentials are configured (SQA_MINIJIRA_EMAIL / SQA_MINIJIRA_PASSWORD)."""
+    import requests
+    email = os.environ.get("SQA_MINIJIRA_EMAIL")
+    password = os.environ.get("SQA_MINIJIRA_PASSWORD")
+    if not (email and password):
+        return None
+    with _minijira_token_lock:
+        if (not force) and _minijira_token["value"] and (
+            time.time() - _minijira_token["fetched_at"] < 30 * 60):
+            return _minijira_token["value"]
+        resp = requests.post(f"{MINIJIRA_BASE}/api/v1/auth/login",
+                             json={"email": email, "password": password},
+                             timeout=30)
+        resp.raise_for_status()
+        token = (resp.json() or {}).get("access_token")
+        if not token:
+            return None
+        _minijira_token["value"] = token
+        _minijira_token["fetched_at"] = time.time()
+        return token
+
+
+def _minijira_get(path: str) -> Any:
+    """GET against minijira with the cached token, refreshing on 401."""
+    import requests
+    token = _minijira_login_get_token()
+    if not token:
+        raise RuntimeError("minijira credentials not configured (set SQA_MINIJIRA_EMAIL + SQA_MINIJIRA_PASSWORD)")
+    url = f"{MINIJIRA_BASE}{path}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    if resp.status_code == 401:
+        token = _minijira_login_get_token(force=True)
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _minijira_post(path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+    """POST against minijira with the cached token, refreshing on 401.
+    Returns (status_code, parsed_body)."""
+    import requests
+    token = _minijira_login_get_token()
+    if not token:
+        raise RuntimeError("minijira credentials not configured (set SQA_MINIJIRA_EMAIL + SQA_MINIJIRA_PASSWORD)")
+    url = f"{MINIJIRA_BASE}{path}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    if resp.status_code == 401:
+        token = _minijira_login_get_token(force=True)
+        headers["Authorization"] = f"Bearer {token}"
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    try:
+        body = resp.json()
+    except Exception:
+        body = (resp.text or "")[:5000]
+    return resp.status_code, body
+
+
+def _failed_questions_description(job_id: str) -> tuple[str, int]:
+    """Build a human-readable list of FAIL / PARTIAL / TIMEOUT queries for
+    this run, used as the (read-only) task description. Returns
+    (text, failed_count)."""
+    run = _run_owned_by_current_user(job_id)
+    if not run:
+        return "", 0
+    rows = db.fetch_all(
+        "SELECT qid, status, duration_ms, nl_query, record FROM query_results "
+        "WHERE run_id = %s ORDER BY qid", (job_id,))
+    bad: list[dict[str, Any]] = []
+    for r in rows:
+        rec = r.get("record") or {}
+        v = rec.get("validations") or {}
+        effective, fails, warns, _infos = _reclassify_legacy_validations(
+            v, r["status"] or "")
+        if effective in ("FAIL", "PARTIAL", "TIMEOUT"):
+            reason = ""
+            if fails: reason = fails[0]
+            elif warns: reason = warns[0]
+            bad.append({
+                "qid": r["qid"], "nl": r["nl_query"] or "",
+                "status": effective, "reason": reason,
+                "duration_ms": r["duration_ms"],
+            })
+    lines = [
+        f"Run: {job_id}",
+        f"Tenant: {run.get('login_url') or ''}",
+        f"Total failing queries: {len(bad)}",
+        "",
+        "Failed / partial / timeout queries:",
+        "",
+    ]
+    for i, q in enumerate(bad, start=1):
+        dur = f" ({q['duration_ms']} ms)" if q['duration_ms'] is not None else ""
+        lines.append(f"{i}. q{q['qid']:02d} [{q['status']}]{dur}")
+        lines.append(f"   Question: {q['nl']}")
+        if q['reason']:
+            lines.append(f"   Reason:   {q['reason']}")
+        lines.append("")
+    return "\n".join(lines), len(bad)
+
+
+@app.route("/jobs/<job_id>/assign-task")
+@auth.login_required
+def assign_task_page(job_id: str):
+    run = _run_owned_by_current_user(job_id)
+    if not run: abort(404)
+    return render_template("assign_task.html",
+                           job_id=job_id, active="runs",
+                           creds_configured=bool(os.environ.get("SQA_MINIJIRA_EMAIL")
+                                                 and os.environ.get("SQA_MINIJIRA_PASSWORD")))
+
+
+@app.route("/jobs/<job_id>/assign-task/data")
+@auth.login_required
+def assign_task_data(job_id: str):
+    """Populate the form: prefill description with failed-questions text, list
+    mentionable users + projects so the dropdowns can be filled in one round-trip."""
+    run = _run_owned_by_current_user(job_id)
+    if not run: abort(404)
+    description, failed_count = _failed_questions_description(job_id)
+    try:
+        users = _minijira_get("/api/v1/users/mentionable")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"users: {type(e).__name__}: {e}"}), 502
+    try:
+        projects = _minijira_get("/api/v1/projects/")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"projects: {type(e).__name__}: {e}"}), 502
+    return jsonify({
+        "ok": True,
+        "title_suggestion": f"QA failures — Run {job_id}",
+        "description": description,
+        "failed_count": failed_count,
+        "users": users,
+        "projects": projects,
+    })
+
+
+@app.route("/jobs/<job_id>/assign-task/create", methods=["POST"])
+@auth.login_required
+def assign_task_create(job_id: str):
+    """Create the task on minijira. Description is rebuilt server-side from
+    the run record (the form's description field is read-only, so what the
+    user 'sees' is what we send — but we never trust the client for that)."""
+    run = _run_owned_by_current_user(job_id)
+    if not run: abort(404)
+    title = (request.form.get("title") or "").strip()
+    priority = (request.form.get("priority") or "medium").strip().lower()
+    if priority not in ("low", "medium", "high"):
+        priority = "medium"
+    assigned_to = (request.form.get("assignedTo") or "").strip()
+    project_id = (request.form.get("projectId") or "").strip()
+    due_date = (request.form.get("dueDate") or "").strip()  # YYYY-MM-DD
+    tags_raw = (request.form.get("tags") or "").strip()
+    tags = [t.strip() for t in re.split(r"[,\n]", tags_raw) if t.strip()]
+
+    if not title:
+        return jsonify({"ok": False, "error": "Title is required."}), 400
+    if not assigned_to:
+        return jsonify({"ok": False, "error": "Pick someone to assign to."}), 400
+    if not project_id:
+        return jsonify({"ok": False, "error": "Pick a project."}), 400
+    if not due_date:
+        return jsonify({"ok": False, "error": "Pick a due date."}), 400
+
+    # The minijira API wants ISO datetime with timezone; the form gives us a
+    # bare date. Use 18:30:00.000Z (matches the sample payload).
+    iso_due = f"{due_date}T18:30:00.000Z" if re.match(r"^\d{4}-\d{2}-\d{2}$", due_date) else due_date
+
+    # Description is ALWAYS the server-rebuilt failed-questions text, so the
+    # user can't tamper with what gets attached.
+    description, failed_count = _failed_questions_description(job_id)
+
+    payload = {
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "assignedTo": assigned_to,
+        "projectId": project_id,
+        "dueDate": iso_due,
+        "tags": tags or ["qa-tool"],
+    }
+    try:
+        status_code, body = _minijira_post("/api/v1/tasks/", payload)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
+    ok = 200 <= status_code < 300
+    return jsonify({
+        "ok": ok, "status_code": status_code,
+        "task": body if ok else None,
+        "error": None if ok else (body if isinstance(body, str) else (
+            body.get("detail") or body.get("message") or str(body))[:500] if isinstance(body, dict) else "task create failed"),
+        "failed_count": failed_count,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Activity Logs — pull /sql_agent/history_data/{org_id}/{offset}/{limit}/ for
 # one or more tenants and present a per-org report (totals, LLM vs RAG split,
 # status breakdown, searchable record list). The call is proxied server-side

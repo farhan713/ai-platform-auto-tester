@@ -17,6 +17,7 @@
     <a id="report-link" class="btn btn-primary" href="{{ url_for('job_report', job_id=job_id) }}" target="_blank" style="display:none">Open report ↗</a>
     <a id="dl-zip" class="btn" href="{{ url_for('job_download_zip', job_id=job_id) }}" style="display:none">↓ Download report (zip)</a>
     <a id="dl-failures" class="btn btn-danger" href="{{ url_for('job_export_failures_xlsx', job_id=job_id) }}" style="display:none">↓ Download failed queries (xlsx)</a>
+    <a id="assign-task" class="btn" href="{{ url_for('assign_task_page', job_id=job_id) }}" style="display:none">📋 Assign task</a>
     <a class="btn" href="{{ url_for('job_export_csv', job_id=job_id) }}">Export CSV</a>
   </div>
 </div>
@@ -242,12 +243,17 @@ function refreshStatus() {
       reportLink.style.display = 'inline-flex';
       document.getElementById('dl-zip').style.display = 'inline-flex';
     }
-    // Show "Download failed queries" only if there are any failures
+    // Show "Download failed queries" and "Assign task" only if there are any failures
     const failCount = (s.counts.FAIL || 0) + (s.counts.PARTIAL || 0) + (s.counts.TIMEOUT || 0);
     if (failCount > 0 && (s.status === 'done' || s.status === 'failed' || s.status === 'stopped' || s.status === 'running')) {
       const dlf = document.getElementById('dl-failures');
       dlf.style.display = 'inline-flex';
       dlf.textContent = '↓ Download failed queries (' + failCount + ')';
+      const at = document.getElementById('assign-task');
+      if (at) {
+        at.style.display = 'inline-flex';
+        at.textContent = '📋 Assign task (' + failCount + ')';
+      }
     }
     refreshAllResults();
   }).catch(()=>{}).finally(() => { _statusInFlight = false; });
