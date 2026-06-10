@@ -240,6 +240,9 @@ pre {
 .form input[type="search"],
 .form input[type="file"],
 .form input[type="tel"],
+.form input[type="date"],
+.form input[type="time"],
+.form input[type="datetime-local"],
 .form select,
 .form textarea {
   width: 100%; padding: 10px 12px; font-size: 14px;
@@ -247,6 +250,14 @@ pre {
   background: var(--surface); color: var(--text);
   font-family: inherit;
   transition: border-color .12s, box-shadow .12s;
+}
+/* The native date-picker indicator (the little calendar icon) needs to be
+   left in place but inherit the form colour so it doesn't look stuck-on. */
+.form input[type="date"]::-webkit-calendar-picker-indicator,
+.form input[type="time"]::-webkit-calendar-picker-indicator,
+.form input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.7;
 }
 .form input:hover:not(:focus), .form select:hover:not(:focus), .form textarea:hover:not(:focus) {
   border-color: var(--brand-2);
