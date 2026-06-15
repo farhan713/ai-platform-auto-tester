@@ -1,0 +1,410 @@
+{% extends "base.html" %}
+{% block title %}Insights{% endblock %}
+{% block header_title %}Insights{% endblock %}
+{% block header_sub %}— Cross-organization activity dashboard{% endblock %}
+
+{% block content %}
+<div class="card insights-control">
+  <div class="ic-row">
+    <label class="ic-field">
+      <span class="label-text">From</span>
+      <input type="date" id="ins-from">
+    </label>
+    <label class="ic-field">
+      <span class="label-text">To</span>
+      <input type="date" id="ins-to">
+    </label>
+    <div class="ic-field" style="flex:0">
+      <span class="label-text">&nbsp;</span>
+      <div style="display:flex; gap:8px">
+        <button type="button" class="btn btn-primary" id="ins-apply">Apply</button>
+        <button type="button" class="btn" id="ins-refresh" title="Bypass cache and re-fetch from Celerant">⟳ Refresh</button>
+      </div>
+    </div>
+    <div class="ic-meta" id="ins-meta">
+      <span class="meta">Loading…</span>
+    </div>
+  </div>
+  <details style="margin-top:6px">
+    <summary class="meta" style="cursor:pointer">Advanced</summary>
+    <div class="grid-2" style="margin-top:8px; gap:10px">
+      <label>
+        <span class="label-text">Console URL</span>
+        <input type="url" id="ins-console" value="{{ default_console }}">
+      </label>
+      <label>
+        <span class="label-text">Bearer token <em>(optional)</em></span>
+        <input type="text" id="ins-bearer" autocomplete="off">
+      </label>
+    </div>
+    <span class="meta">Up to {{ limit_per_org }} records pulled per org per refresh.</span>
+  </details>
+</div>
+
+<!-- KPI tiles -->
+<div class="kpi-grid" id="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Organizations</div><div class="kpi-value" id="kpi-orgs">—</div><div class="kpi-sub" id="kpi-orgs-sub">&nbsp;</div></div>
+  <div class="kpi"><div class="kpi-label">Total queries</div><div class="kpi-value" id="kpi-queries">—</div><div class="kpi-sub" id="kpi-queries-sub">&nbsp;</div></div>
+  <div class="kpi kpi-llm"><div class="kpi-label">LLM invocations</div><div class="kpi-value" id="kpi-llm">—</div><div class="kpi-sub" id="kpi-llm-sub">&nbsp;</div></div>
+  <div class="kpi kpi-rag"><div class="kpi-label">RAG hits</div><div class="kpi-value" id="kpi-rag">—</div><div class="kpi-sub" id="kpi-rag-sub">&nbsp;</div></div>
+  <div class="kpi kpi-pass"><div class="kpi-label">Complete</div><div class="kpi-value" id="kpi-complete">—</div><div class="kpi-sub" id="kpi-complete-sub">&nbsp;</div></div>
+  <div class="kpi kpi-fail"><div class="kpi-label">Failed</div><div class="kpi-value" id="kpi-failed">—</div><div class="kpi-sub" id="kpi-failed-sub">&nbsp;</div></div>
+  <div class="kpi"><div class="kpi-label">Unique users</div><div class="kpi-value" id="kpi-users">—</div><div class="kpi-sub">across all orgs</div></div>
+  <div class="kpi"><div class="kpi-label">Sessions</div><div class="kpi-value" id="kpi-sessions">—</div><div class="kpi-sub">across all orgs</div></div>
+</div>
+
+<!-- Charts row 1 -->
+<div class="grid-3">
+  <div class="card" style="grid-column: 1 / span 2">
+    <div class="card-head"><h2>Daily activity</h2><span class="meta" id="ts-range"></span></div>
+    <div class="chart-wrap" style="height:280px"><canvas id="chart-timeseries"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>LLM vs RAG</h2></div>
+    <div class="chart-wrap" style="height:280px"><canvas id="chart-llmrag"></canvas></div>
+  </div>
+</div>
+
+<!-- Charts row 2 -->
+<div class="grid-2">
+  <div class="card">
+    <div class="card-head"><h2>Top organizations</h2><span class="meta">by query volume</span></div>
+    <div class="chart-wrap" style="height:340px"><canvas id="chart-toporgs"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>Top users</h2><span class="meta">by query volume</span></div>
+    <div class="chart-wrap" style="height:340px"><canvas id="chart-topusers"></canvas></div>
+  </div>
+</div>
+
+<!-- Heatmap -->
+<div class="card">
+  <div class="card-head"><h2>Activity heatmap</h2><span class="meta">hour-of-day · UTC, weekdays Monday → Sunday</span></div>
+  <div id="heatmap-wrap"></div>
+</div>
+
+<!-- Per-org table -->
+<div class="card">
+  <div class="card-head">
+    <h2>Organizations</h2>
+    <input type="text" id="org-filter" placeholder="Filter by name…" style="width:240px">
+  </div>
+  <div style="overflow-x:auto">
+    <table class="table" id="org-table">
+      <thead>
+        <tr>
+          <th>Organization</th>
+          <th style="text-align:right">Queries</th>
+          <th style="text-align:right">LLM</th>
+          <th style="text-align:right">RAG</th>
+          <th style="text-align:right">Failed</th>
+          <th style="text-align:right">Users</th>
+          <th style="text-align:right">Sessions</th>
+          <th>Range</th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="8" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Recent failures -->
+<div class="card">
+  <div class="card-head"><h2>Recent failures</h2><span class="meta">most recent across all orgs</span></div>
+  <div style="overflow-x:auto">
+    <table class="table" id="failures-table">
+      <thead>
+        <tr>
+          <th>Time (UTC)</th>
+          <th>Organization</th>
+          <th>User</th>
+          <th>Source</th>
+          <th>Question</th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="5" class="table-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
+<script>
+const fromEl   = document.getElementById('ins-from');
+const toEl     = document.getElementById('ins-to');
+const consoleEl= document.getElementById('ins-console');
+const bearerEl = document.getElementById('ins-bearer');
+const applyBtn = document.getElementById('ins-apply');
+const refreshBtn = document.getElementById('ins-refresh');
+const metaEl   = document.getElementById('ins-meta');
+
+let _charts = {};            // chart.js instances we can destroy() before re-rendering
+let _lastData = null;
+
+// Default: last 30 days through today.
+(function() {
+  const today = new Date();
+  const month = new Date(); month.setDate(today.getDate() - 30);
+  const iso = d => d.toISOString().slice(0, 10);
+  toEl.value   = iso(today);
+  fromEl.value = iso(month);
+})();
+
+function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
+function pct(part, total){ return total ? Math.round((part/total) * 1000)/10 + '%' : '—'; }
+function fmtN(n){ return (n == null) ? '—' : n.toLocaleString(); }
+function fmtTime(s){ return s ? String(s).slice(0,19).replace('T',' ') : '—'; }
+function fmtDate(s){ return s ? String(s).slice(0,10) : '—'; }
+
+// Pull theme colours from CSS variables so charts match light/dark.
+function themeColours() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = k => (cs.getPropertyValue(k) || '').trim();
+  return {
+    text: v('--text') || '#102a43',
+    muted: v('--text-muted') || '#64748b',
+    grid: v('--border') || '#e2e8f0',
+    brand: v('--brand') || '#1F3A5F',
+    brand2: v('--brand-2') || '#2E5288',
+    pass: v('--pass') || '#1a8a3a',
+    fail: v('--fail') || '#c62828',
+    partial: v('--partial') || '#d49a00',
+    accent: v('--accent') || '#2563eb',
+  };
+}
+
+function destroyChart(key) {
+  if (_charts[key]) { try { _charts[key].destroy(); } catch(e) {} _charts[key] = null; }
+}
+
+function renderKPIs(t) {
+  document.getElementById('kpi-orgs').textContent      = fmtN(t.orgs);
+  document.getElementById('kpi-orgs-sub').textContent  = `${fmtN(t.orgs_with_activity)} with activity`;
+  document.getElementById('kpi-queries').textContent   = fmtN(t.queries);
+  document.getElementById('kpi-queries-sub').innerHTML = `&nbsp;`;
+  document.getElementById('kpi-llm').textContent       = fmtN(t.llm);
+  document.getElementById('kpi-llm-sub').textContent   = `${pct(t.llm, t.queries)} of total`;
+  document.getElementById('kpi-rag').textContent       = fmtN(t.rag);
+  document.getElementById('kpi-rag-sub').textContent   = `${pct(t.rag, t.queries)} of total`;
+  document.getElementById('kpi-complete').textContent  = fmtN(t.complete);
+  document.getElementById('kpi-complete-sub').textContent = `${pct(t.complete, t.queries)} of total`;
+  document.getElementById('kpi-failed').textContent    = fmtN(t.failed);
+  document.getElementById('kpi-failed-sub').textContent = `${pct(t.failed, t.queries)} of total`;
+  document.getElementById('kpi-users').textContent     = fmtN(t.unique_users);
+  document.getElementById('kpi-sessions').textContent  = fmtN(t.unique_sessions);
+}
+
+function renderTimeseries(ts) {
+  const c = themeColours();
+  destroyChart('ts');
+  const ctx = document.getElementById('chart-timeseries').getContext('2d');
+  _charts.ts = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: ts.days,
+      datasets: [
+        { label: 'Total', data: ts.total, borderColor: c.brand, backgroundColor: c.brand + '20', tension: 0.3, fill: true, borderWidth: 2 },
+        { label: 'LLM',   data: ts.llm,   borderColor: c.partial, borderWidth: 2, tension: 0.3, pointRadius: 0 },
+        { label: 'RAG',   data: ts.rag,   borderColor: c.accent, borderWidth: 2, tension: 0.3, pointRadius: 0 },
+        { label: 'Failed',data: ts.failed,borderColor: c.fail, borderWidth: 2, tension: 0.3, pointRadius: 0, borderDash: [4,4] },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: c.grid }, ticks: { color: c.muted, autoSkip: true, maxRotation: 0 } },
+        y: { grid: { color: c.grid }, ticks: { color: c.muted, precision: 0 }, beginAtZero: true },
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { color: c.text } },
+        tooltip: { mode: 'index', intersect: false },
+      },
+      interaction: { mode: 'nearest', axis: 'x', intersect: false },
+    }
+  });
+  document.getElementById('ts-range').textContent =
+    ts.days.length ? `${ts.days[0]} → ${ts.days[ts.days.length-1]}` : 'no data';
+}
+
+function renderLlmRag(t) {
+  const c = themeColours();
+  destroyChart('llmrag');
+  const ctx = document.getElementById('chart-llmrag').getContext('2d');
+  _charts.llmrag = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['LLM-generated', 'RAG-hit'],
+      datasets: [{
+        data: [t.llm, t.rag],
+        backgroundColor: [c.partial, c.accent],
+        borderColor: '#fff', borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: {
+        legend: { position: 'bottom', labels: { color: c.text } },
+        tooltip: {
+          callbacks: { label: (item) => `${item.label}: ${fmtN(item.parsed)} (${pct(item.parsed, t.queries)})` }
+        }
+      }
+    }
+  });
+}
+
+function renderTopOrgs(rows) {
+  const c = themeColours();
+  destroyChart('orgs');
+  const ctx = document.getElementById('chart-toporgs').getContext('2d');
+  _charts.orgs = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.name),
+      datasets: [
+        { label: 'LLM',    data: rows.map(r => r.llm),    backgroundColor: c.partial, stack: 's' },
+        { label: 'RAG',    data: rows.map(r => r.rag),    backgroundColor: c.accent,  stack: 's' },
+        { label: 'Failed', data: rows.map(r => r.failed), backgroundColor: c.fail,    stack: 's' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+      scales: {
+        x: { stacked: true, grid: { color: c.grid }, ticks: { color: c.muted, precision: 0 }, beginAtZero: true },
+        y: { stacked: true, grid: { display: false }, ticks: { color: c.text } },
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { color: c.text } },
+      }
+    }
+  });
+}
+
+function renderTopUsers(rows) {
+  const c = themeColours();
+  destroyChart('users');
+  const ctx = document.getElementById('chart-topusers').getContext('2d');
+  _charts.users = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.label),
+      datasets: [{
+        label: 'Queries', data: rows.map(r => r.total),
+        backgroundColor: c.brand2, borderColor: c.brand, borderWidth: 0,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+      scales: {
+        x: { grid: { color: c.grid }, ticks: { color: c.muted, precision: 0 }, beginAtZero: true },
+        y: { grid: { display: false }, ticks: { color: c.text } },
+      },
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+function renderHeatmap(matrix) {
+  const wrap = document.getElementById('heatmap-wrap');
+  const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  // Find max so we can normalise colour.
+  let max = 0;
+  for (const row of matrix) for (const v of row) if (v > max) max = v;
+  const c = themeColours();
+  // Build hour header
+  let hdr = '<div class="hm-row"><div class="hm-axis"></div>';
+  for (let h = 0; h < 24; h++) {
+    hdr += `<div class="hm-cell hm-head">${h.toString().padStart(2,'0')}</div>`;
+  }
+  hdr += '</div>';
+  let html = '<div class="hm-grid">' + hdr;
+  for (let d = 0; d < 7; d++) {
+    html += `<div class="hm-row"><div class="hm-axis">${DAYS[d]}</div>`;
+    for (let h = 0; h < 24; h++) {
+      const v = matrix[d][h] || 0;
+      const intensity = max ? v / max : 0;
+      // 0 -> #f1f5f9, 1 -> brand colour
+      const a = intensity === 0 ? 0 : 0.10 + intensity * 0.85;
+      const bg = `rgba(13, 148, 136, ${a.toFixed(2)})`;
+      html += `<div class="hm-cell" style="background:${bg}" title="${DAYS[d]} ${h.toString().padStart(2,'0')}:00 — ${v}"><span class="hm-val">${v||''}</span></div>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  wrap.innerHTML = html;
+}
+
+function renderOrgTable(rows) {
+  const filter = (document.getElementById('org-filter').value || '').toLowerCase();
+  let visible = rows.slice();
+  if (filter) visible = visible.filter(r => (r.name||'').toLowerCase().includes(filter));
+  visible.sort((a,b) => b.total - a.total);
+  const tbody = document.querySelector('#org-table tbody');
+  if (!visible.length) { tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No organizations match.</td></tr>'; return; }
+  tbody.innerHTML = visible.map(r => `
+    <tr>
+      <td><b>${esc(r.name)}</b>${r.error ? ` <span class="meta" title="${esc(r.error)}">⚠</span>` : ''}</td>
+      <td style="text-align:right">${fmtN(r.total)}</td>
+      <td style="text-align:right">${fmtN(r.llm)}</td>
+      <td style="text-align:right">${fmtN(r.rag)}</td>
+      <td style="text-align:right" class="${r.failed ? 'http-bad' : ''}">${fmtN(r.failed)}</td>
+      <td style="text-align:right">${fmtN(r.user_count)}</td>
+      <td style="text-align:right">${fmtN(r.session_count)}</td>
+      <td><span class="meta">${esc(fmtDate(r.first_ts))} → ${esc(fmtDate(r.last_ts))}</span></td>
+    </tr>`).join('');
+}
+document.getElementById('org-filter').addEventListener('input', () => {
+  if (_lastData) renderOrgTable(_lastData.per_org);
+});
+
+function renderFailures(rows) {
+  const tbody = document.querySelector('#failures-table tbody');
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No failures in this window. 🎉</td></tr>'; return; }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td>${esc(fmtTime(r.created_at))}</td>
+      <td>${esc(r.org || '—')}</td>
+      <td>${esc(r.user || '—')}</td>
+      <td>${r.llm_invoked === true ? '<span class="badge PARTIAL">LLM</span>' : (r.llm_invoked === false ? '<span class="badge badge-soft">RAG</span>' : '<span class="meta">—</span>')}</td>
+      <td>${esc((r.query || '').slice(0,180))}${(r.query||'').length>180?'…':''}</td>
+    </tr>`).join('');
+}
+
+async function load(refresh = false) {
+  metaEl.innerHTML = '<span class="meta">Fetching from Celerant…</span>';
+  applyBtn.disabled = true; refreshBtn.disabled = true;
+  try {
+    const params = new URLSearchParams({
+      from_date: fromEl.value, to_date: toEl.value,
+      console_url: consoleEl.value, bearer_token: bearerEl.value,
+    });
+    if (refresh) params.set('refresh', '1');
+    const r = await SQA.fetchJSON(`/insights/data?${params.toString()}`);
+    if (!r.ok) throw new Error(r.error || 'Failed to load');
+    _lastData = r;
+
+    renderKPIs(r.totals);
+    renderTimeseries(r.timeseries);
+    renderLlmRag(r.totals);
+    renderTopOrgs(r.top_orgs);
+    renderTopUsers(r.top_users);
+    renderHeatmap(r.heatmap);
+    renderOrgTable(r.per_org);
+    renderFailures(r.recent_failures);
+
+    const when = r.cached_at ? new Date(r.cached_at * 1000) : new Date();
+    const fresh = r.cached ? `cached ${Math.max(0, Math.round((Date.now()/1000 - r.cached_at)))}s ago`
+                           : `fresh · ${r.fetch_elapsed_ms} ms`;
+    metaEl.innerHTML = `<span class="meta">Updated <b>${when.toLocaleTimeString()}</b> · ${fresh}${r.errors && r.errors.length ? ` · <span style="color:var(--fail)">${r.errors.length} fetch error(s)</span>` : ''}</span>`;
+  } catch (e) {
+    metaEl.innerHTML = `<span style="color:var(--fail)">Could not load: ${esc(e.message)}</span>`;
+  } finally {
+    applyBtn.disabled = false; refreshBtn.disabled = false;
+  }
+}
+
+applyBtn.addEventListener('click', () => load(false));
+refreshBtn.addEventListener('click', () => load(true));
+load(false);
+</script>
+{% endblock %}

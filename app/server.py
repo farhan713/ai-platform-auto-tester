@@ -1634,6 +1634,240 @@ def activity_logs_fetch():
 
 
 # ---------------------------------------------------------------------------
+# Insights — cross-org dashboard. Fans out to /sql_agent/all_orgs/ then pulls
+# /history_data/{db_id}/0/<limit>/?from&to in parallel for every org and
+# aggregates the result into KPI tiles, time series, heatmap, top-N tables.
+# ---------------------------------------------------------------------------
+_insights_cache: dict[tuple, dict[str, Any]] = {}
+_insights_cache_lock = threading.Lock()
+_INSIGHTS_TTL_S = 300            # 5-min cache by (from, to)
+_INSIGHTS_LIMIT_PER_ORG = 500    # cap per-org records pulled per refresh
+_INSIGHTS_PARALLEL = 10          # concurrent org fetches
+
+
+def _fetch_orgs_history_parallel(
+    from_iso: str, to_iso: str, console: str, bearer: str = "",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Returns (orgs_with_records, errors). Each org dict carries
+    name + database_id + records[] from history_data."""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+
+    console = console.rstrip("/")
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    errors: list[str] = []
+
+    # 1) Get the full org list.
+    try:
+        all_orgs_resp = requests.get(
+            f"{console}/sql_agent/all_orgs/", headers=headers, timeout=30)
+        all_orgs_resp.raise_for_status()
+        orgs = ((all_orgs_resp.json() or {}).get("responseBody") or {}).get("data") or []
+    except Exception as e:
+        errors.append(f"all_orgs: {type(e).__name__}: {e}")
+        return [], errors
+
+    base = f"{console}/sql_agent/history_data"
+    from_mmddyyyy = _yyyy_mm_dd_to_mm_dd_yyyy(from_iso)
+    to_mmddyyyy   = _yyyy_mm_dd_to_mm_dd_yyyy(to_iso)
+    if not from_mmddyyyy or not to_mmddyyyy:
+        errors.append("invalid from/to dates (expected YYYY-MM-DD)")
+        return [], errors
+
+    def _one(org: dict[str, Any]) -> dict[str, Any]:
+        db_id = org.get("database_id")
+        if not db_id:
+            return {"name": org.get("name", ""), "database_id": "",
+                    "records": [], "error": "missing database_id"}
+        url = f"{base}/{db_id}/0/{_INSIGHTS_LIMIT_PER_ORG}/"
+        try:
+            r = requests.get(url, headers=headers,
+                             params={"from_date": from_mmddyyyy, "to_date": to_mmddyyyy},
+                             timeout=60)
+            r.raise_for_status()
+            body = r.json() or {}
+            records = ((body.get("responseBody") or {}).get("data") or {}).get("history_records") or []
+            history_count = ((body.get("responseBody") or {}).get("data") or {}).get("history_count")
+            return {"name": org.get("name") or db_id, "database_id": db_id,
+                    "records": records, "history_count": history_count}
+        except Exception as e:
+            return {"name": org.get("name") or db_id, "database_id": db_id,
+                    "records": [], "error": f"{type(e).__name__}: {e}"}
+
+    with ThreadPoolExecutor(max_workers=_INSIGHTS_PARALLEL) as ex:
+        out = list(ex.map(_one, orgs))
+
+    return out, errors
+
+
+def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
+    """Crunch the raw per-org records into the dashboard payload."""
+    from collections import Counter
+
+    per_org: list[dict[str, Any]] = []
+    all_recs: list[dict[str, Any]] = []
+
+    for org in orgs_data:
+        recs = org.get("records") or []
+        llm = sum(1 for r in recs if r.get("llm_invoked") is True)
+        rag = sum(1 for r in recs if r.get("llm_invoked") is False)
+        complete = sum(1 for r in recs if (r.get("query_status") or "").lower() == "complete")
+        failed   = sum(1 for r in recs if (r.get("query_status") or "").lower() == "failed")
+        users    = sorted({str(r.get("login_name")) for r in recs if r.get("login_name")})
+        sessions = {str(r.get("session_id")) for r in recs if r.get("session_id")}
+        ts_list  = [r.get("created_at") for r in recs if r.get("created_at")]
+        per_org.append({
+            "name": org.get("name") or org.get("database_id") or "",
+            "database_id": org.get("database_id"),
+            "total": len(recs),
+            "llm": llm, "rag": rag,
+            "complete": complete, "failed": failed,
+            "users": users,
+            "user_count": len(users),
+            "session_count": len(sessions),
+            "first_ts": min(ts_list) if ts_list else None,
+            "last_ts":  max(ts_list) if ts_list else None,
+            "error": org.get("error"),
+        })
+        # Tag and merge into the global list.
+        for r in recs:
+            rr = dict(r)
+            rr["_org_name"] = org.get("name") or org.get("database_id") or ""
+            rr["_db_id"]    = org.get("database_id")
+            all_recs.append(rr)
+
+    # Totals
+    totals = {
+        "orgs": len(per_org),
+        "orgs_with_activity": sum(1 for o in per_org if o["total"] > 0),
+        "queries": len(all_recs),
+        "llm":      sum(1 for r in all_recs if r.get("llm_invoked") is True),
+        "rag":      sum(1 for r in all_recs if r.get("llm_invoked") is False),
+        "complete": sum(1 for r in all_recs if (r.get("query_status") or "").lower() == "complete"),
+        "failed":   sum(1 for r in all_recs if (r.get("query_status") or "").lower() == "failed"),
+        "unique_users":    len({(r.get("_db_id"), r.get("login_name")) for r in all_recs if r.get("login_name")}),
+        "unique_sessions": len({(r.get("_db_id"), r.get("session_id")) for r in all_recs if r.get("session_id")}),
+    }
+
+    # Daily time series
+    daily_total  = Counter()
+    daily_llm    = Counter()
+    daily_rag    = Counter()
+    daily_failed = Counter()
+    for r in all_recs:
+        ts = r.get("created_at")
+        if not ts: continue
+        day = str(ts)[:10]
+        daily_total[day] += 1
+        if r.get("llm_invoked") is True:  daily_llm[day]   += 1
+        if r.get("llm_invoked") is False: daily_rag[day]   += 1
+        if (r.get("query_status") or "").lower() == "failed":
+            daily_failed[day] += 1
+    days = sorted(daily_total.keys())
+    timeseries = {
+        "days": days,
+        "total":  [daily_total[d]  for d in days],
+        "llm":    [daily_llm[d]    for d in days],
+        "rag":    [daily_rag[d]    for d in days],
+        "failed": [daily_failed[d] for d in days],
+    }
+
+    # Hour × weekday heatmap (Mon..Sun × 0..23)
+    heatmap = [[0] * 24 for _ in range(7)]
+    for r in all_recs:
+        ts = r.get("created_at")
+        if not ts: continue
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            heatmap[dt.weekday()][dt.hour] += 1
+        except Exception:
+            pass
+
+    # Top orgs by query volume
+    top_orgs = sorted(per_org, key=lambda o: -o["total"])[:10]
+    top_orgs_view = [{
+        "name": o["name"], "total": o["total"], "llm": o["llm"],
+        "rag": o["rag"], "failed": o["failed"],
+    } for o in top_orgs]
+
+    # Top users (carry org context with the name to disambiguate same-named
+    # users across tenants).
+    user_counter = Counter()
+    for r in all_recs:
+        ln = r.get("login_name")
+        if ln:
+            user_counter[f"{ln}  ·  {r.get('_org_name') or ''}"] += 1
+    top_users = [{"label": k, "total": v} for k, v in user_counter.most_common(10)]
+
+    # Recent failures
+    fails = sorted(
+        (r for r in all_recs if (r.get("query_status") or "").lower() == "failed"),
+        key=lambda r: r.get("created_at", ""), reverse=True,
+    )[:25]
+    recent_failures = [{
+        "created_at": r.get("created_at"),
+        "org": r.get("_org_name"),
+        "user": r.get("login_name"),
+        "session_id": r.get("session_id"),
+        "query": r.get("natural_language_query"),
+        "llm_invoked": r.get("llm_invoked"),
+    } for r in fails]
+
+    return {
+        "totals": totals,
+        "per_org": per_org,
+        "timeseries": timeseries,
+        "heatmap": heatmap,
+        "top_orgs": top_orgs_view,
+        "top_users": top_users,
+        "recent_failures": recent_failures,
+    }
+
+
+@app.route("/insights")
+@auth.login_required
+def insights_page():
+    return render_template("insights.html", active="insights",
+                           default_console="https://celerantai.com",
+                           limit_per_org=_INSIGHTS_LIMIT_PER_ORG)
+
+
+@app.route("/insights/data")
+@auth.login_required
+def insights_data():
+    from_iso = (request.args.get("from_date") or "").strip()
+    to_iso   = (request.args.get("to_date") or "").strip()
+    if not from_iso or not to_iso:
+        return jsonify({"ok": False, "error": "from_date and to_date required (YYYY-MM-DD)."}), 400
+    console = (request.args.get("console_url") or "https://celerantai.com").strip()
+    bearer  = (request.args.get("bearer_token") or "").strip()
+    refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
+
+    key = (from_iso, to_iso, console)
+    now = time.time()
+    if not refresh:
+        with _insights_cache_lock:
+            cached = _insights_cache.get(key)
+        if cached and (now - cached["ts"]) < _INSIGHTS_TTL_S:
+            return jsonify({"ok": True, "cached": True,
+                            "cached_at": cached["ts"], "ttl_s": _INSIGHTS_TTL_S,
+                            **cached["data"]})
+
+    started = time.time()
+    orgs_data, errors = _fetch_orgs_history_parallel(from_iso, to_iso, console, bearer)
+    if not orgs_data and errors:
+        return jsonify({"ok": False, "error": "; ".join(errors)}), 502
+    agg = _aggregate_insights(orgs_data)
+    elapsed = int((time.time() - started) * 1000)
+    payload = {**agg, "errors": errors, "fetch_elapsed_ms": elapsed,
+               "from_date": from_iso, "to_date": to_iso}
+    with _insights_cache_lock:
+        _insights_cache[key] = {"ts": now, "data": payload}
+    return jsonify({"ok": True, "cached": False, "cached_at": now,
+                    "ttl_s": _INSIGHTS_TTL_S, **payload})
+
+
+# ---------------------------------------------------------------------------
 # Variant Tests — run an original question + its paraphrases through the SQL
 # AI Engine and report how many variants generate the same SQL as the original.
 # Reuses the SQL Agent runner; the run is tagged with a variant_groups map.
