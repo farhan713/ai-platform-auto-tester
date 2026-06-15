@@ -1606,12 +1606,16 @@ def activity_logs_fetch():
             "first_ts": first, "last_ts": last,
         }
 
+    from urllib.parse import urlencode
     out_orgs: list[dict[str, Any]] = []
     grand = {"orgs": 0, "queries": 0, "llm": 0, "rag": 0, "complete": 0, "failed": 0}
     for org_id in org_ids:
-        url = f"{base}/{org_id}/{offset}/{limit}/"
+        base_url = f"{base}/{org_id}/{offset}/{limit}/"
+        # Full URL WITH the date query params — this is exactly what we send,
+        # and what we show in the UI so the date range is visible/verifiable.
+        url = f"{base_url}?{urlencode({'from_date': from_d, 'to_date': to_d})}"
         try:
-            resp = requests.get(url, params={"from_date": from_d, "to_date": to_d},
+            resp = requests.get(base_url, params={"from_date": from_d, "to_date": to_d},
                                 headers=headers, timeout=120)
             try:
                 body = resp.json()
