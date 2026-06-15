@@ -2012,6 +2012,304 @@ def insights_data():
 
 
 # ---------------------------------------------------------------------------
+# SQL Dev — mirror of the Celerant "SQL Developer" dashboard. Lets a reviewer
+# pull reported / disliked / completed queries for an org, correct the SQL,
+# generate a visualization, save a draft, and approve into the trained set.
+# Every call is proxied server-side to the celerantai SQL-Agent API.
+# ---------------------------------------------------------------------------
+SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com/sql_agent").rstrip("/")
+
+
+def _sqldev_console_base() -> str:
+    return (request.values.get("console_url") or SQLDEV_API_BASE).strip().rstrip("/")
+
+
+def _sqldev_headers() -> dict[str, str]:
+    h = {}
+    tok = (request.values.get("bearer_token") or "").strip()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def _sqldev_transform_feedback(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the feedback_data response into a single list of review rows,
+    exactly like the Angular dashboard's loadFeedbackData()."""
+    out: list[dict[str, Any]] = []
+    vh = (data.get("validated_history_examples") or {})
+    ex = (data.get("examples") or {})
+    uv = (data.get("user_visit_history") or {})
+
+    for q in (vh.get("validation_status_clicked") or []):
+        out.append({**q, "id": q.get("query_id"), "status": "not_verified",
+                    "reported_date": q.get("created_at"),
+                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
+                    "isDisliked": False})
+    for q in (vh.get("validation_status_dislike") or []):
+        out.append({**q, "id": q.get("query_id"), "status": "not_verified",
+                    "reported_date": q.get("created_at"),
+                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
+                    "isDisliked": True})
+    for q in (ex.get("users_sql_queries") or []):
+        out.append({**q, "id": q.get("example_id"), "query_id": q.get("example_id"),
+                    "dev_sql_query": "", "status": "completed_by_user",
+                    "reported_date": q.get("created_at"),
+                    "corrected_sql": q.get("sql_query"), "isDisliked": False})
+    for q in (ex.get("developer_sql_queries") or []):
+        if not q:
+            continue
+        qid = q.get("query_id") or q.get("example_id")
+        out.append({**q, "id": qid, "query_id": qid, "status": "completed_by_sql_dev",
+                    "reported_date": q.get("created_at"),
+                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
+                    "isDisliked": False})
+    for q in (uv.get("result") or []):
+        out.append({**q, "id": q.get("query_id"), "dev_sql_query": "",
+                    "status": "user_visit", "reported_date": q.get("created_at"),
+                    "corrected_sql": q.get("sql_query"), "isDisliked": False})
+    return out
+
+
+@app.route("/sql-dev")
+@auth.login_required
+def sql_dev_page():
+    return render_template("sql_dev.html", active="sql_dev",
+                           default_console="https://celerantai.com",
+                           current_user_id=auth.current_user_id())
+
+
+@app.route("/sql-dev/feedback")
+@auth.login_required
+def sql_dev_feedback():
+    """GET feedback_data/{org_id}/{start}/{end}/?from_date&to_date — the review
+    queue. Returns the flattened rows + the per-category counts for pagination."""
+    import requests
+    from urllib.parse import urlencode
+    org_id = (request.args.get("org_id") or "").strip()
+    if not org_id:
+        return jsonify({"ok": False, "error": "org_id is required"}), 400
+    try:
+        start = max(0, int(request.args.get("start") or 0))
+        end   = max(start, int(request.args.get("end") or 9))
+    except ValueError:
+        return jsonify({"ok": False, "error": "start/end must be integers"}), 400
+    from_d = _yyyy_mm_dd_to_mm_dd_yyyy(request.args.get("from_date") or "")
+    to_d   = _yyyy_mm_dd_to_mm_dd_yyyy(request.args.get("to_date") or "")
+
+    # Demo mode (env-gated, OFF in production) so the page is usable while the
+    # Celerant feedback_data endpoint is returning HTTP 500.
+    if os.environ.get("SQA_SQLDEV_DEMO", "").strip() in ("1", "true", "yes"):
+        return jsonify({"ok": True, "demo": True, **_sqldev_demo_feedback()})
+
+    base = _sqldev_console_base()
+    url = f"{base}/sql_agent/feedback_data/{org_id}/{start}/{end}/"
+    if from_d and to_d:
+        url += "?" + urlencode({"from_date": from_d, "to_date": to_d})
+    try:
+        r = requests.get(url, headers=_sqldev_headers(), timeout=60)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        data = ((body.get("responseBody") or {}).get("data")) if isinstance(body, dict) else None
+        if not (200 <= r.status_code < 300) or data is None:
+            msg = (body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else None
+            return jsonify({"ok": False, "status_code": r.status_code, "url": url,
+                            "error": msg or f"feedback_data returned HTTP {r.status_code}"}), 502
+        vh = data.get("validated_history_examples") or {}
+        ex = data.get("examples") or {}
+        uv = data.get("user_visit_history") or {}
+        counts = {
+            "clicked": vh.get("clicked_queries_count") or 0,
+            "dislike": vh.get("dislike_queries_count") or 0,
+            "user": ex.get("user_queries_count") or 0,
+            "developer": ex.get("developer_queries_count") or 0,
+            "user_visit": uv.get("user_visit_history_count") or 0,
+        }
+        return jsonify({"ok": True, "url": url, "rows": _sqldev_transform_feedback(data),
+                        "counts": counts})
+    except Exception as e:
+        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
+
+
+@app.route("/sql-dev/visualization", methods=["POST"])
+@auth.login_required
+def sql_dev_visualization():
+    """POST generate_visualization {question, sql} -> visualization configs."""
+    import requests
+    question = (request.form.get("question") or "").strip()
+    sql = (request.form.get("sql") or "").strip()
+    if not question or not sql:
+        return jsonify({"ok": False, "error": "question and sql are required"}), 400
+    base = _sqldev_console_base()
+    try:
+        r = requests.post(f"{base}/sql_agent/generate_visualization",
+                          json={"question": question, "sql": sql},
+                          headers={**_sqldev_headers(), "Content-Type": "application/json"},
+                          timeout=120)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
+              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
+        viz = (((body.get("responseBody") or {}).get("data") or {}).get("visualizations")) or [] if isinstance(body, dict) else []
+        return jsonify({"ok": ok, "status_code": r.status_code,
+                        "visualizations": viz,
+                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else "viz failed")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
+
+
+@app.route("/sql-dev/save-draft", methods=["POST"])
+@auth.login_required
+def sql_dev_save_draft():
+    """PATCH validation_from_developer/{org_id}/{query_id}/ — save a draft
+    correction {natural_language_query, dev_sql_query, visualization}."""
+    import requests
+    org_id = (request.form.get("org_id") or "").strip()
+    query_id = (request.form.get("query_id") or "").strip()
+    if not org_id or not query_id:
+        return jsonify({"ok": False, "error": "org_id and query_id are required"}), 400
+    try:
+        viz = json.loads(request.form.get("visualization") or "{}")
+    except Exception:
+        viz = {}
+    payload = {
+        "natural_language_query": request.form.get("natural_language_query") or "",
+        "dev_sql_query": request.form.get("dev_sql_query") or "",
+        "visualization": viz,
+    }
+    base = _sqldev_console_base()
+    url = f"{base}/sql_agent/validation_from_developer/{org_id}/{query_id}/"
+    try:
+        r = requests.patch(url, json=payload,
+                           headers={**_sqldev_headers(), "Content-Type": "application/json"},
+                           timeout=60)
+        try: body = r.json()
+        except Exception: body = {}
+        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
+              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
+        return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
+                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else f"HTTP {r.status_code}")})
+    except Exception as e:
+        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
+
+
+@app.route("/sql-dev/approve", methods=["POST"])
+@auth.login_required
+def sql_dev_approve():
+    """PATCH validation_like/{org_id}/{query_id}/ — approve into the trained
+    examples. Uses the UPDATED SQLExampleMetadata schema (the Swagger dropped
+    the old description/business_context fields)."""
+    import requests
+    org_id = (request.form.get("org_id") or "").strip()
+    query_id = (request.form.get("query_id") or "").strip()
+    if not org_id or not query_id:
+        return jsonify({"ok": False, "error": "org_id and query_id are required"}), 400
+    try:
+        viz = json.loads(request.form.get("visualization") or "{}")
+    except Exception:
+        viz = {}
+    payload = {
+        "natural_language_query": request.form.get("natural_language_query") or "",
+        "sql_query": request.form.get("sql_query") or "",
+        "visualization": viz,
+        "query_category": request.form.get("query_category") or "default",
+        "validation_by": "developer",
+        "user_id": request.form.get("user_id") or "-1",
+        "embedding_model": "all-MiniLM-L6-v2",
+    }
+    base = _sqldev_console_base()
+    url = f"{base}/sql_agent/validation_like/{org_id}/{query_id}/"
+    try:
+        r = requests.patch(url, json=payload,
+                           headers={**_sqldev_headers(), "Content-Type": "application/json"},
+                           timeout=60)
+        try: body = r.json()
+        except Exception: body = {}
+        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
+              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
+        return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
+                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else f"HTTP {r.status_code}")})
+    except Exception as e:
+        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
+
+
+@app.route("/sql-dev/execute", methods=["POST"])
+@auth.login_required
+def sql_dev_execute():
+    """Proxy a SQL execution to a tenant's /backoffice/report/run-sql. Needs a
+    tenant_url (the backoffice origin). The tenant may require a session; if so
+    the call will fail and we surface that — execution is a verification aid,
+    the review/approve workflow does not depend on it."""
+    import requests
+    sql = (request.form.get("sql") or "").strip()
+    tenant_url = (request.form.get("tenant_url") or "").strip().rstrip("/")
+    if not sql:
+        return jsonify({"ok": False, "error": "sql is required"}), 400
+    if not tenant_url:
+        return jsonify({"ok": False, "error": "Provide the tenant backoffice URL (Advanced) to execute SQL."}), 400
+    if sql.endswith(";"):
+        sql = sql[:-1]
+    payload = {
+        "action": "Search", "application": None, "attributes": [],
+        "buttonType": "StandardBTN", "sql": sql, "id": -1, "message": None,
+        "screenName": "CustomerCatList1", "screenType": "1", "status": "SUCCESS",
+        "targetScreenName": "MainScreen", "targetScreenType": "7",
+        "dataTables": None, "components": [], "data": [{"sql": sql}],
+    }
+    run_url = f"{tenant_url}/backoffice/report/run-sql"
+    try:
+        r = requests.post(run_url, data={"json": json.dumps(payload)},
+                          headers={"Content-Type": "application/x-www-form-urlencoded"},
+                          timeout=120, verify=False)
+        try: body = r.json()
+        except Exception: body = (r.text or "")[:20000]
+        rows = body.get("data") if isinstance(body, dict) else None
+        ok = 200 <= r.status_code < 300 and isinstance(rows, list)
+        return jsonify({"ok": ok, "status_code": r.status_code, "url": run_url,
+                        "data": rows if ok else None,
+                        "error": None if ok else (body.get("message") if isinstance(body, dict) else "execution failed or needs a tenant session")})
+    except Exception as e:
+        return jsonify({"ok": False, "url": run_url, "error": f"{type(e).__name__}: {e}"}), 502
+
+
+def _sqldev_demo_feedback() -> dict[str, Any]:
+    """Synthetic review queue for demos/screenshots while feedback_data is 500."""
+    base = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    def q(i, status, disliked=False):
+        nlqs = ["Show total sales by store this month",
+                "Top 10 customers by spend this year",
+                "Which products are low on inventory?",
+                "Average transaction value per store",
+                "Units sold by brand last month"]
+        sqls = ["SELECT S.STORE_NAME, SUM(R.TOTAL) AS Sales FROM TB_RECEIPT R JOIN TB_STORES S ON R.STORE_ID=S.STORE_ID GROUP BY S.STORE_NAME",
+                "SELECT TOP 10 C.FIRST_NAME, SUM(R.TOTAL) AS Spend FROM TB_RECEIPT R JOIN TB_CUSTOMERS C ON R.CUSTOMER_ID=C.CUSTOMER_ID GROUP BY C.FIRST_NAME ORDER BY Spend DESC",
+                "SELECT STYLE, QOH FROM TB_SKU_BUCKETS WHERE QOH < MINI",
+                "SELECT S.STORE_NAME, AVG(R.TOTAL) AS AvgTxn FROM TB_RECEIPT R JOIN TB_STORES S ON R.STORE_ID=S.STORE_ID GROUP BY S.STORE_NAME",
+                "SELECT TS.BRAND, SUM(RL.QUANTITY) AS Units FROM TB_RECEIPTLINE RL JOIN TB_STYLES TS ON RL.STYLE_ID=TS.STYLE_ID GROUP BY TS.BRAND"]
+        idx = i % len(nlqs)
+        return {
+            "id": f"demo-{status}-{i}", "query_id": f"demo-{status}-{i}",
+            "user_id": "-1", "login_name": ["dummy","analyst","store_mgr"][i % 3],
+            "natural_language_query": nlqs[idx], "sql_query": sqls[idx],
+            "dev_sql_query": sqls[idx] if status == "completed_by_sql_dev" else "",
+            "created_at": base, "updated_at": base,
+            "status": status, "reported_date": base,
+            "corrected_sql": sqls[idx], "isDisliked": disliked,
+        }
+    rows = (
+        [q(i, "not_verified", disliked=(i % 2 == 0)) for i in range(6)] +
+        [q(i, "completed_by_user") for i in range(4)] +
+        [q(i, "completed_by_sql_dev") for i in range(3)] +
+        [q(i, "user_visit") for i in range(5)]
+    )
+    return {"rows": rows, "counts": {"clicked": 3, "dislike": 3, "user": 4,
+                                     "developer": 3, "user_visit": 5}}
+
+
+# ---------------------------------------------------------------------------
 # Variant Tests — run an original question + its paraphrases through the SQL
 # AI Engine and report how many variants generate the same SQL as the original.
 # Reuses the SQL Agent runner; the run is tagged with a variant_groups map.
