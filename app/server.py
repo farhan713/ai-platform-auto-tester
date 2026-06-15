@@ -1472,6 +1472,45 @@ def _yyyy_mm_dd_to_mm_dd_yyyy(s: str) -> str | None:
     return None
 
 
+def _normalize_org(o: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a /sql_agent/all_orgs/ record across API shape changes.
+
+    The endpoint has returned two different shapes over time:
+      OLD: {"name", "database_id", "organization_id"}
+      NEW: {"org_name", "org_id", "industry_type", "client_id", "domain_id"}
+
+    The id we pass to /history_data/{id}/... is whichever this response
+    provides — database_id if present (old), else org_id (new). Returns
+    None if neither an id nor a name can be found.
+    """
+    if not isinstance(o, dict):
+        return None
+    hist_id = (o.get("database_id") or o.get("org_id") or "").strip()
+    name = (o.get("name") or o.get("org_name") or "").strip()
+    org_uuid = (o.get("organization_id") or o.get("org_id") or "").strip()
+    if not hist_id and not name:
+        return None
+    return {
+        "id": hist_id or org_uuid,        # what /history_data takes
+        "name": name or hist_id,          # friendly label
+        "organization_id": org_uuid,
+    }
+
+
+def _fetch_all_orgs_normalized(console: str, bearer: str = "") -> list[dict[str, Any]]:
+    """GET {console}/sql_agent/all_orgs/ and return a normalized, name-sorted
+    list of {id, name, organization_id}. Raises on transport / non-2xx."""
+    import requests
+    console = console.rstrip("/")
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    resp = requests.get(f"{console}/sql_agent/all_orgs/", headers=headers, timeout=30)
+    resp.raise_for_status()
+    raw = (resp.json() or {}).get("responseBody", {}).get("data") or []
+    out = [n for n in (_normalize_org(o) for o in raw) if n and n["id"]]
+    out.sort(key=lambda o: (o["name"] or "").lower())
+    return out
+
+
 @app.route("/activity-logs")
 @auth.login_required
 def activity_logs_page():
@@ -1484,33 +1523,17 @@ def activity_logs_page():
 def activity_logs_orgs():
     """Proxy to GET {console}/sql_agent/all_orgs/ so the dropdown can be
     populated server-side (no CORS, no Celerant token leak to the browser).
-    Returns the list verbatim from responseBody.data, sorted by name."""
-    import requests
-    console = (request.args.get("console_url") or "https://celerantai.com").strip().rstrip("/")
-    url = f"{console}/sql_agent/all_orgs/"
-    headers: dict[str, str] = {}
+    Normalizes across the old/new response shapes (see _normalize_org)."""
+    console = (request.args.get("console_url") or "https://celerantai.com").strip()
     token = (request.args.get("bearer_token") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        orgs = _fetch_all_orgs_normalized(console, token)
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
-    if not (200 <= resp.status_code < 300):
-        return jsonify({"ok": False, "status_code": resp.status_code,
-                        "error": (resp.text or "")[:300]}), 502
-    try:
-        body = resp.json()
-    except Exception:
-        return jsonify({"ok": False, "error": "non-JSON response from all_orgs"}), 502
-    orgs = (body.get("responseBody") or {}).get("data") or []
-    # Project to the fields we actually use; sort by friendly name.
-    slim = sorted([{
-        "name": o.get("name") or "",
-        "database_id": o.get("database_id") or "",
-        "organization_id": o.get("organization_id") or "",
-    } for o in orgs if o.get("database_id")],
-        key=lambda o: (o["name"] or "").lower())
+    # Expose 'database_id' as the id field for backward-compat with the
+    # existing activity_logs.html JS (it submits that value).
+    slim = [{"name": o["name"], "database_id": o["id"],
+             "organization_id": o["organization_id"]} for o in orgs]
     return jsonify({"ok": True, "count": len(slim), "orgs": slim})
 
 
@@ -1657,14 +1680,14 @@ def _fetch_orgs_history_parallel(
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
     errors: list[str] = []
 
-    # 1) Get the full org list.
+    # 1) Get the full org list (normalized across API shape changes).
     try:
-        all_orgs_resp = requests.get(
-            f"{console}/sql_agent/all_orgs/", headers=headers, timeout=30)
-        all_orgs_resp.raise_for_status()
-        orgs = ((all_orgs_resp.json() or {}).get("responseBody") or {}).get("data") or []
+        orgs = _fetch_all_orgs_normalized(console, bearer)
     except Exception as e:
         errors.append(f"all_orgs: {type(e).__name__}: {e}")
+        return [], errors
+    if not orgs:
+        errors.append("all_orgs returned no usable organizations")
         return [], errors
 
     base = f"{console}/sql_agent/history_data"
@@ -1675,27 +1698,41 @@ def _fetch_orgs_history_parallel(
         return [], errors
 
     def _one(org: dict[str, Any]) -> dict[str, Any]:
-        db_id = org.get("database_id")
-        if not db_id:
-            return {"name": org.get("name", ""), "database_id": "",
-                    "records": [], "error": "missing database_id"}
-        url = f"{base}/{db_id}/0/{_INSIGHTS_LIMIT_PER_ORG}/"
+        hid = org["id"]
+        name = org["name"]
+        url = f"{base}/{hid}/0/{_INSIGHTS_LIMIT_PER_ORG}/"
         try:
             r = requests.get(url, headers=headers,
                              params={"from_date": from_mmddyyyy, "to_date": to_mmddyyyy},
                              timeout=60)
             r.raise_for_status()
             body = r.json() or {}
-            records = ((body.get("responseBody") or {}).get("data") or {}).get("history_records") or []
-            history_count = ((body.get("responseBody") or {}).get("data") or {}).get("history_count")
-            return {"name": org.get("name") or db_id, "database_id": db_id,
-                    "records": records, "history_count": history_count}
+            rb = (body.get("responseBody") or {})
+            data = rb.get("data")
+            # Celerant returns 200 with responseHeader.message_type == 'Fail'
+            # and data == null when the history backend errors. Surface that
+            # as a per-org error instead of silently producing 0 records.
+            if data is None:
+                msg = (body.get("responseHeader") or {}).get("message") or "history endpoint returned no data"
+                return {"name": name, "database_id": hid, "records": [], "error": msg}
+            records = data.get("history_records") or []
+            return {"name": name, "database_id": hid,
+                    "records": records, "history_count": data.get("history_count")}
         except Exception as e:
-            return {"name": org.get("name") or db_id, "database_id": db_id,
+            return {"name": name, "database_id": hid,
                     "records": [], "error": f"{type(e).__name__}: {e}"}
 
     with ThreadPoolExecutor(max_workers=_INSIGHTS_PARALLEL) as ex:
         out = list(ex.map(_one, orgs))
+
+    # Roll any per-org history errors up into the page-level error list (deduped)
+    # so the dashboard can show "history endpoint is currently failing".
+    seen_err: set[str] = set()
+    for o in out:
+        if o.get("error") and o["error"] not in seen_err:
+            seen_err.add(o["error"])
+    for e in seen_err:
+        errors.append(f"history: {e}")
 
     return out, errors
 
@@ -1832,6 +1869,57 @@ def insights_page():
                            limit_per_org=_INSIGHTS_LIMIT_PER_ORG)
 
 
+def _demo_insights_payload(from_iso: str, to_iso: str) -> dict[str, Any]:
+    """Synthetic but realistic dashboard data — used for demos / screenshots
+    when the upstream Celerant history endpoint is unavailable. Gated behind
+    the SQA_INSIGHTS_DEMO env var (off in production)."""
+    orgs = ["safesidetactical", "rebelrags", "workwarehouse", "hp123",
+            "oneplus123", "firearms", "pets", "ski", "Cooks Inc",
+            "Bluewater Outriggers"]
+    users = ["dummy", "qa_admin", "store_mgr", "analyst", "ops"]
+    questions = [
+        "What is the total revenue from all receipts?",
+        "Show top 10 customers by total spend this year",
+        "How many units sold by brand last month?",
+        "Which products are running low on inventory?",
+        "What is the average transaction value per store?",
+    ]
+    recs_per_org: dict[str, list] = {}
+    # Deterministic pseudo-random so screenshots are stable.
+    seed = 7
+    def nxt(mod):
+        nonlocal seed
+        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
+        return seed % mod
+    try:
+        base = datetime.fromisoformat(from_iso)
+    except Exception:
+        base = datetime.now(timezone.utc) - timedelta(days=7)
+    for oi, org in enumerate(orgs):
+        n = 12 + nxt(40) + (30 if oi < 3 else 0)
+        recs = []
+        for i in range(n):
+            day_off = nxt(7)
+            hour = 8 + nxt(11)
+            ts = (base + timedelta(days=day_off, hours=hour, minutes=nxt(60)))
+            llm = nxt(10) < 6
+            failed = nxt(10) < 2
+            recs.append({
+                "created_at": ts.isoformat(),
+                "login_name": users[nxt(len(users))],
+                "session_id": f"sess-{org}-{nxt(8)}",
+                "natural_language_query": questions[nxt(len(questions))],
+                "llm_invoked": llm,
+                "query_status": "failed" if failed else "complete",
+            })
+        recs_per_org[org] = recs
+    orgs_data = [{"name": o, "database_id": f"demo-{o}", "records": r}
+                 for o, r in recs_per_org.items()]
+    agg = _aggregate_insights(orgs_data)
+    return {**agg, "errors": [], "fetch_elapsed_ms": 0,
+            "from_date": from_iso, "to_date": to_iso, "demo": True}
+
+
 @app.route("/insights/data")
 @auth.login_required
 def insights_data():
@@ -1839,6 +1927,14 @@ def insights_data():
     to_iso   = (request.args.get("to_date") or "").strip()
     if not from_iso or not to_iso:
         return jsonify({"ok": False, "error": "from_date and to_date required (YYYY-MM-DD)."}), 400
+
+    # Demo mode (env-gated, OFF in production) — return synthetic data so the
+    # dashboard can be screenshotted / demoed while the upstream history
+    # endpoint is unavailable.
+    if os.environ.get("SQA_INSIGHTS_DEMO", "").strip() in ("1", "true", "yes"):
+        return jsonify({"ok": True, "cached": False, "cached_at": time.time(),
+                        "ttl_s": _INSIGHTS_TTL_S,
+                        **_demo_insights_payload(from_iso, to_iso)})
     console = (request.args.get("console_url") or "https://celerantai.com").strip()
     bearer  = (request.args.get("bearer_token") or "").strip()
     refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")

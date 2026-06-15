@@ -41,6 +41,9 @@
   </details>
 </div>
 
+<!-- Page-level banner: shown when the upstream history endpoint errors -->
+<div id="ins-banner" class="reason reason-warn" style="display:none; margin-bottom:14px"></div>
+
 <!-- KPI tiles -->
 <div class="kpi-grid" id="kpi-grid">
   <div class="kpi"><div class="kpi-label">Organizations</div><div class="kpi-value" id="kpi-orgs">—</div><div class="kpi-sub" id="kpi-orgs-sub">&nbsp;</div></div>
@@ -142,13 +145,13 @@ const metaEl   = document.getElementById('ins-meta');
 let _charts = {};            // chart.js instances we can destroy() before re-rendering
 let _lastData = null;
 
-// Default: last 30 days through today.
+// Default: last 7 days through today.
 (function() {
   const today = new Date();
-  const month = new Date(); month.setDate(today.getDate() - 30);
+  const week = new Date(); week.setDate(today.getDate() - 7);
   const iso = d => d.toISOString().slice(0, 10);
   toEl.value   = iso(today);
-  fromEl.value = iso(month);
+  fromEl.value = iso(week);
 })();
 
 function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
@@ -382,6 +385,21 @@ async function load(refresh = false) {
     const r = await SQA.fetchJSON(`/insights/data?${params.toString()}`);
     if (!r.ok) throw new Error(r.error || 'Failed to load');
     _lastData = r;
+
+    // Banner: if upstream history calls errored, tell the user plainly —
+    // especially important when totals are 0 (otherwise the page looks blank
+    // for no apparent reason).
+    const banner = document.getElementById('ins-banner');
+    if (r.errors && r.errors.length) {
+      const noData = (r.totals.queries || 0) === 0;
+      banner.style.display = '';
+      banner.innerHTML = (noData
+          ? '<b>No activity data returned.</b> The Celerant history endpoint reported an error for every organization — this is an upstream issue, not a problem with this page. '
+          : '<b>Partial data.</b> Some organizations could not be fetched. ')
+        + 'Details: ' + r.errors.map(esc).join(' · ');
+    } else {
+      banner.style.display = 'none';
+    }
 
     renderKPIs(r.totals);
     renderTimeseries(r.timeseries);
