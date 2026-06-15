@@ -1473,26 +1473,32 @@ def _yyyy_mm_dd_to_mm_dd_yyyy(s: str) -> str | None:
 
 
 def _normalize_org(o: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize a /sql_agent/all_orgs/ record across API shape changes.
+    """Normalize a /sql_agent/all_orgs/ record into {id, name, industry, ...}.
 
-    The endpoint has returned two different shapes over time:
-      OLD: {"name", "database_id", "organization_id"}
-      NEW: {"org_name", "org_id", "industry_type", "client_id", "domain_id"}
+    The CURRENT (new) API shape, confirmed against the live endpoint, is:
+      {"org_id", "org_name", "industry_type", "client_id", "domain_id"}
+    where ``org_id`` is the identifier the /history_data/{org_id}/... path
+    expects (Swagger: "Target org database id"). For real tenants org_id is
+    a UUID (e.g. fd39c82a-...); for test tenants it's a short code
+    (e.g. 17bwf6px). The endpoint's Swagger param is literally named org_id.
 
-    The id we pass to /history_data/{id}/... is whichever this response
-    provides — database_id if present (old), else org_id (new). Returns
-    None if neither an id nor a name can be found.
+    We still accept the OLD shape ({"name", "database_id", "organization_id"})
+    as a fallback so a future/partial rollback doesn't break us.
+
+    Returns None if no id and no name can be found.
     """
     if not isinstance(o, dict):
         return None
-    hist_id = (o.get("database_id") or o.get("org_id") or "").strip()
-    name = (o.get("name") or o.get("org_name") or "").strip()
+    # New shape first, then old-shape fallbacks.
+    hist_id = (o.get("org_id") or o.get("database_id") or "").strip()
+    name    = (o.get("org_name") or o.get("name") or "").strip()
     org_uuid = (o.get("organization_id") or o.get("org_id") or "").strip()
     if not hist_id and not name:
         return None
     return {
-        "id": hist_id or org_uuid,        # what /history_data takes
-        "name": name or hist_id,          # friendly label
+        "id": hist_id or org_uuid,        # what /history_data/{id}/ takes
+        "name": name or hist_id,          # friendly label (org_name)
+        "industry": (o.get("industry_type") or "").strip(),
         "organization_id": org_uuid,
     }
 
@@ -1700,6 +1706,7 @@ def _fetch_orgs_history_parallel(
     def _one(org: dict[str, Any]) -> dict[str, Any]:
         hid = org["id"]
         name = org["name"]
+        industry = org.get("industry", "")
         url = f"{base}/{hid}/0/{_INSIGHTS_LIMIT_PER_ORG}/"
         try:
             r = requests.get(url, headers=headers,
@@ -1714,12 +1721,12 @@ def _fetch_orgs_history_parallel(
             # as a per-org error instead of silently producing 0 records.
             if data is None:
                 msg = (body.get("responseHeader") or {}).get("message") or "history endpoint returned no data"
-                return {"name": name, "database_id": hid, "records": [], "error": msg}
+                return {"name": name, "database_id": hid, "industry": industry, "records": [], "error": msg}
             records = data.get("history_records") or []
-            return {"name": name, "database_id": hid,
+            return {"name": name, "database_id": hid, "industry": industry,
                     "records": records, "history_count": data.get("history_count")}
         except Exception as e:
-            return {"name": name, "database_id": hid,
+            return {"name": name, "database_id": hid, "industry": industry,
                     "records": [], "error": f"{type(e).__name__}: {e}"}
 
     with ThreadPoolExecutor(max_workers=_INSIGHTS_PARALLEL) as ex:
@@ -1756,6 +1763,7 @@ def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
         per_org.append({
             "name": org.get("name") or org.get("database_id") or "",
             "database_id": org.get("database_id"),
+            "industry": org.get("industry") or "",
             "total": len(recs),
             "llm": llm, "rag": rag,
             "complete": complete, "failed": failed,

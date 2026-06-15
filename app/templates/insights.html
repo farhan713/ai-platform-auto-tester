@@ -97,6 +97,7 @@
       <thead>
         <tr>
           <th>Organization</th>
+          <th>Industry</th>
           <th style="text-align:right">Queries</th>
           <th style="text-align:right">LLM</th>
           <th style="text-align:right">RAG</th>
@@ -106,7 +107,7 @@
           <th>Range</th>
         </tr>
       </thead>
-      <tbody><tr><td colspan="8" class="table-empty">Loading…</td></tr></tbody>
+      <tbody><tr><td colspan="9" class="table-empty">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -343,10 +344,11 @@ function renderOrgTable(rows) {
   if (filter) visible = visible.filter(r => (r.name||'').toLowerCase().includes(filter));
   visible.sort((a,b) => b.total - a.total);
   const tbody = document.querySelector('#org-table tbody');
-  if (!visible.length) { tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No organizations match.</td></tr>'; return; }
+  if (!visible.length) { tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No organizations match.</td></tr>'; return; }
   tbody.innerHTML = visible.map(r => `
     <tr>
       <td><b>${esc(r.name)}</b>${r.error ? ` <span class="meta" title="${esc(r.error)}">⚠</span>` : ''}</td>
+      <td><span class="meta">${esc(r.industry || '—')}</span></td>
       <td style="text-align:right">${fmtN(r.total)}</td>
       <td style="text-align:right">${fmtN(r.llm)}</td>
       <td style="text-align:right">${fmtN(r.rag)}</td>
