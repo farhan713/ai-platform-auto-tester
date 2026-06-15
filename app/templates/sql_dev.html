@@ -85,7 +85,6 @@
     <div class="grid-2" style="margin-top:8px;gap:10px">
       <label><span class="label-text">Console URL</span><input type="url" id="sd-console" value="{{ default_console }}"></label>
       <label><span class="label-text">Bearer token (optional)</span><input type="text" id="sd-token" autocomplete="off"></label>
-      <label><span class="label-text">Tenant backoffice URL (for Execute SQL)</span><input type="url" id="sd-tenant" placeholder="https://&lt;host&gt;:8443"></label>
     </div>
   </details>
   <div id="sd-banner" style="display:none"></div>
@@ -126,7 +125,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
 <script>
 const CURRENT_USER_ID = {{ current_user_id|tojson }};
 const esc = s => SQA.escapeHtml(s == null ? '' : String(s));
@@ -138,8 +136,7 @@ let _start=0,_end=9; const PAGE=10;
   document.getElementById('sd-to').value=iso(t);document.getElementById('sd-from').value=iso(y);})();
 
 function cfg(){return{console_url:document.getElementById('sd-console').value.trim(),
-  bearer_token:document.getElementById('sd-token').value.trim(),
-  tenant_url:document.getElementById('sd-tenant').value.trim()};}
+  bearer_token:document.getElementById('sd-token').value.trim()};}
 
 function banner(kind,msg){const b=document.getElementById('sd-banner');
   if(!msg){b.style.display='none';return;}
@@ -247,7 +244,7 @@ function renderList(){
 const editable=()=>_selected&&(_selected.status==='not_verified'||_selected.status==='user_visit');
 
 function selectRow(r){
-  _selected={...r,corrected_sql:r.corrected_sql||r.sql_query,_llmRows:null,_devRows:null,_llmViz:null,_devViz:null};
+  _selected={...r,corrected_sql:r.corrected_sql||r.sql_query};
   renderList();renderDetail();
 }
 
@@ -268,28 +265,14 @@ function renderDetail(){
     <div class="sd-section">
       <div class="head"><h3>🤖 LLM-generated SQL <span class="meta" style="font-weight:400">read-only</span></h3></div>
       <div class="sd-sqlbox">${esc(r.sql_query)}</div>
-      <div class="sd-actions">
-        <button class="btn btn-sm" id="sd-exec-llm">▶ Execute</button>
-        <button class="btn btn-sm" id="sd-viz-llm">📊 Visualization</button>
-      </div>
-      <div id="sd-llm-out" style="margin-top:8px"></div>
     </div>
 
     <div class="sd-section">
-      <div class="head"><h3>✏️ Corrected SQL <span class="meta" style="font-weight:400">${ed?'editable':'read-only'}</span></h3></div>
-      <textarea id="sd-corrected" rows="6" class="sd-editor" ${ed?'':'readonly'}>${esc(r.corrected_sql)}</textarea>
-      <div class="sd-actions">
-        <button class="btn btn-sm" id="sd-exec-dev">▶ Execute</button>
-        <button class="btn btn-sm" id="sd-viz-dev">📊 Visualization</button>
-      </div>
-      <div id="sd-dev-out" style="margin-top:8px"></div>
+      <div class="head"><h3>✏️ Corrected SQL <span class="meta" style="font-weight:400">${ed?'editable — fix the SQL, then Save draft &amp; Approve':'read-only'}</span></h3></div>
+      <textarea id="sd-corrected" rows="7" class="sd-editor" ${ed?'':'readonly'}>${esc(r.corrected_sql)}</textarea>
     </div>`;
   const d=document.getElementById('sd-detail');
   d.querySelector('#sd-corrected').addEventListener('input',e=>{_selected.corrected_sql=e.target.value;});
-  d.querySelector('#sd-exec-llm').addEventListener('click',ev=>execSql(ev.currentTarget,r.sql_query,'sd-llm-out','_llmRows'));
-  d.querySelector('#sd-exec-dev').addEventListener('click',ev=>execSql(ev.currentTarget,_selected.corrected_sql,'sd-dev-out','_devRows'));
-  d.querySelector('#sd-viz-llm').addEventListener('click',ev=>genViz(ev.currentTarget,r.natural_language_query,r.sql_query,'sd-llm-out','_llmViz','_llmRows'));
-  d.querySelector('#sd-viz-dev').addEventListener('click',ev=>genViz(ev.currentTarget,r.natural_language_query,_selected.corrected_sql,'sd-dev-out','_devViz','_devRows'));
   d.querySelector('#sd-save').addEventListener('click',saveDraft);
   d.querySelector('#sd-approve').addEventListener('click',approve);
 }
@@ -297,62 +280,12 @@ function renderDetail(){
 function busy(btn,on,label){if(on){btn.dataset.t=btn.innerHTML;btn.innerHTML='<span class="sd-spin"></span> '+(label||'…');btn.disabled=true;}
   else{btn.innerHTML=btn.dataset.t||btn.innerHTML;btn.disabled=false;}}
 
-async function execSql(btn,sql,outId,store){
-  const out=document.getElementById(outId);busy(btn,true,'Running');
-  try{const fd=new URLSearchParams({sql,tenant_url:cfg().tenant_url});
-    const r=await fetch('/sql-dev/execute',{method:'POST',body:fd});const data=await r.json();
-    if(!data.ok){out.innerHTML=`<div class="sd-banner warn"><span class="ico">⚠️</span><div>${esc(data.error||'execution failed')}</div></div>`;}
-    else{_selected[store]=data.data||[];out.innerHTML=renderTable(data.data||[]);}
-  }catch(e){out.innerHTML=`<div class="sd-banner warn"><span class="ico">⚠️</span><div>${esc(e.message)}</div></div>`;}
-  finally{busy(btn,false);}
-}
-
-function renderTable(rows){
-  if(!rows||!rows.length)return '<p class="meta">No rows returned.</p>';
-  const cols=Object.keys(rows[0]);
-  return `<div style="overflow:auto;max-height:280px;border:1px solid var(--border);border-radius:8px"><table class="table" style="margin:0">
-    <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead>
-    <tbody>${rows.slice(0,200).map(row=>`<tr>${cols.map(c=>`<td>${esc(row[c])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-    <p class="meta" style="margin-top:4px">${rows.length} row(s)${rows.length>200?' (showing 200)':''}</p>`;
-}
-
-async function genViz(btn,question,sql,outId,vizStore,rowStore){
-  const out=document.getElementById(outId);busy(btn,true,'Generating');
-  try{const fd=new URLSearchParams({question,sql,...cfg()});
-    const r=await fetch('/sql-dev/visualization',{method:'POST',body:fd});const data=await r.json();
-    const tbl=_selected[rowStore]?renderTable(_selected[rowStore]):'';
-    if(!data.ok){out.innerHTML=tbl+`<div class="sd-banner warn"><span class="ico">⚠️</span><div>Visualization: ${esc(data.error||'failed')}</div></div>`;return;}
-    const vizes=data.visualizations||[];
-    _selected[vizStore]=vizes.find(v=>v.chart_type!=='table')||vizes[0]||null;
-    const canvasId=outId+'-cv';
-    out.innerHTML=tbl+`<div class="meta" style="margin-top:6px">📊 ${vizes.length} visualization(s) generated.</div>`+
-      (_selected[rowStore]&&_selected[vizStore]?`<div style="height:300px;margin-top:8px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px"><canvas id="${canvasId}"></canvas></div>`:'<p class="meta">▶ Execute the SQL first to chart its data.</p>');
-    if(_selected[rowStore]&&_selected[vizStore])drawChart(canvasId,_selected[rowStore],_selected[vizStore]);
-  }catch(e){out.innerHTML=`<div class="sd-banner warn"><span class="ico">⚠️</span><div>${esc(e.message)}</div></div>`;}
-  finally{busy(btn,false);}
-}
-
-function drawChart(canvasId,rows,viz){
-  const cv=document.getElementById(canvasId);if(!cv)return;
-  const c=viz.chart_config||{},xs=(c.x_axis?.columns)||[],ys=(c.y_axis?.columns)||[];
-  if(viz.chart_type==='table'||!xs.length||!ys.length){cv.parentElement.innerHTML='<p class="meta">Table/unsupported viz — see results above.</p>';return;}
-  const labels=rows.map(r=>r[xs[0]]??'');
-  const palette=['#2563eb','#d97706','#059669','#7c3aed','#db2777','#0891b2'];
-  const ds=ys.map((col,i)=>({label:col,data:rows.map(r=>r[col]??0),
-    backgroundColor:(c.colors&&c.colors[i])||palette[i%palette.length],
-    borderColor:(c.colors&&c.colors[i])||palette[i%palette.length],borderWidth:2,fill:viz.chart_type==='line'?false:true}));
-  new Chart(cv.getContext('2d'),{type:viz.chart_type==='line'?'line':(viz.chart_type==='pie'?'pie':'bar'),
-    data:{labels,datasets:ds},options:{maintainAspectRatio:false,plugins:{legend:{position:'bottom'},title:{display:!!viz.chart_title,text:viz.chart_title||''}}}});
-}
-
-function activeViz(){return _selected._devViz||_selected._llmViz||{};}
-
 async function saveDraft(ev){
   if(!editable()){SQA.toast('Only not-verified / user-visit queries are editable.','error');return;}
   const btn=ev.currentTarget;busy(btn,true,'Saving');
   try{const org=document.getElementById('sd-org').value;
     const fd=new URLSearchParams({org_id:org,query_id:_selected.id,natural_language_query:_selected.natural_language_query,
-      dev_sql_query:_selected.corrected_sql,visualization:JSON.stringify(activeViz()),...cfg()});
+      dev_sql_query:_selected.corrected_sql,...cfg()});
     const r=await fetch('/sql-dev/save-draft',{method:'POST',body:fd});const d=await r.json();
     if(d.ok)SQA.toast('Draft saved. You can approve now.','success');else SQA.toast('Save failed: '+(d.error||''),'error');
   }catch(e){SQA.toast(e.message,'error');}finally{busy(btn,false);}
@@ -364,7 +297,7 @@ async function approve(ev){
   const btn=ev.currentTarget;busy(btn,true,'Approving');
   try{const org=document.getElementById('sd-org').value;
     const fd=new URLSearchParams({org_id:org,query_id:_selected.id,natural_language_query:_selected.natural_language_query,
-      sql_query:_selected.corrected_sql||_selected.sql_query,visualization:JSON.stringify(activeViz()),
+      sql_query:_selected.corrected_sql||_selected.sql_query,
       query_category:'default',user_id:CURRENT_USER_ID||'-1',...cfg()});
     const r=await fetch('/sql-dev/approve',{method:'POST',body:fd});const d=await r.json();
     if(d.ok){SQA.toast('Approved into the trained set!','success');loadFeedback();}

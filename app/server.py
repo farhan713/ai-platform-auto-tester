@@ -2132,35 +2132,6 @@ def sql_dev_feedback():
         return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
 
 
-@app.route("/sql-dev/visualization", methods=["POST"])
-@auth.login_required
-def sql_dev_visualization():
-    """POST generate_visualization {question, sql} -> visualization configs."""
-    import requests
-    question = (request.form.get("question") or "").strip()
-    sql = (request.form.get("sql") or "").strip()
-    if not question or not sql:
-        return jsonify({"ok": False, "error": "question and sql are required"}), 400
-    base = _sqldev_console_base()
-    try:
-        r = requests.post(f"{base}/sql_agent/generate_visualization",
-                          json={"question": question, "sql": sql},
-                          headers={**_sqldev_headers(), "Content-Type": "application/json"},
-                          timeout=120)
-        try:
-            body = r.json()
-        except Exception:
-            body = {}
-        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
-              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
-        viz = (((body.get("responseBody") or {}).get("data") or {}).get("visualizations")) or [] if isinstance(body, dict) else []
-        return jsonify({"ok": ok, "status_code": r.status_code,
-                        "visualizations": viz,
-                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else "viz failed")})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
-
-
 @app.route("/sql-dev/save-draft", methods=["POST"])
 @auth.login_required
 def sql_dev_save_draft():
@@ -2234,45 +2205,6 @@ def sql_dev_approve():
                         "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else f"HTTP {r.status_code}")})
     except Exception as e:
         return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
-
-
-@app.route("/sql-dev/execute", methods=["POST"])
-@auth.login_required
-def sql_dev_execute():
-    """Proxy a SQL execution to a tenant's /backoffice/report/run-sql. Needs a
-    tenant_url (the backoffice origin). The tenant may require a session; if so
-    the call will fail and we surface that — execution is a verification aid,
-    the review/approve workflow does not depend on it."""
-    import requests
-    sql = (request.form.get("sql") or "").strip()
-    tenant_url = (request.form.get("tenant_url") or "").strip().rstrip("/")
-    if not sql:
-        return jsonify({"ok": False, "error": "sql is required"}), 400
-    if not tenant_url:
-        return jsonify({"ok": False, "error": "Provide the tenant backoffice URL (Advanced) to execute SQL."}), 400
-    if sql.endswith(";"):
-        sql = sql[:-1]
-    payload = {
-        "action": "Search", "application": None, "attributes": [],
-        "buttonType": "StandardBTN", "sql": sql, "id": -1, "message": None,
-        "screenName": "CustomerCatList1", "screenType": "1", "status": "SUCCESS",
-        "targetScreenName": "MainScreen", "targetScreenType": "7",
-        "dataTables": None, "components": [], "data": [{"sql": sql}],
-    }
-    run_url = f"{tenant_url}/backoffice/report/run-sql"
-    try:
-        r = requests.post(run_url, data={"json": json.dumps(payload)},
-                          headers={"Content-Type": "application/x-www-form-urlencoded"},
-                          timeout=120, verify=False)
-        try: body = r.json()
-        except Exception: body = (r.text or "")[:20000]
-        rows = body.get("data") if isinstance(body, dict) else None
-        ok = 200 <= r.status_code < 300 and isinstance(rows, list)
-        return jsonify({"ok": ok, "status_code": r.status_code, "url": run_url,
-                        "data": rows if ok else None,
-                        "error": None if ok else (body.get("message") if isinstance(body, dict) else "execution failed or needs a tenant session")})
-    except Exception as e:
-        return jsonify({"ok": False, "url": run_url, "error": f"{type(e).__name__}: {e}"}), 502
 
 
 def _sqldev_demo_feedback() -> dict[str, Any]:
