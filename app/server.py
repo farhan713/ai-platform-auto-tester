@@ -69,12 +69,36 @@ _db_ready = False
 _db_lock = threading.Lock()
 
 
+def _reconcile_orphaned_runs() -> None:
+    """Mark runs left 'running'/'queued' by a previous container as failed.
+
+    Runs execute in an in-process background thread. When the container is
+    replaced (redeploy) or crashes, those threads die but the DB rows stay
+    'running' forever and the Stop button can't reach the (gone) thread.
+    Because the app runs as a single replica (maxReplicas=1), any row still
+    'running' or 'queued' at startup is by definition orphaned — no live
+    thread exists for it. Flip them to 'failed' so they stop spinning and
+    the user can re-run.
+    """
+    try:
+        db.execute(
+            "UPDATE runs SET status = 'failed', finished_at = NOW(), "
+            "    error = COALESCE(error, 'Interrupted by a server restart/redeploy "
+            "(the run thread did not survive). Please start the run again.') "
+            "WHERE status IN ('running', 'queued')"
+        )
+        print("[startup] reconciled orphaned runs (running/queued -> failed)", flush=True)
+    except Exception as e:
+        print(f"[startup] orphan reconciliation failed: {e}", flush=True)
+
+
 def _ensure_db_ready() -> None:
     global _db_ready
     if _db_ready: return
     with _db_lock:
         if _db_ready: return
         db.init_schema()
+        _reconcile_orphaned_runs()
         _db_ready = True
 
 
@@ -163,6 +187,12 @@ def _job_dir(run_id: str) -> Path:
 # Per-job in-memory event queues + stop flags
 _event_queues: dict[str, queue.Queue[str]] = {}
 _stop_events: dict[str, threading.Event] = {}
+# run_ids that have a LIVE runner thread in THIS process. Used to tell a
+# genuinely-running run (whose Stop event a thread will consume) apart from
+# an orphaned run left 'running' in the DB by a previous container that was
+# killed on redeploy/restart. A run not in this set has no live thread.
+_active_run_ids: set[str] = set()
+_active_run_lock = threading.Lock()
 
 # Global concurrency cap. Each active run holds an open Playwright Chromium
 # (~600 MB - 1 GB resident with the SQL Agent SPA loaded) plus the Python
@@ -856,6 +886,10 @@ def _run_job(run_id: str, cfg: RunConfig) -> None:
     by the /jobs POST handler so it shows up in the dashboard immediately,
     just without a started_at timestamp until the slot opens.
     """
+    # Mark this run as having a live thread in THIS process. The Stop handler
+    # uses this to distinguish a genuinely-running run from an orphaned one.
+    with _active_run_lock:
+        _active_run_ids.add(run_id)
     # Surface "waiting for slot" feedback to the user — the run page is
     # already loaded and listening on /events when this thread starts.
     waiting_emitted = False
@@ -949,6 +983,8 @@ def _run_job(run_id: str, cfg: RunConfig) -> None:
             _run_slot_semaphore.release()
         except ValueError:
             pass
+        with _active_run_lock:
+            _active_run_ids.discard(run_id)
         _emit(run_id, "[__end__]")
 
 
@@ -2333,13 +2369,39 @@ def job_events(job_id: str):
 @app.route("/jobs/<job_id>/stop", methods=["POST"])
 @auth.login_required
 def job_stop(job_id: str):
-    if not _run_owned_by_current_user(job_id): abort(404)
-    ev = _stop_events.get(job_id)
-    if ev is None:
-        ev = threading.Event(); _stop_events[job_id] = ev
-    ev.set()
-    _emit(job_id, "[stop] user requested stop")
-    return jsonify({"ok": True, "stop_requested": True})
+    run = _run_owned_by_current_user(job_id)
+    if not run: abort(404)
+
+    # If a live runner thread owns this run in THIS process, signal it to
+    # stop gracefully (it finishes the current step, then exits + updates DB).
+    with _active_run_lock:
+        is_live = job_id in _active_run_ids
+    if is_live:
+        ev = _stop_events.get(job_id)
+        if ev is None:
+            ev = threading.Event(); _stop_events[job_id] = ev
+        ev.set()
+        _emit(job_id, "[stop] user requested stop")
+        return jsonify({"ok": True, "stop_requested": True, "mode": "live"})
+
+    # No live thread — the run is orphaned (its container was replaced on a
+    # redeploy/restart). The event mechanism can't reach a thread that no
+    # longer exists, so mark the run stopped directly in the DB so the UI
+    # stops showing it as 'running'.
+    if run["status"] in ("running", "queued"):
+        db.execute(
+            "UPDATE runs SET status = 'stopped', finished_at = NOW(), "
+            "    error = COALESCE(error, 'Stopped by user — the original run "
+            "thread was no longer active (server had restarted).') "
+            "WHERE id = %s AND user_id = %s",
+            (job_id, auth.current_user_id()),
+        )
+        _emit(job_id, "[stop] run was orphaned by a restart — marked stopped")
+        return jsonify({"ok": True, "stop_requested": True, "mode": "orphaned-cleared"})
+
+    # Already finished — nothing to do.
+    return jsonify({"ok": True, "stop_requested": False, "mode": "already-final",
+                    "status": run["status"]})
 
 
 @app.route("/jobs/<job_id>/result/<int:qid>")
