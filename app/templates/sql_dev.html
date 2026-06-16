@@ -54,11 +54,15 @@
   .sd-section{margin-top:18px}
   .sd-section .head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
   .sd-section .head h3{margin:0;font-size:13px;font-weight:700;display:flex;align-items:center;gap:7px;color:var(--text)}
-  .sd-sqlbox{background:var(--code-bg);color:#e2e8f0;border-radius:10px;padding:12px 14px;font-family:var(--font-mono);font-size:12px;
-    line-height:1.5;max-height:170px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-  .sd-editor{width:100%;border:1px solid var(--border-strong);border-radius:10px;background:var(--code-bg);color:#e2e8f0;
-    font-family:var(--font-mono);font-size:12px;line-height:1.5;padding:12px 14px;resize:vertical}
-  .sd-editor:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+  /* Always-dark code surfaces so the SQL is readable in both light & dark themes */
+  .sd-sqlbox{background:#0f172a;color:#e2e8f0;border:1px solid #1e293b;border-radius:10px;padding:12px 14px;font-family:var(--font-mono);
+    font-size:12.5px;line-height:1.55;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .sd-editor{width:100%;border:1px solid #334155;border-radius:10px;background:#0f172a;color:#e2e8f0;caret-color:#38bdf8;
+    font-family:var(--font-mono);font-size:12.5px;line-height:1.55;padding:12px 14px;resize:vertical}
+  .sd-editor:focus{outline:none;border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.25)}
+  .sd-editor::placeholder{color:#64748b}
+  .sd-feedback{background:rgba(212,154,0,.10);border:1px solid rgba(212,154,0,.35);border-radius:10px;padding:10px 14px;
+    font-size:13px;color:var(--text);line-height:1.5}
   .sd-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
   .sd-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:60px 20px;color:var(--text-muted);text-align:center}
   .sd-empty .big{font-size:40px;opacity:.5}
@@ -248,6 +252,22 @@ function selectRow(r){
   renderList();renderDetail();
 }
 
+// User's feedback / why they flagged the query. Only Not-Verified / Disliked
+// records carry a validation_comment; User Visits are just queries the user ran.
+function feedbackBlock(r){
+  if(r.status==='not_verified'){
+    const c=(r.validation_comment||'').trim();
+    const label=r.isDisliked?'👎 User disliked this result':'🚩 Flagged by user — needs review';
+    return `<div class="sd-section"><div class="head"><h3>💬 User feedback</h3></div>
+      ${c?`<div class="sd-feedback"><b>${label}.</b><br>${esc(c)}</div>`
+         :`<div class="sd-feedback">${label}. <span class="meta">No written comment was provided.</span></div>`}</div>`;
+  }
+  if(r.status==='user_visit')
+    return `<div class="sd-section"><div class="head"><h3>💬 User feedback</h3></div>
+      <p class="meta">This is a query a user ran (a "user visit") — there's no flag or comment attached. Review the SQL and approve it if it's correct.</p></div>`;
+  return '';
+}
+
 function renderDetail(){
   const r=_selected;if(!r)return;
   const ed=editable();
@@ -261,6 +281,8 @@ function renderDetail(){
     </div>
     <p style="margin:10px 0 2px;font-size:15px;font-weight:600">${esc(r.natural_language_query)}</p>
     <div class="sd-qmeta"><span>👤 ${esc(r.login_name||'—')}</span><span>🕑 ${esc(String(r.reported_date||'').slice(0,19).replace('T',' '))}</span></div>
+
+    ${feedbackBlock(r)}
 
     <div class="sd-section">
       <div class="head"><h3>🤖 LLM-generated SQL <span class="meta" style="font-weight:400">read-only</span></h3></div>
