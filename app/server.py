@@ -2017,11 +2017,17 @@ def insights_data():
 # generate a visualization, save a draft, and approve into the trained set.
 # Every call is proxied server-side to the celerantai SQL-Agent API.
 # ---------------------------------------------------------------------------
-SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com/sql_agent").rstrip("/")
+# Console ORIGIN (no /sql_agent suffix) — every route appends /sql_agent/...
+SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com").rstrip("/")
 
 
 def _sqldev_console_base() -> str:
-    return (request.values.get("console_url") or SQLDEV_API_BASE).strip().rstrip("/")
+    base = (request.values.get("console_url") or SQLDEV_API_BASE).strip().rstrip("/")
+    # Guard against a console_url that already includes /sql_agent (the routes
+    # append it), which would 404 with a doubled path.
+    if base.endswith("/sql_agent"):
+        base = base[: -len("/sql_agent")]
+    return base
 
 
 def _sqldev_headers() -> dict[str, str]:
