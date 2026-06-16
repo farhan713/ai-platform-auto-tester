@@ -2142,6 +2142,32 @@ def sql_dev_feedback():
         return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
 
 
+def _sqldev_result(status_code: int, body: Any) -> tuple[bool, str]:
+    """Interpret a validation_from_developer / validation_like response.
+
+    These write endpoints use a FLAT shape {message, data, datalist} — NOT
+    the {responseHeader, responseBody} wrapper the read endpoints use. We
+    accept either and return (ok, message). validation_like also returns
+    data.valid == false when the SQL fails schema validation.
+    """
+    if not isinstance(body, dict):
+        return (200 <= status_code < 300), (str(body)[:300] if body else f"HTTP {status_code}")
+    rh = body.get("responseHeader")
+    if isinstance(rh, dict):  # wrapped shape
+        return rh.get("message_type") == "Success", (rh.get("message") or "")
+    # flat shape
+    msg = (body.get("message") or "").strip()
+    data = body.get("data")
+    low = msg.lower()
+    failed = any(w in low for w in (
+        "issue", "error", "failed", "invalid", "please try again",
+        "could not", "unable", "not reference", "does not"))
+    if isinstance(data, dict) and data.get("valid") is False:
+        failed = True
+    ok = (200 <= status_code < 300) and not failed
+    return ok, (msg or ("ok" if ok else f"HTTP {status_code}"))
+
+
 @app.route("/sql-dev/save-draft", methods=["POST"])
 @auth.login_required
 def sql_dev_save_draft():
@@ -2169,10 +2195,9 @@ def sql_dev_save_draft():
                            timeout=60)
         try: body = r.json()
         except Exception: body = {}
-        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
-              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
+        ok, msg = _sqldev_result(r.status_code, body)
         return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
-                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else f"HTTP {r.status_code}")})
+                        "message": msg, "error": None if ok else msg})
     except Exception as e:
         return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
 
@@ -2209,10 +2234,9 @@ def sql_dev_approve():
                            timeout=60)
         try: body = r.json()
         except Exception: body = {}
-        ok = (200 <= r.status_code < 300 and isinstance(body, dict)
-              and (body.get("responseHeader", {}) or {}).get("message_type") == "Success")
+        ok, msg = _sqldev_result(r.status_code, body)
         return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
-                        "error": None if ok else ((body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else f"HTTP {r.status_code}")})
+                        "message": msg, "error": None if ok else msg})
     except Exception as e:
         return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
 
