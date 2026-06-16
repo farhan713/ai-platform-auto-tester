@@ -2036,7 +2036,10 @@ def _sqldev_transform_feedback(data: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten the feedback_data response into a single list of review rows,
     exactly like the Angular dashboard's loadFeedbackData()."""
     out: list[dict[str, Any]] = []
-    vh = (data.get("validated_history_examples") or {})
+    # The backend renamed this key validated_history_examples ->
+    # validated_sql_history_examples; accept both.
+    vh = (data.get("validated_sql_history_examples")
+          or data.get("validated_history_examples") or {})
     ex = (data.get("examples") or {})
     uv = (data.get("user_visit_history") or {})
 
@@ -2116,7 +2119,8 @@ def sql_dev_feedback():
             msg = (body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else None
             return jsonify({"ok": False, "status_code": r.status_code, "url": url,
                             "error": msg or f"feedback_data returned HTTP {r.status_code}"}), 502
-        vh = data.get("validated_history_examples") or {}
+        vh = (data.get("validated_sql_history_examples")
+              or data.get("validated_history_examples") or {})
         ex = data.get("examples") or {}
         uv = data.get("user_visit_history") or {}
         counts = {
