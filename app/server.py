@@ -1772,14 +1772,22 @@ def _fetch_orgs_history_parallel(
     with ThreadPoolExecutor(max_workers=_INSIGHTS_PARALLEL) as ex:
         out = list(ex.map(_one, orgs))
 
-    # Roll any per-org history errors up into the page-level error list (deduped)
-    # so the dashboard can show "history endpoint is currently failing".
-    seen_err: set[str] = set()
-    for o in out:
-        if o.get("error") and o["error"] not in seen_err:
-            seen_err.add(o["error"])
-    for e in seen_err:
-        errors.append(f"history: {e}")
+    # Summarize per-org failures into ONE concise line instead of dumping
+    # every org's full URL (which produced a wall of identical HTTP 500s).
+    failed = [o for o in out if o.get("error")]
+    if failed:
+        names = [o.get("name") or o.get("database_id") for o in failed]
+        # Pick a short representative reason (strip the long URL noise).
+        rep = ""
+        for o in failed:
+            e = str(o.get("error") or "")
+            if "500" in e:
+                rep = "HTTP 500 from the history endpoint"; break
+            rep = e.split(" for url")[0][:80]
+        shown = ", ".join(names[:6]) + (f" +{len(names) - 6} more" if len(names) > 6 else "")
+        errors.append(
+            f"{len(failed)} of {len(orgs)} organizations could not be fetched "
+            f"({rep}): {shown}")
 
     return out, errors
 

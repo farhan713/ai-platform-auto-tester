@@ -395,10 +395,15 @@ async function load(refresh = false) {
     if (r.errors && r.errors.length) {
       const noData = (r.totals.queries || 0) === 0;
       banner.style.display = '';
-      banner.innerHTML = (noData
-          ? '<b>No activity data returned.</b> The Celerant history endpoint reported an error for every organization — this is an upstream issue, not a problem with this page. '
-          : '<b>Partial data.</b> Some organizations could not be fetched. ')
-        + 'Details: ' + r.errors.map(esc).join(' · ');
+      // Keep it concise: a one-line headline + collapsible details — never a
+      // wall of repeated URLs.
+      const headline = noData
+        ? '<b>No activity data.</b> The Celerant history endpoint is currently failing for every organization (upstream issue, not this page).'
+        : `<b>Showing data for ${fmtN(r.totals.orgs_with_activity || 0)} organization(s).</b> Some couldn’t be fetched (these are the short-code test orgs the upstream endpoint is still failing on).`;
+      const details = r.errors.map(esc).join('<br>');
+      banner.innerHTML = headline +
+        ` <details style="margin-top:6px"><summary class="meta" style="cursor:pointer">Details</summary>` +
+        `<div class="meta" style="margin-top:4px; white-space:normal">${details}</div></details>`;
     } else {
       banner.style.display = 'none';
     }
