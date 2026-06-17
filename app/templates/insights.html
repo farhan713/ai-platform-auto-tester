@@ -4,8 +4,34 @@
 {% block header_sub %}— Cross-organization activity dashboard{% endblock %}
 
 {% block content %}
+<style>
+  .ins-orgfilter{position:relative}
+  .ins-orgbtn{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--border-strong);border-radius:8px;
+    background:var(--surface);cursor:pointer;font-size:13px;font-weight:600;min-width:200px;justify-content:space-between}
+  .ins-orgbtn:hover{border-color:var(--brand-2)}
+  .ins-orgpanel{position:absolute;z-index:30;top:calc(100% + 4px);left:0;width:320px;max-height:360px;overflow:auto;
+    background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-md);padding:8px}
+  .ins-orgpanel .row{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;cursor:pointer}
+  .ins-orgpanel .row:hover{background:var(--code-bg)}
+  .ins-orgpanel .tools{display:flex;gap:6px;margin-bottom:6px}
+  .ins-orgpanel .tools input{flex:1;padding:6px 8px;font-size:13px}
+</style>
 <div class="card insights-control">
   <div class="ic-row">
+    <div class="ic-field ins-orgfilter" style="flex:0 0 auto">
+      <span class="label-text">Organizations</span>
+      <button type="button" class="ins-orgbtn" id="ins-org-btn">
+        <span id="ins-org-label">All organizations</span><span>▾</span>
+      </button>
+      <div class="ins-orgpanel" id="ins-org-panel" style="display:none">
+        <div class="tools">
+          <input type="text" id="ins-org-search" placeholder="Filter…">
+          <button type="button" class="btn btn-sm" id="ins-org-all">All</button>
+          <button type="button" class="btn btn-sm" id="ins-org-none">Clear</button>
+        </div>
+        <div id="ins-org-list"><span class="meta">Loading…</span></div>
+      </div>
+    </div>
     <label class="ic-field">
       <span class="label-text">From</span>
       <input type="date" id="ins-from">
@@ -82,7 +108,11 @@
 
 <!-- Heatmap -->
 <div class="card">
-  <div class="card-head"><h2>Activity heatmap</h2><span class="meta">hour-of-day · UTC, weekdays Monday → Sunday</span></div>
+  <div class="card-head"><h2>When are queries run?</h2><span class="meta" id="hm-summary"></span></div>
+  <p class="meta" style="margin:0 0 10px">
+    Each cell is one hour of one weekday (times in UTC). <b>Darker = more queries</b> ran in that slot —
+    so the dark patches show your busy hours. Hover a cell for the exact count.
+  </p>
   <div id="heatmap-wrap"></div>
 </div>
 
@@ -145,6 +175,42 @@ const metaEl   = document.getElementById('ins-meta');
 
 let _charts = {};            // chart.js instances we can destroy() before re-rendering
 let _lastData = null;
+
+// ---- Org filter ----
+let _allOrgs = [];                  // [{name, database_id}]
+const _selectedOrgs = new Set();    // selected database_ids; empty = ALL
+let _orgSearch = '';
+
+async function loadOrgFilter() {
+  try {
+    const qs = new URLSearchParams({ console_url: consoleEl.value.trim(), bearer_token: bearerEl.value.trim() });
+    const r = await SQA.fetchJSON('/activity-logs/orgs?' + qs.toString());
+    _allOrgs = (r && r.ok && r.orgs) ? r.orgs : [];
+  } catch (e) { _allOrgs = []; }
+  renderOrgList();
+}
+function renderOrgList() {
+  const wrap = document.getElementById('ins-org-list');
+  const term = _orgSearch.toLowerCase();
+  const vis = _allOrgs.filter(o => !term || (o.name||'').toLowerCase().includes(term) || (o.database_id||'').toLowerCase().includes(term));
+  if (!vis.length) { wrap.innerHTML = '<span class="meta" style="padding:6px">No organizations.</span>'; return; }
+  wrap.innerHTML = vis.map(o => `<label class="row">
+    <input type="checkbox" class="ins-org-cb" value="${esc(o.database_id)}" ${_selectedOrgs.has(o.database_id)?'checked':''}>
+    <span>${esc(o.name)}</span></label>`).join('');
+  wrap.querySelectorAll('.ins-org-cb').forEach(cb => cb.addEventListener('change', () => {
+    if (cb.checked) _selectedOrgs.add(cb.value); else _selectedOrgs.delete(cb.value);
+    updateOrgLabel();
+  }));
+}
+function updateOrgLabel() {
+  const lbl = document.getElementById('ins-org-label');
+  const n = _selectedOrgs.size;
+  if (n === 0) { lbl.textContent = 'All organizations'; }
+  else if (n === 1) {
+    const o = _allOrgs.find(x => _selectedOrgs.has(x.database_id));
+    lbl.textContent = o ? o.name : '1 organization';
+  } else { lbl.textContent = `${n} organizations`; }
+}
 
 // Default: last 7 days through today.
 (function() {
@@ -311,30 +377,46 @@ function renderTopUsers(rows) {
 function renderHeatmap(matrix) {
   const wrap = document.getElementById('heatmap-wrap');
   const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  // Find max so we can normalise colour.
-  let max = 0;
-  for (const row of matrix) for (const v of row) if (v > max) max = v;
-  const c = themeColours();
-  // Build hour header
-  let hdr = '<div class="hm-row"><div class="hm-axis"></div>';
-  for (let h = 0; h < 24; h++) {
-    hdr += `<div class="hm-cell hm-head">${h.toString().padStart(2,'0')}</div>`;
+  // Find max + busiest slot.
+  let max = 0, bestD = -1, bestH = -1, total = 0;
+  for (let d = 0; d < 7; d++) for (let h = 0; h < 24; h++) {
+    const v = (matrix[d] && matrix[d][h]) || 0; total += v;
+    if (v > max) { max = v; bestD = d; bestH = h; }
   }
+  // Busiest-slot summary in the card header.
+  const sum = document.getElementById('hm-summary');
+  if (sum) sum.textContent = max > 0
+    ? `Busiest: ${DAYS[bestD]} ${String(bestH).padStart(2,'0')}:00 (${max} queries)`
+    : 'No activity in this window';
+
+  // Header row: hours 0–23
+  let hdr = '<div class="hm-row"><div class="hm-axis"></div>';
+  for (let h = 0; h < 24; h++) hdr += `<div class="hm-cell hm-head">${h.toString().padStart(2,'0')}</div>`;
   hdr += '</div>';
   let html = '<div class="hm-grid">' + hdr;
   for (let d = 0; d < 7; d++) {
     html += `<div class="hm-row"><div class="hm-axis">${DAYS[d]}</div>`;
     for (let h = 0; h < 24; h++) {
-      const v = matrix[d][h] || 0;
+      const v = (matrix[d] && matrix[d][h]) || 0;
       const intensity = max ? v / max : 0;
-      // 0 -> #f1f5f9, 1 -> brand colour
-      const a = intensity === 0 ? 0 : 0.10 + intensity * 0.85;
+      const a = intensity === 0 ? 0 : 0.12 + intensity * 0.85;
       const bg = `rgba(13, 148, 136, ${a.toFixed(2)})`;
-      html += `<div class="hm-cell" style="background:${bg}" title="${DAYS[d]} ${h.toString().padStart(2,'0')}:00 — ${v}"><span class="hm-val">${v||''}</span></div>`;
+      const txtCol = intensity > 0.55 ? '#fff' : 'inherit';
+      html += `<div class="hm-cell" style="background:${bg}" title="${DAYS[d]} ${h.toString().padStart(2,'0')}:00 UTC — ${v} quer${v===1?'y':'ies'}"><span class="hm-val" style="color:${txtCol}">${v||''}</span></div>`;
     }
     html += '</div>';
   }
   html += '</div>';
+  // Axis caption + legend
+  html += `<div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; flex-wrap:wrap; gap:8px">
+    <span class="meta">← hour of day (00–23 UTC) →&nbsp;&nbsp;•&nbsp;&nbsp;rows = day of week</span>
+    <span class="meta" style="display:inline-flex; align-items:center; gap:6px">
+      fewer
+      <span style="display:inline-flex; gap:2px">
+        ${[0.12,0.35,0.55,0.78,0.97].map(a=>`<span style="width:16px;height:12px;border-radius:2px;background:rgba(13,148,136,${a})"></span>`).join('')}
+      </span>
+      more</span>
+  </div>`;
   wrap.innerHTML = html;
 }
 
@@ -383,6 +465,7 @@ async function load(refresh = false) {
       from_date: fromEl.value, to_date: toEl.value,
       console_url: consoleEl.value, bearer_token: bearerEl.value,
     });
+    if (_selectedOrgs.size) params.set('org_ids', Array.from(_selectedOrgs).join(','));
     if (refresh) params.set('refresh', '1');
     const r = await SQA.fetchJSON(`/insights/data?${params.toString()}`);
     if (!r.ok) throw new Error(r.error || 'Failed to load');
@@ -430,6 +513,36 @@ async function load(refresh = false) {
 
 applyBtn.addEventListener('click', () => load(false));
 refreshBtn.addEventListener('click', () => load(true));
+
+// ---- Org filter wiring ----
+const orgBtn = document.getElementById('ins-org-btn');
+const orgPanel = document.getElementById('ins-org-panel');
+let _orgSnapshot = '';   // selection when the panel last opened
+function closeOrgPanel() {
+  if (orgPanel.style.display === 'none') return;
+  orgPanel.style.display = 'none';
+  const snap = Array.from(_selectedOrgs).sort().join(',');
+  if (snap !== _orgSnapshot) { _orgSnapshot = snap; load(false); }   // reload only if changed
+}
+orgBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (orgPanel.style.display === 'none') {
+    _orgSnapshot = Array.from(_selectedOrgs).sort().join(',');
+    orgPanel.style.display = 'block';
+  } else { closeOrgPanel(); }
+});
+document.addEventListener('click', (e) => {
+  if (!orgPanel.contains(e.target) && e.target !== orgBtn) closeOrgPanel();
+});
+document.getElementById('ins-org-search').addEventListener('input', (e) => { _orgSearch = e.target.value; renderOrgList(); });
+document.getElementById('ins-org-all').addEventListener('click', () => {
+  const term = _orgSearch.toLowerCase();
+  _allOrgs.filter(o => !term || (o.name||'').toLowerCase().includes(term)).forEach(o => _selectedOrgs.add(o.database_id));
+  renderOrgList(); updateOrgLabel();
+});
+document.getElementById('ins-org-none').addEventListener('click', () => { _selectedOrgs.clear(); renderOrgList(); updateOrgLabel(); });
+
+loadOrgFilter();
 load(false);
 </script>
 {% endblock %}

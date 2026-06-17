@@ -1716,9 +1716,11 @@ _INSIGHTS_PARALLEL = 10          # concurrent org fetches
 
 def _fetch_orgs_history_parallel(
     from_iso: str, to_iso: str, console: str, bearer: str = "",
+    only_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Returns (orgs_with_records, errors). Each org dict carries
-    name + database_id + records[] from history_data."""
+    name + database_id + records[] from history_data. If only_ids is given,
+    fetch history for just those org ids (the dashboard org filter)."""
     import requests
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1735,6 +1737,14 @@ def _fetch_orgs_history_parallel(
     if not orgs:
         errors.append("all_orgs returned no usable organizations")
         return [], errors
+
+    # Org filter — restrict to the selected ids if provided.
+    if only_ids:
+        want = set(only_ids)
+        orgs = [o for o in orgs if o["id"] in want]
+        if not orgs:
+            errors.append("none of the selected organizations were found")
+            return [], errors
 
     base = f"{console}/sql_agent/history_data"
     from_mmddyyyy = _yyyy_mm_dd_to_mm_dd_yyyy(from_iso)
@@ -1994,8 +2004,10 @@ def insights_data():
     console = (request.args.get("console_url") or "https://celerantai.com").strip()
     bearer  = (request.args.get("bearer_token") or "").strip()
     refresh = (request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes")
+    # Optional org filter — comma/newline separated database_ids. Empty = all.
+    only_ids = [s.strip() for s in re.split(r"[,\n]", request.args.get("org_ids") or "") if s.strip()]
 
-    key = (from_iso, to_iso, console)
+    key = (from_iso, to_iso, console, tuple(sorted(only_ids)))
     now = time.time()
     if not refresh:
         with _insights_cache_lock:
@@ -2006,7 +2018,7 @@ def insights_data():
                             **cached["data"]})
 
     started = time.time()
-    orgs_data, errors = _fetch_orgs_history_parallel(from_iso, to_iso, console, bearer)
+    orgs_data, errors = _fetch_orgs_history_parallel(from_iso, to_iso, console, bearer, only_ids or None)
     if not orgs_data and errors:
         return jsonify({"ok": False, "error": "; ".join(errors)}), 502
     agg = _aggregate_insights(orgs_data)
