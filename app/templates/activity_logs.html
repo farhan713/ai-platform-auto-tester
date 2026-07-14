@@ -171,7 +171,7 @@ function rerenderAllTables() {
 }
 
 // ── CSV / Excel helpers ─────────────────────────────────────────────────────
-const EXPORT_HEADERS = ['Time (UTC)','Organization','User','User ID','Status','Question','Store ID'];
+const EXPORT_HEADERS = ['Time (UTC)','Organization','User','User ID','Status','Question'];
 
 function recordToRow(r, orgName) {
   return [
@@ -180,8 +180,7 @@ function recordToRow(r, orgName) {
     r.login_name || '',
     r.user_id || '',
     r.query_status || '',
-    r.natural_language_query || '',
-    r.store_id || ''
+    r.natural_language_query || ''
   ];
 }
 
@@ -287,10 +286,9 @@ function renderRecordsTable(org) {
       <td>${esc(r.login_name || '')}<br><span class="meta">${esc(r.user_id || '')}</span></td>
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
-      <td>${esc(r.store_id || '—')}</td>
     </tr>`).join('');
   return `<div style="overflow-x:auto"><table class="table">
-    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Question</th><th>Store ID</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Question</th></tr></thead>
     <tbody>${trs}</tbody>
   </table></div>`;
 }
