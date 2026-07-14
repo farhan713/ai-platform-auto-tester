@@ -150,7 +150,7 @@ function csvRow(cells) {
 }
 
 function buildCSV(orgs) {
-  const header = csvRow(['Time (UTC)','Organization','User','User ID','Status','Source','Question','Session','Seq']);
+  const header = csvRow(['Time (UTC)','Organization','User','User ID','Status','Source','Question','Store ID']);
   const lines = [header];
   for (const org of orgs) {
     if (!org.ok) continue;
@@ -164,8 +164,7 @@ function buildCSV(orgs) {
         r.query_status || '',
         r.llm_invoked === true ? 'LLM' : r.llm_invoked === false ? 'RAG' : '',
         r.natural_language_query || '',
-        r.session_id || '',
-        r.sequence_number != null ? r.sequence_number : ''
+        r.store_id || ''
       ]));
     }
   }
@@ -219,11 +218,10 @@ function renderRecordsTable(org) {
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${llmBadge(r.llm_invoked)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
-      <td><span class="meta">${esc(r.session_id || '')}</span></td>
-      <td style="text-align:right">${esc(r.sequence_number != null ? r.sequence_number : '')}</td>
+      <td>${esc(r.store_id || '—')}</td>
     </tr>`).join('');
   return `<div style="overflow-x:auto"><table class="table">
-    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Source</th><th>Question</th><th>Session</th><th style="text-align:right">Seq</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Source</th><th>Question</th><th>Store ID</th></tr></thead>
     <tbody>${trs}</tbody>
   </table></div>`;
 }
