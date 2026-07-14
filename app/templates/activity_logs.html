@@ -201,6 +201,8 @@ function csvRow(cells) {
   return cells.map(c => `"${(c == null ? '' : String(c)).replace(/"/g, '""')}"`).join(',');
 }
 
+function todayStr() { return new Date().toISOString().slice(0,10); }
+
 function downloadCSV(orgs, filename) {
   const rows = getExportRows(orgs);
   const lines = [csvRow(EXPORT_HEADERS), ...rows.map(csvRow)];
@@ -265,8 +267,8 @@ function renderTotals(t) {
       </div>
     </div>`;
   rerenderTotalsPills();
-  document.getElementById('al-dl-csv-all').addEventListener('click', () => downloadCSV(_orgByIdx, 'activity-logs.csv'));
-  document.getElementById('al-dl-xls-all').addEventListener('click', () => downloadExcel(_orgByIdx, 'activity-logs.xls'));
+  document.getElementById('al-dl-csv-all').addEventListener('click', () => downloadCSV(_orgByIdx, `activity-logs-${todayStr()}.csv`));
+  document.getElementById('al-dl-xls-all').addEventListener('click', () => downloadExcel(_orgByIdx, `activity-logs-${todayStr()}.xls`));
 }
 
 function renderRecordsTable(org) {
@@ -363,9 +365,9 @@ function renderResult(data) {
     }
     const safeName = () => orgLabel(org.org_id).replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const csvBtn = card.querySelector('.al-dl-csv');
-    if (csvBtn && org) csvBtn.addEventListener('click', () => downloadCSV([org], `activity-logs-${safeName()}.csv`));
+    if (csvBtn && org) csvBtn.addEventListener('click', () => downloadCSV([org], `${safeName()}-${todayStr()}.csv`));
     const xlsBtn = card.querySelector('.al-dl-xls');
-    if (xlsBtn && org) xlsBtn.addEventListener('click', () => downloadExcel([org], `activity-logs-${safeName()}.xls`));
+    if (xlsBtn && org) xlsBtn.addEventListener('click', () => downloadExcel([org], `${safeName()}-${todayStr()}.xls`));
   });
 }
 
