@@ -142,18 +142,63 @@ function statusBadgeFor(s){
   return badge('badge-soft', s);
 }
 
+function csvRow(cells) {
+  return cells.map(c => {
+    const s = (c == null ? '' : String(c)).replace(/"/g, '""');
+    return `"${s}"`;
+  }).join(',');
+}
+
+function buildCSV(orgs) {
+  const header = csvRow(['Time (UTC)','Organization','User','User ID','Status','Source','Question','Session','Seq']);
+  const lines = [header];
+  for (const org of orgs) {
+    if (!org.ok) continue;
+    const name = orgLabel(org.org_id);
+    for (const r of (org.records || [])) {
+      lines.push(csvRow([
+        r.created_at || '',
+        name,
+        r.login_name || '',
+        r.user_id || '',
+        r.query_status || '',
+        r.llm_invoked === true ? 'LLM' : r.llm_invoked === false ? 'RAG' : '',
+        r.natural_language_query || '',
+        r.session_id || '',
+        r.sequence_number != null ? r.sequence_number : ''
+      ]));
+    }
+  }
+  return lines.join('\r\n');
+}
+
+function downloadCSV(orgs, filename) {
+  const csv = buildCSV(orgs);
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
 function renderTotals(t) {
   totalsEl.innerHTML = `
     <div class="card">
-      <div class="counts" style="display:flex; gap:18px; flex-wrap:wrap">
-        <span class="count-pill">Organizations<b>${t.orgs}</b></span>
-        <span class="count-pill">Total queries<b>${t.queries}</b></span>
-        <span class="count-pill PARTIAL">LLM<b>${t.llm}</b></span>
-        <span class="count-pill">RAG<b>${t.rag}</b></span>
-        <span class="count-pill PASS">Complete<b>${t.complete}</b></span>
-        <span class="count-pill FAIL">Failed<b>${t.failed}</b></span>
+      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+        <div class="counts" style="display:flex; gap:18px; flex-wrap:wrap">
+          <span class="count-pill">Organizations<b>${t.orgs}</b></span>
+          <span class="count-pill">Total queries<b>${t.queries}</b></span>
+          <span class="count-pill PARTIAL">LLM<b>${t.llm}</b></span>
+          <span class="count-pill">RAG<b>${t.rag}</b></span>
+          <span class="count-pill PASS">Complete<b>${t.complete}</b></span>
+          <span class="count-pill FAIL">Failed<b>${t.failed}</b></span>
+        </div>
+        <button class="btn btn-sm" id="al-download-all" style="white-space:nowrap">⬇ Download CSV</button>
       </div>
     </div>`;
+  document.getElementById('al-download-all').addEventListener('click', () => {
+    downloadCSV(_orgByIdx, 'activity-logs-all.csv');
+  });
 }
 
 function renderRecordsTable(org) {
@@ -203,7 +248,10 @@ function renderOrg(org, idx) {
   return `<div class="card" data-org-idx="${idx}">
     <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
       ${header}
-      <span class="meta">Records: <b>${total}</b>${org.history_count != null && org.history_count !== total ? ` · history_count ${org.history_count}` : ''}</span>
+      <div style="display:flex; align-items:center; gap:12px">
+        <span class="meta">Records: <b>${total}</b>${org.history_count != null && org.history_count !== total ? ` · history_count ${org.history_count}` : ''}</span>
+        <button class="btn btn-sm al-dl-org" data-org-idx="${idx}" style="white-space:nowrap">⬇ CSV</button>
+      </div>
     </div>
     <div class="counts" style="display:flex; gap:14px; flex-wrap:wrap; margin:10px 0">
       <span class="count-pill PARTIAL">LLM<b>${s.llm} · ${pct(llmPct)}</b></span>
@@ -233,7 +281,7 @@ function renderResult(data) {
   renderTotals(data.totals);
   _orgByIdx = data.organizations.slice();
   orgsEl.innerHTML = _orgByIdx.map((o, i) => renderOrg(o, i)).join('');
-  // Wire up per-org filter inputs.
+  // Wire up per-org filter inputs and download buttons.
   orgsEl.querySelectorAll('[data-org-idx]').forEach(card => {
     const idx = parseInt(card.getAttribute('data-org-idx'), 10);
     const org = _orgByIdx[idx];
@@ -243,6 +291,13 @@ function renderResult(data) {
       input.addEventListener('input', () => {
         _filters[org.org_id] = input.value;
         recordsDiv.innerHTML = renderRecordsTable(org);
+      });
+    }
+    const dlBtn = card.querySelector('.al-dl-org');
+    if (dlBtn && org) {
+      dlBtn.addEventListener('click', () => {
+        const safeName = orgLabel(org.org_id).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        downloadCSV([org], `activity-logs-${safeName}.csv`);
       });
     }
   });
