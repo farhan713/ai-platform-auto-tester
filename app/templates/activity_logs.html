@@ -283,7 +283,7 @@ function renderRecordsTable(org) {
   const trs = rows.map(r => `
     <tr>
       <td>${shortDate(r.created_at)}</td>
-      <td>${esc(r.login_name || '')}<br><span class="meta">${esc(r.user_id || '')}</span></td>
+      <td>${esc(r.login_name || '')}</td>
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
     </tr>`).join('');
