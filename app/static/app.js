@@ -2,12 +2,17 @@
 // Exposes window.SQA = { toast, escapeHtml, fetchJSON }.
 
 (function () {
+  // ---- Icons (symbols live in templates/_icons.svg, inlined by base.html) ---
+  function icon(name, cls) {
+    return `<svg class="i${cls ? ' ' + cls : ''}" aria-hidden="true" focusable="false"><use href="#i-${name}"></use></svg>`;
+  }
+
   // ---- Theme toggle (persisted to localStorage) -----------------------------
   const themeBtn = document.getElementById('theme-toggle');
   const themeIcon = document.getElementById('theme-icon');
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
-    if (themeIcon) themeIcon.textContent = t === 'dark' ? '☀' : '🌙';
+    if (themeIcon) themeIcon.innerHTML = icon(t === 'dark' ? 'sun' : 'moon');
   }
   applyTheme(localStorage.getItem('skylar.theme') || 'light');
   if (themeBtn) {
@@ -24,8 +29,12 @@
     const c = document.getElementById('toasts');
     if (!c) return;
     const el = document.createElement('div');
-    el.className = 'toast ' + (kind || 'info');
-    el.textContent = msg;
+    const k = kind || 'info';
+    el.className = 'toast ' + k;
+    el.innerHTML = icon({ success: 'check-circle', error: 'warning-circle' }[k] || 'info', 'toast-ico');
+    const text = document.createElement('span');
+    text.textContent = msg;
+    el.appendChild(text);
     c.appendChild(el);
     setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 4500);
   }
@@ -84,5 +93,5 @@
   }
   document.addEventListener('DOMContentLoaded', () => initTabs());
 
-  window.SQA = { toast, escapeHtml, fetchJSON, fmtDuration, fmtDate, initTabs };
+  window.SQA = { toast, escapeHtml, fetchJSON, fmtDuration, fmtDate, initTabs, icon };
 })();

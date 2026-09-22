@@ -11,10 +11,10 @@
       <label class="label-text">Test type <em>required</em></label>
       <div style="display:flex; gap:16px; margin-bottom:14px">
         <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
-          <input type="radio" name="test_type" value="sql_agent" id="tt-sql" checked> 🧠 SQL AI Engine
+          <input type="radio" name="test_type" value="sql_agent" id="tt-sql" checked> {{ icon('brain') }} SQL AI Engine
         </label>
         <label style="display:inline-flex; align-items:center; gap:6px; margin:0; font-weight:500">
-          <input type="radio" name="test_type" value="site_search" id="tt-search"> 🔎 Site Search
+          <input type="radio" name="test_type" value="site_search" id="tt-search"> {{ icon('magnifying-glass') }} Site Search
         </label>
       </div>
 
@@ -46,9 +46,9 @@
           <span class="label-text" id="label-login-url">Login URL <em>required</em></span>
           <input type="url" name="login_url" id="f-login_url" placeholder="https://&lt;host&gt;:8443/backoffice/?mid=100" required>
           <small id="hint-login-url">Full URL of the Celerant login page.</small>
-          <div id="file-url-warning" style="display:none; margin-top:6px; padding:8px 12px; background:#fff7e6; border-left:3px solid var(--partial); border-radius:4px; font-size:12px; color:#8a5a00; line-height:1.5">
-            ⚠ <b>file:// URLs cannot be reached from inside Docker.</b> Either deploy your page on a public URL, or run this from the page's folder:
-            <code style="display:block; margin:6px 0; padding:6px 10px; background:#fff; color:#222">python3 -m http.server 8765</code>
+          <div id="file-url-warning" style="display:none; margin-top:6px; padding:8px 12px; background:color-mix(in srgb, var(--partial) 9%, transparent); border:1px solid color-mix(in srgb, var(--partial) 32%, transparent); border-radius:8px; font-size:12px; color:var(--text); line-height:1.5">
+            {{ icon('warning') }} <b>file:// URLs cannot be reached from inside Docker.</b> Either deploy your page on a public URL, or run this from the page's folder:
+            <code style="display:block; margin:6px 0; padding:6px 10px; background:var(--surface); color:var(--text)">python3 -m http.server 8765</code>
             then use <code>http://host.docker.internal:8765/index.html</code> — or pick "Use uploaded bundle" above.
           </div>
         </label>
@@ -191,7 +191,7 @@
       </details>
 
       <div style="margin-top:18px; display:flex; gap:8px">
-        <button type="submit" class="btn btn-success">▶ Start QA Run</button>
+        <button type="submit" class="btn btn-success">{{ icon('play') }} Start QA Run</button>
         <a href="{{ url_for('dashboard') }}" class="btn btn-ghost">Cancel</a>
       </div>
     </form>

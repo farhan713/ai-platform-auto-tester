@@ -120,6 +120,15 @@ def inject_globals():
     return {"app_version": APP_VERSION, "active": "", "g": g}
 
 
+@app.template_global()
+def icon(name: str, cls: str = "") -> Any:
+    """Inline reference to a symbol in templates/_icons.svg (Phosphor, regular)."""
+    from markupsafe import Markup, escape
+    extra = f" {escape(cls)}" if cls else ""
+    return Markup(f'<svg class="i{extra}" aria-hidden="true" focusable="false">'
+                  f'<use href="#i-{escape(name)}"></use></svg>')
+
+
 # ---------------------------------------------------------------------------
 # Auth pages
 # ---------------------------------------------------------------------------

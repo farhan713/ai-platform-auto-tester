@@ -68,16 +68,16 @@ function renderGroups(groups) {
     const rows = (g.variants || []).map(v => {
       // Exact (literal) match
       const exactCell = v.matches_original
-        ? '<span class="badge PASS">✓ exact</span>'
-        : '<span class="badge badge-soft">✗ differs</span>';
+        ? '<span class="badge PASS">' + SQA.icon('check') + ' exact</span>'
+        : '<span class="badge badge-soft">' + SQA.icon('x') + ' differs</span>';
       // Semantic equivalence (the meaningful verdict)
       let eqCell;
       if (!g.original_has_sql) {
         eqCell = '<span class="meta">—</span>';
       } else if (v.equivalent === true) {
-        eqCell = `<span class="badge PASS" title="${esc(v.equivalent_reason)}">✓ equivalent</span>`;
+        eqCell = `<span class="badge PASS" title="${esc(v.equivalent_reason)}">${SQA.icon('check')} equivalent</span>`;
       } else if (v.equivalent === false) {
-        eqCell = `<span class="badge FAIL" title="${esc(v.equivalent_reason)}">✗ ${esc(v.equivalent_reason)}</span>`;
+        eqCell = `<span class="badge FAIL" title="${esc(v.equivalent_reason)}">${SQA.icon('x')} ${esc(v.equivalent_reason)}</span>`;
       } else {
         eqCell = '<span class="meta">—</span>';
       }

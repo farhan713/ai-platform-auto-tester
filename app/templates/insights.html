@@ -7,12 +7,14 @@
 <style>
   .ins-orgfilter{position:relative}
   .ins-orgbtn{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--border-strong);border-radius:8px;
-    background:var(--surface);cursor:pointer;font-size:13px;font-weight:600;min-width:200px;justify-content:space-between}
-  .ins-orgbtn:hover{border-color:var(--brand-2)}
+    background:var(--surface);color:var(--text);font-family:inherit;cursor:pointer;font-size:13px;font-weight:600;min-width:200px;justify-content:space-between;
+    box-shadow:var(--shadow-xs);transition:border-color .15s var(--ease),background .15s var(--ease)}
+  .ins-orgbtn:hover{border-color:color-mix(in srgb,var(--border-strong) 55%,var(--text-soft));background:var(--surface-2)}
+  .ins-orgbtn .i{color:var(--text-soft)}
   .ins-orgpanel{position:absolute;z-index:30;top:calc(100% + 4px);left:0;width:320px;max-height:360px;overflow:auto;
     background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-md);padding:8px}
   .ins-orgpanel .row{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:6px;cursor:pointer}
-  .ins-orgpanel .row:hover{background:var(--code-bg)}
+  .ins-orgpanel .row:hover{background:var(--surface-hover)}
   .ins-orgpanel .tools{display:flex;gap:6px;margin-bottom:6px}
   .ins-orgpanel .tools input{flex:1;padding:6px 8px;font-size:13px}
 </style>
@@ -21,7 +23,7 @@
     <div class="ic-field ins-orgfilter" style="flex:0 0 auto">
       <span class="label-text">Organizations</span>
       <button type="button" class="ins-orgbtn" id="ins-org-btn">
-        <span id="ins-org-label">All organizations</span><span>▾</span>
+        <span id="ins-org-label">All organizations</span><span>{{ icon('caret-down') }}</span>
       </button>
       <div class="ins-orgpanel" id="ins-org-panel" style="display:none">
         <div class="tools">
@@ -44,7 +46,7 @@
       <span class="label-text">&nbsp;</span>
       <div style="display:flex; gap:8px">
         <button type="button" class="btn btn-primary" id="ins-apply">Apply</button>
-        <button type="button" class="btn" id="ins-refresh" title="Bypass cache and re-fetch from Celerant">⟳ Refresh</button>
+        <button type="button" class="btn" id="ins-refresh" title="Bypass cache and re-fetch from Celerant">{{ icon('arrow-clockwise') }} Refresh</button>
       </div>
     </div>
     <div class="ic-meta" id="ins-meta">
@@ -430,7 +432,7 @@ function renderOrgTable(rows) {
   if (!visible.length) { tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No organizations match.</td></tr>'; return; }
   tbody.innerHTML = visible.map(r => `
     <tr>
-      <td><b>${esc(r.name)}</b>${r.error ? ` <span class="meta" title="${esc(r.error)}">⚠</span>` : ''}</td>
+      <td><b>${esc(r.name)}</b>${r.error ? ` <span class="meta" style="color:var(--partial)" title="${esc(r.error)}">${SQA.icon('warning')}</span>` : ''}</td>
       <td><span class="meta">${esc(r.industry || '—')}</span></td>
       <td style="text-align:right">${fmtN(r.total)}</td>
       <td style="text-align:right">${fmtN(r.llm)}</td>
@@ -447,7 +449,7 @@ document.getElementById('org-filter').addEventListener('input', () => {
 
 function renderFailures(rows) {
   const tbody = document.querySelector('#failures-table tbody');
-  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No failures in this window. 🎉</td></tr>'; return; }
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No failures in this window.</td></tr>'; return; }
   tbody.innerHTML = rows.map(r => `
     <tr>
       <td>${esc(fmtTime(r.created_at))}</td>

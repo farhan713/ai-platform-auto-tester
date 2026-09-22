@@ -76,7 +76,7 @@
       <span class="meta">Comma-separated. Leave blank to use the default <code>qa-tool</code>.</span>
     </label>
 
-    <button type="submit" class="btn btn-primary" id="at-submit">📋 Create task in minijira</button>
+    <button type="submit" class="btn btn-primary" id="at-submit">{{ icon('clipboard-text') }} Create task in minijira</button>
     <span id="at-inline" class="meta" style="margin-left:10px"></span>
   </form>
 
@@ -154,7 +154,7 @@ formEl.addEventListener('submit', async (e) => {
     if (data.ok) {
       const t = data.task || {};
       result.innerHTML = `<div class="card" style="margin:0; border-left:3px solid var(--pass)">
-        <h3 style="margin-top:0; color:var(--pass)">✓ Task created (HTTP ${data.status_code})</h3>
+        <h3 style="margin-top:0; color:var(--pass)">${SQA.icon('check-circle')} Task created (HTTP ${data.status_code})</h3>
         <p>Linked ${data.failed_count} failing quer${data.failed_count === 1 ? 'y' : 'ies'} to the new task.</p>
         ${t.id ? `<p class="meta">Task id: <code>${esc(t.id)}</code></p>` : ''}
         ${t.title ? `<p><b>${esc(t.title)}</b></p>` : ''}
@@ -175,7 +175,7 @@ formEl.addEventListener('submit', async (e) => {
     SQA.toast('Request failed.', 'error');
   } finally {
     submit.disabled = false;
-    submit.textContent = '📋 Create task in minijira';
+    submit.innerHTML = SQA.icon('clipboard-text') + ' Create task in minijira';
     inline.textContent = '';
   }
 });

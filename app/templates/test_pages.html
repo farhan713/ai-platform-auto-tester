@@ -22,7 +22,7 @@
         <input type="file" id="up-file" name="file" accept=".js,.zip" required>
         <small>Accepts <code>.js</code> (single bundle) or <code>.zip</code> (bundle + CSS + assets).</small>
       </label>
-      <button type="submit" class="btn btn-primary">↑ Upload bundle</button>
+      <button type="submit" class="btn btn-primary">{{ icon('upload-simple') }} Upload bundle</button>
     </form>
     <div id="upload-status" class="meta" style="margin-top:10px"></div>
   </div>
@@ -55,7 +55,7 @@ async function loadBundles() {
         <td>${formatSize(b.size_bytes)}</td>
         <td><span class="meta">${SQA.fmtDate(b.uploaded_at)}</span></td>
         <td style="white-space:nowrap">
-          <a class="btn btn-sm" href="${SQA.escapeHtml(b.test_url)}" target="_blank">Open page ↗</a>
+          <a class="btn btn-sm" href="${SQA.escapeHtml(b.test_url)}" target="_blank">Open page ${SQA.icon('arrow-square-out')}</a>
           <a class="btn btn-sm btn-primary" href="/runs/new?bundle_id=${encodeURIComponent(b.id)}">Use →</a>
           <button type="button" class="btn btn-sm btn-danger" data-id="${SQA.escapeHtml(b.id)}">Delete</button>
         </td>

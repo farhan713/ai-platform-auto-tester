@@ -111,7 +111,7 @@ function render(d) {
     shots.forEach(sp => {
       const fname = sp.split('/').pop();
       const url = `/jobs/${encodeURIComponent(jobId)}/screenshots/${encodeURIComponent(fname)}`;
-      html += `<div><a href="${url}" target="_blank">${SQA.escapeHtml(fname)} ↗</a><br><img src="${url}" style="max-width:100%; border:1px solid var(--border); border-radius:6px; margin-top:6px"></div>`;
+      html += `<div><a href="${url}" target="_blank">${SQA.escapeHtml(fname)} ${SQA.icon('arrow-square-out')}</a><br><img src="${url}" style="max-width:100%; border:1px solid var(--border); border-radius:6px; margin-top:6px"></div>`;
     });
     html += '</div></div>';
   }

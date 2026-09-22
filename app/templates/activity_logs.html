@@ -6,7 +6,7 @@
 {% block head_extra %}
 <style>
   .al-records td:nth-child(1), .al-records td:nth-child(2) { white-space:nowrap; }
-  .al-sql-btn { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; font-family:var(--font-mono); }
+  .al-sql-btn { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
   .al-sql-btn[disabled] { opacity:.45; cursor:not-allowed; }
   .al-sql-overlay { position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:100;
     display:none; align-items:center; justify-content:center; padding:16px; }
@@ -52,7 +52,7 @@
         <select name="org_ids" id="al-org-select" required style="flex:1">
           <option value="">— loading organizations… —</option>
         </select>
-        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent_v2/all_orgs/">⟳</button>
+        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent_v2/all_orgs/" aria-label="Reload organizations">{{ icon('arrow-clockwise') }}</button>
       </div>
       <span class="meta" id="al-orgs-status"></span>
     </label>
@@ -91,7 +91,7 @@
       </label>
     </details>
 
-    <button type="submit" class="btn btn-primary" id="al-submit">▶ Fetch logs</button>
+    <button type="submit" class="btn btn-primary" id="al-submit">{{ icon('play') }} Fetch logs</button>
     <span id="al-status" class="meta" style="margin-left:10px"></span>
   </form>
 </div>
@@ -106,7 +106,7 @@
         <h2 id="al-sql-title">Generated SQL</h2>
         <div class="al-sql-meta" id="al-sql-meta"></div>
       </div>
-      <button type="button" class="al-sql-close" id="al-sql-close" aria-label="Close">×</button>
+      <button type="button" class="al-sql-close" id="al-sql-close" aria-label="Close">{{ icon('x') }}</button>
     </div>
     <div class="al-sql-body">
       <div class="al-sql-code">
@@ -185,8 +185,8 @@ function sqlOf(r) {
   return String(v || '').trim();
 }
 
-const COPY_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+const COPY_ICON = SQA.icon('copy');
+const CHECK_ICON = SQA.icon('check');
 
 const sqlOverlay = document.getElementById('al-sql-overlay');
 const sqlText = document.getElementById('al-sql-text');
@@ -378,8 +378,8 @@ function renderTotals(t) {
       <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
         <div class="counts" id="al-pills-row" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center"></div>
         <div style="display:flex; gap:8px">
-          <button class="btn btn-sm" id="al-dl-csv-all" style="white-space:nowrap">⬇ CSV</button>
-          <button class="btn btn-sm" id="al-dl-xls-all" style="white-space:nowrap">⬇ Excel</button>
+          <button class="btn btn-sm" id="al-dl-csv-all" style="white-space:nowrap">${SQA.icon('download-simple')} CSV</button>
+          <button class="btn btn-sm" id="al-dl-xls-all" style="white-space:nowrap">${SQA.icon('download-simple')} Excel</button>
         </div>
       </div>
     </div>`;
@@ -406,8 +406,8 @@ function renderRecordsTable(org) {
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
       <td style="text-align:right">${sqlOf(r)
-        ? `<button type="button" class="btn btn-sm al-sql-btn" data-org-idx="${org.__idx}" data-k="${r.__k}">&lt;/&gt; SQL</button>`
-        : `<button type="button" class="btn btn-sm al-sql-btn" disabled title="No SQL in the API response for this query">&lt;/&gt; SQL</button>`}</td>
+        ? `<button type="button" class="btn btn-sm al-sql-btn" data-org-idx="${org.__idx}" data-k="${r.__k}">${SQA.icon('code')} SQL</button>`
+        : `<button type="button" class="btn btn-sm al-sql-btn" disabled title="No SQL in the API response for this query">${SQA.icon('code')} SQL</button>`}</td>
     </tr>`).join('');
   return `<div style="overflow-x:auto"><table class="table">
     <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Question</th><th style="text-align:right">SQL</th></tr></thead>
@@ -447,8 +447,8 @@ function renderOrg(org, idx) {
       ${header}
       <div style="display:flex; align-items:center; gap:12px">
         <span class="meta">Records: <b>${total}</b>${org.history_count != null && org.history_count !== total ? ` · history_count ${org.history_count}` : ''}</span>
-        <button class="btn btn-sm al-dl-csv" data-org-idx="${idx}" style="white-space:nowrap">⬇ CSV</button>
-        <button class="btn btn-sm al-dl-xls" data-org-idx="${idx}" style="white-space:nowrap">⬇ Excel</button>
+        <button class="btn btn-sm al-dl-csv" data-org-idx="${idx}" style="white-space:nowrap">${SQA.icon('download-simple')} CSV</button>
+        <button class="btn btn-sm al-dl-xls" data-org-idx="${idx}" style="white-space:nowrap">${SQA.icon('download-simple')} Excel</button>
       </div>
     </div>
     <div class="counts" style="display:flex; gap:14px; flex-wrap:wrap; margin:10px 0">
@@ -523,7 +523,7 @@ form.addEventListener('submit', async (e) => {
     SQA.toast('Request failed.', 'error');
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = '▶ Fetch logs';
+    submitBtn.innerHTML = SQA.icon('play') + ' Fetch logs';
   }
 });
 </script>

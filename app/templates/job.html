@@ -10,14 +10,14 @@
     <p class="subtitle"><span class="meta">{{ meta.created_at }}</span> · <code>{{ meta.login_url }}</code></p>
   </div>
   <div style="display:flex; gap:8px; flex-wrap:wrap">
-    <button id="stop-btn" type="button" class="btn btn-danger" style="display:none">⏹ Stop run</button>
+    <button id="stop-btn" type="button" class="btn btn-danger" style="display:none">{{ icon('stop') }} Stop run</button>
     {% if meta.is_variant %}
-    <a class="btn btn-primary" href="{{ url_for('job_variant_view', job_id=job_id) }}">🔀 Consistency report</a>
+    <a class="btn btn-primary" href="{{ url_for('job_variant_view', job_id=job_id) }}">{{ icon('git-diff') }} Consistency report</a>
     {% endif %}
-    <a id="report-link" class="btn btn-primary" href="{{ url_for('job_report', job_id=job_id) }}" target="_blank" style="display:none">Open report ↗</a>
-    <a id="dl-zip" class="btn" href="{{ url_for('job_download_zip', job_id=job_id) }}" style="display:none">↓ Download report (zip)</a>
-    <a id="dl-failures" class="btn btn-danger" href="{{ url_for('job_export_failures_xlsx', job_id=job_id) }}" style="display:none">↓ Download failed queries (xlsx)</a>
-    <a id="assign-task" class="btn" href="{{ url_for('assign_task_page', job_id=job_id) }}" style="display:none">📋 Assign task</a>
+    <a id="report-link" class="btn btn-primary" href="{{ url_for('job_report', job_id=job_id) }}" target="_blank" style="display:none">Open report {{ icon('arrow-square-out') }}</a>
+    <a id="dl-zip" class="btn" href="{{ url_for('job_download_zip', job_id=job_id) }}" style="display:none">{{ icon('download-simple') }} Download report (zip)</a>
+    <a id="dl-failures" class="btn btn-danger" href="{{ url_for('job_export_failures_xlsx', job_id=job_id) }}" style="display:none">{{ icon('download-simple') }} Download failed queries (xlsx)</a>
+    <a id="assign-task" class="btn" href="{{ url_for('assign_task_page', job_id=job_id) }}" style="display:none">{{ icon('clipboard-text') }} Assign task</a>
     <a class="btn" href="{{ url_for('job_export_csv', job_id=job_id) }}">Export CSV</a>
   </div>
 </div>
@@ -214,7 +214,7 @@ stopBtn.addEventListener('click', async () => {
   stopBtn.disabled = true;
   stopBtn.textContent = 'Stopping…';
   try { await SQA.fetchJSON(`/jobs/${jobId}/stop`, { method: 'POST' }); SQA.toast('Stop requested.', 'info'); }
-  catch (e) { stopBtn.disabled = false; stopBtn.textContent = '⏹ Stop run'; SQA.toast(e.message, 'error'); }
+  catch (e) { stopBtn.disabled = false; stopBtn.innerHTML = SQA.icon('stop') + ' Stop run'; SQA.toast(e.message, 'error'); }
 });
 
 // ---- Live status (counts + last5 + stop button visibility) -----------------
@@ -236,7 +236,7 @@ function refreshStatus() {
     if (s.status === 'running' || s.status === 'queued') {
       stopBtn.style.display = 'inline-flex';
       stopBtn.disabled = !!s.stop_requested;
-      stopBtn.textContent = s.stop_requested ? 'Stopping…' : '⏹ Stop run';
+      stopBtn.innerHTML = s.stop_requested ? 'Stopping…' : SQA.icon('stop') + ' Stop run';
     } else {
       stopBtn.style.display = 'none';
     }
@@ -249,11 +249,11 @@ function refreshStatus() {
     if (failCount > 0 && (s.status === 'done' || s.status === 'failed' || s.status === 'stopped' || s.status === 'running')) {
       const dlf = document.getElementById('dl-failures');
       dlf.style.display = 'inline-flex';
-      dlf.textContent = '↓ Download failed queries (' + failCount + ')';
+      dlf.innerHTML = SQA.icon('download-simple') + ' Download failed queries (' + failCount + ')';
       const at = document.getElementById('assign-task');
       if (at) {
         at.style.display = 'inline-flex';
-        at.textContent = '📋 Assign task (' + failCount + ')';
+        at.innerHTML = SQA.icon('clipboard-text') + ' Assign task (' + failCount + ')';
       }
     }
     refreshAllResults();

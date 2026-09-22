@@ -29,7 +29,7 @@
           Two columns required: <code>natural_language_query</code>, <code>sql_query</code>
           (one example per row, header on row 1).
           <a href="{{ url_for('static', filename='train-sql-examples-sample.csv') }}"
-             download="train_sql_examples_sample.csv">↓ Download sample CSV</a>.
+             download="train_sql_examples_sample.csv">{{ icon('download-simple') }} Download sample CSV</a>.
           Upload the CSV here, or use a server-side filepath below — one is required.
         </span>
       </label>
@@ -75,7 +75,7 @@
         </label>
       </details>
 
-      <button type="submit" class="btn btn-primary" id="t-submit">▶ Submit training</button>
+      <button type="submit" class="btn btn-primary" id="t-submit">{{ icon('play') }} Submit training</button>
       <span id="t-inline-status" class="meta" style="margin-left:10px"></span>
     </form>
   </div>
@@ -142,7 +142,7 @@
         </label>
       </div>
     </details>
-    <button type="submit" class="btn btn-primary">▶ Run test against SQL Agent</button>
+    <button type="submit" class="btn btn-primary">{{ icon('play') }} Run test against SQL Agent</button>
     <span class="meta" style="margin-left:10px">You'll be taken to the run page (live progress + screenshots).</span>
   </form>
 </div>
@@ -252,7 +252,7 @@ form.addEventListener('submit', async (e) => {
     SQA.toast('Request failed.', 'error');
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = '▶ Submit training';
+    submitBtn.innerHTML = SQA.icon('play') + ' Submit training';
     inlineStatus.textContent = '';
   }
 });
