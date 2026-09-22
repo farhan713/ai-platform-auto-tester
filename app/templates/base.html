@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <title>{% block title %}Skylar IQ QA{% endblock %} — Skylar IQ QA Tool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <script>
 // Apply persisted theme before first paint to avoid flash
@@ -30,7 +33,7 @@
     <a href="{{ url_for('insights_page') }}" class="nav-link {% if active=='insights' %}active{% endif %}"><span class="ico">📈</span> Insights</a>
     <a href="{{ url_for('sql_dev_page') }}" class="nav-link {% if active=='sql_dev' %}active{% endif %}"><span class="ico">🛠️</span> SQL Dev</a>
     <div class="nav-section">Configure</div>
-    <a href="{{ url_for('settings_page') }}" class="nav-link {% if active=='settings' %}active{% endif %}"><span class="ico">⚙</span> Settings</a>
+    <a href="{{ url_for('settings_page') }}" class="nav-link {% if active=='settings' %}active{% endif %}"><span class="ico">⚙️</span> Settings</a>
     <a href="{{ url_for('help_page') }}" class="nav-link {% if active=='help' %}active{% endif %}"><span class="ico">📖</span> Help</a>
     <div style="margin-top:auto; padding:12px; font-size:11px; color:var(--text-soft)">v{{ app_version }}</div>
   </aside>

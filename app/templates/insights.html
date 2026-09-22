@@ -164,6 +164,7 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
+<script>Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;</script>
 <script>
 const fromEl   = document.getElementById('ins-from');
 const toEl     = document.getElementById('ins-to');

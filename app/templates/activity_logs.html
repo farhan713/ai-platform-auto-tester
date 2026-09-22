@@ -5,7 +5,8 @@
 
 {% block head_extra %}
 <style>
-  .al-sql-btn { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .al-records td:nth-child(1), .al-records td:nth-child(2) { white-space:nowrap; }
+  .al-sql-btn { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; font-family:var(--font-mono); }
   .al-sql-btn[disabled] { opacity:.45; cursor:not-allowed; }
   .al-sql-overlay { position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:100;
     display:none; align-items:center; justify-content:center; padding:16px; }
@@ -23,7 +24,7 @@
   .al-sql-body { padding:14px 18px 18px; overflow:auto; }
   .al-sql-code { position:relative; }
   .al-sql-code pre { margin:0; background:var(--pre-bg); color:var(--pre-text); border-radius:var(--radius-sm);
-    padding:14px 48px 14px 14px; font:12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding:14px 48px 14px 14px; font:12.5px/1.6 var(--font-mono);
     white-space:pre-wrap; overflow-wrap:anywhere; max-height:60vh; overflow:auto; }
   .al-sql-copy { position:absolute; top:8px; right:8px; display:inline-flex; align-items:center; justify-content:center;
     width:32px; height:32px; border-radius:var(--radius-sm); border:1px solid rgba(203,213,225,.25);
