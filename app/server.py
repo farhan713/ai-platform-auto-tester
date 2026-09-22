@@ -1065,18 +1065,40 @@ def _is_route_not_found(resp: Any) -> bool:
         return False
 
 
+def _celerant_request(method: str, url: str, **kwargs: Any) -> Any:
+    """requests.request with retries for transient gateway failures. Celerant's
+    v2 ingress intermittently answers 503 "no healthy upstream" — the request
+    never reached the app, so retrying is safe for any method. Reads (GET) also
+    retry on other 502/503/504s and connection errors."""
+    import requests
+    for attempt in range(3):
+        last = attempt == 2
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if method.upper() != "GET" or last:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+            continue
+        gateway_down = resp.status_code == 503 and "no healthy upstream" in (resp.text or "")
+        read_retry = method.upper() == "GET" and resp.status_code in (502, 503, 504)
+        if last or not (gateway_down or read_retry):
+            return resp
+        time.sleep(1.5 * (attempt + 1))
+    return resp
+
+
 def celerant_call(method: str, console: str | None, path: str, **kwargs: Any) -> tuple[Any, str]:
     """Call {origin}/sql_agent_v2/{path}, falling back to v1 if v2 lacks the
     route. Returns (response, url_actually_used)."""
-    import requests
     origin = _celerant_origin(console)
     path = path.lstrip("/")
     url = f"{origin}/{CELERANT_API_PREFIX}/{path}"
-    resp = requests.request(method, url, **kwargs)
+    resp = _celerant_request(method, url, **kwargs)
     if (CELERANT_API_FALLBACK_PREFIX and CELERANT_API_FALLBACK_PREFIX != CELERANT_API_PREFIX
             and _is_route_not_found(resp)):
         url = f"{origin}/{CELERANT_API_FALLBACK_PREFIX}/{path}"
-        resp = requests.request(method, url, **kwargs)
+        resp = _celerant_request(method, url, **kwargs)
     return resp, url
 
 

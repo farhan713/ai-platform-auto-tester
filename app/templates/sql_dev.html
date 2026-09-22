@@ -145,7 +145,7 @@ const esc = s => SQA.escapeHtml(s == null ? '' : String(s));
 let _rows=[], _counts={}, _tab='all', _sub='developer', _selected=null;
 let _start=0,_end=9; const PAGE=10;
 
-(function(){const t=new Date(),y=new Date(Date.now()-864e5),iso=d=>d.toISOString().slice(0,10);
+(function(){const t=new Date(),y=new Date(Date.now()-30*864e5),iso=d=>d.toISOString().slice(0,10);
   document.getElementById('sd-to').value=iso(t);document.getElementById('sd-from').value=iso(y);})();
 
 function cfg(){return{console_url:document.getElementById('sd-console').value.trim(),
@@ -235,7 +235,7 @@ function fmtTime(s){const d=new Date(s);if(isNaN(d))return '';
 function renderList(){
   const rows=visibleRows();
   const el=document.getElementById('sd-list');
-  if(!rows.length){el.innerHTML='<div class="sd-empty"><span class="big">'+SQA.icon('tray')+'</span><div>No queries in this view.</div></div>';
+  if(!rows.length){el.innerHTML='<div class="sd-empty"><span class="big">'+SQA.icon('tray')+'</span><div>No queries in this view for the selected dates.<br><span class="meta">Try a wider date range.</span></div></div>';
     document.getElementById('sd-pager').style.display='none';return;}
   el.innerHTML=rows.map((r,i)=>{const m=metaFor(r);
     const selCls=(_selected&&_selected.id===r.id)?' sel':'';
