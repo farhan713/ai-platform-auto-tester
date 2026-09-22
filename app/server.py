@@ -1028,7 +1028,47 @@ def test_pages_page():
 # rows were saved and which failed — all without leaving the tool or fighting
 # CORS (the call is made server-side).
 # ---------------------------------------------------------------------------
-CELERANT_TRAIN_BASE = "https://celerantai.com/sql_agent/train_sql_examples_backoffice_validated"
+
+# Celerant API version. Every server-side call goes to sql_agent_v2 first.
+# Some routes we use (history_data, train_sql_examples_backoffice_validated)
+# aren't on v2 yet, so when v2 answers with FastAPI's bare route-404 we retry
+# the same path on v1. Once Celerant ships a route on v2 the fallback simply
+# stops firing — no redeploy needed.
+CELERANT_API_PREFIX = os.environ.get("SQA_CELERANT_API_PREFIX", "sql_agent_v2").strip("/")
+CELERANT_API_FALLBACK_PREFIX = os.environ.get("SQA_CELERANT_API_FALLBACK_PREFIX", "sql_agent").strip("/")
+
+
+def _celerant_origin(console: str | None) -> str:
+    """Console origin with any trailing /sql_agent or /sql_agent_v2 removed."""
+    base = (console or "https://celerantai.com").strip().rstrip("/")
+    for suffix in ("/sql_agent_v2", "/sql_agent"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def _is_route_not_found(resp: Any) -> bool:
+    if resp.status_code != 404:
+        return False
+    try:
+        return resp.json() == {"detail": "Not Found"}
+    except Exception:
+        return False
+
+
+def celerant_call(method: str, console: str | None, path: str, **kwargs: Any) -> tuple[Any, str]:
+    """Call {origin}/sql_agent_v2/{path}, falling back to v1 if v2 lacks the
+    route. Returns (response, url_actually_used)."""
+    import requests
+    origin = _celerant_origin(console)
+    path = path.lstrip("/")
+    url = f"{origin}/{CELERANT_API_PREFIX}/{path}"
+    resp = requests.request(method, url, **kwargs)
+    if (CELERANT_API_FALLBACK_PREFIX and CELERANT_API_FALLBACK_PREFIX != CELERANT_API_PREFIX
+            and _is_route_not_found(resp)):
+        url = f"{origin}/{CELERANT_API_FALLBACK_PREFIX}/{path}"
+        resp = requests.request(method, url, **kwargs)
+    return resp, url
 
 
 @app.route("/training")
@@ -1056,9 +1096,9 @@ def training_submit():
         return jsonify({"ok": False, "error": "Database ID is required."}), 400
 
     # Optional console origin override (default celerantai.com).
-    console = (request.form.get("console_url") or "https://celerantai.com").strip().rstrip("/")
-    base = f"{console}/sql_agent/train_sql_examples_backoffice_validated"
-    url = f"{base}/{database_id}/"
+    console = request.form.get("console_url")
+    train_path = f"train_sql_examples_backoffice_validated/{database_id}/"
+    url = f"{_celerant_origin(console)}/{CELERANT_API_PREFIX}/{train_path}"
 
     # Query params — only send the ones the user actually set.
     params: dict[str, str] = {}
@@ -1113,13 +1153,14 @@ def training_submit():
 
     started = time.time()
     try:
-        resp = requests.post(url, params=params, files=files, headers=headers,
-                             timeout=600)
+        resp, url = celerant_call("POST", console, train_path, params=params,
+                                  files=files, headers=headers, timeout=600)
     except requests.exceptions.SSLError:
         # Fall back to no-verify if the tenant uses a self-signed cert.
         try:
-            resp = requests.post(url, params=params, files=files, headers=headers,
-                                 timeout=600, verify=False)
+            resp, url = celerant_call("POST", console, train_path, params=params,
+                                      files=files, headers=headers, timeout=600,
+                                      verify=False)
         except Exception as e:
             return jsonify({"ok": False, "url": url,
                             "error": f"Request failed (SSL): {type(e).__name__}: {e}"}), 502
@@ -1485,12 +1526,11 @@ def assign_task_create(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Activity Logs — pull /sql_agent/history_data/{org_id}/{offset}/{limit}/ for
-# one or more tenants and present a per-org report (totals, LLM vs RAG split,
-# status breakdown, searchable record list). The call is proxied server-side
-# so the browser doesn't fight CORS and we can fan out across N orgs.
+# Activity Logs — pull history_data/{org_id}/{offset}/{limit}/ for one or more
+# tenants and present a per-org report (totals, LLM vs RAG split, status
+# breakdown, searchable record list). The call is proxied server-side so the
+# browser doesn't fight CORS and we can fan out across N orgs.
 # ---------------------------------------------------------------------------
-CELERANT_HISTORY_BASE = "https://celerantai.com/sql_agent/history_data"
 
 
 def _yyyy_mm_dd_to_mm_dd_yyyy(s: str) -> str | None:
@@ -1540,12 +1580,10 @@ def _normalize_org(o: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _fetch_all_orgs_normalized(console: str, bearer: str = "") -> list[dict[str, Any]]:
-    """GET {console}/sql_agent/all_orgs/ and return a normalized, name-sorted
+    """GET {console}/sql_agent_v2/all_orgs/ and return a normalized, name-sorted
     list of {id, name, organization_id}. Raises on transport / non-2xx."""
-    import requests
-    console = console.rstrip("/")
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
-    resp = requests.get(f"{console}/sql_agent/all_orgs/", headers=headers, timeout=30)
+    resp, _ = celerant_call("GET", console, "all_orgs/", headers=headers, timeout=30)
     resp.raise_for_status()
     raw = (resp.json() or {}).get("responseBody", {}).get("data") or []
     out = [n for n in (_normalize_org(o) for o in raw) if n and n["id"]]
@@ -1604,8 +1642,7 @@ def activity_logs_fetch():
     except ValueError:
         return jsonify({"ok": False, "error": "offset and limit must be integers."}), 400
 
-    console = (request.form.get("console_url") or "https://celerantai.com").strip().rstrip("/")
-    base = f"{console}/sql_agent/history_data"
+    console = request.form.get("console_url")
     headers: dict[str, str] = {}
     token = (request.form.get("bearer_token") or "").strip()
     if token:
@@ -1646,13 +1683,16 @@ def activity_logs_fetch():
     out_orgs: list[dict[str, Any]] = []
     grand = {"orgs": 0, "queries": 0, "llm": 0, "rag": 0, "complete": 0, "failed": 0}
     for org_id in org_ids:
-        base_url = f"{base}/{org_id}/{offset}/{limit}/"
-        # Full URL WITH the date query params — this is exactly what we send,
-        # and what we show in the UI so the date range is visible/verifiable.
-        url = f"{base_url}?{urlencode({'from_date': from_d, 'to_date': to_d})}"
+        path = f"history_data/{org_id}/{offset}/{limit}/"
+        query = urlencode({"from_date": from_d, "to_date": to_d})
+        url = f"{_celerant_origin(console)}/{CELERANT_API_PREFIX}/{path}?{query}"
         try:
-            resp = requests.get(base_url, params={"from_date": from_d, "to_date": to_d},
-                                headers=headers, timeout=120)
+            resp, used = celerant_call("GET", console, path,
+                                       params={"from_date": from_d, "to_date": to_d},
+                                       headers=headers, timeout=120)
+            # Full URL WITH the date query params — exactly what was sent, and
+            # what we show in the UI so the date range is visible/verifiable.
+            url = f"{used}?{query}"
             try:
                 body = resp.json()
             except Exception:
@@ -1746,7 +1786,6 @@ def _fetch_orgs_history_parallel(
             errors.append("none of the selected organizations were found")
             return [], errors
 
-    base = f"{console}/sql_agent/history_data"
     from_mmddyyyy = _yyyy_mm_dd_to_mm_dd_yyyy(from_iso)
     to_mmddyyyy   = _yyyy_mm_dd_to_mm_dd_yyyy(to_iso)
     if not from_mmddyyyy or not to_mmddyyyy:
@@ -1757,11 +1796,11 @@ def _fetch_orgs_history_parallel(
         hid = org["id"]
         name = org["name"]
         industry = org.get("industry", "")
-        url = f"{base}/{hid}/0/{_INSIGHTS_LIMIT_PER_ORG}/"
         try:
-            r = requests.get(url, headers=headers,
-                             params={"from_date": from_mmddyyyy, "to_date": to_mmddyyyy},
-                             timeout=60)
+            r, _ = celerant_call("GET", console, f"history_data/{hid}/0/{_INSIGHTS_LIMIT_PER_ORG}/",
+                                 headers=headers,
+                                 params={"from_date": from_mmddyyyy, "to_date": to_mmddyyyy},
+                                 timeout=60)
             r.raise_for_status()
             body = r.json() or {}
             rb = (body.get("responseBody") or {})
@@ -2037,17 +2076,12 @@ def insights_data():
 # generate a visualization, save a draft, and approve into the trained set.
 # Every call is proxied server-side to the celerantai SQL-Agent API.
 # ---------------------------------------------------------------------------
-# Console ORIGIN (no /sql_agent suffix) — every route appends /sql_agent/...
+# Console ORIGIN — celerant_call() appends the versioned /sql_agent_v2/... path.
 SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com").rstrip("/")
 
 
 def _sqldev_console_base() -> str:
-    base = (request.values.get("console_url") or SQLDEV_API_BASE).strip().rstrip("/")
-    # Guard against a console_url that already includes /sql_agent (the routes
-    # append it), which would 404 with a doubled path.
-    if base.endswith("/sql_agent"):
-        base = base[: -len("/sql_agent")]
-    return base
+    return _celerant_origin(request.values.get("console_url") or SQLDEV_API_BASE)
 
 
 def _sqldev_headers() -> dict[str, str]:
@@ -2131,11 +2165,14 @@ def sql_dev_feedback():
         return jsonify({"ok": True, "demo": True, **_sqldev_demo_feedback()})
 
     base = _sqldev_console_base()
-    url = f"{base}/sql_agent/feedback_data/{org_id}/{start}/{end}/"
-    if from_d and to_d:
-        url += "?" + urlencode({"from_date": from_d, "to_date": to_d})
+    path = f"feedback_data/{org_id}/{start}/{end}/"
+    params = {"from_date": from_d, "to_date": to_d} if (from_d and to_d) else None
+    query = ("?" + urlencode(params)) if params else ""
+    url = f"{base}/{CELERANT_API_PREFIX}/{path}{query}"
     try:
-        r = requests.get(url, headers=_sqldev_headers(), timeout=60)
+        r, used = celerant_call("GET", base, path, params=params,
+                                headers=_sqldev_headers(), timeout=60)
+        url = f"{used}{query}"
         try:
             body = r.json()
         except Exception:
@@ -2208,11 +2245,12 @@ def sql_dev_save_draft():
         "visualization": viz,
     }
     base = _sqldev_console_base()
-    url = f"{base}/sql_agent/validation_from_developer/{org_id}/{query_id}/"
+    path = f"validation_from_developer/{org_id}/{query_id}/"
+    url = f"{base}/{CELERANT_API_PREFIX}/{path}"
     try:
-        r = requests.patch(url, json=payload,
-                           headers={**_sqldev_headers(), "Content-Type": "application/json"},
-                           timeout=60)
+        r, url = celerant_call("PATCH", base, path, json=payload,
+                               headers={**_sqldev_headers(), "Content-Type": "application/json"},
+                               timeout=60)
         try: body = r.json()
         except Exception: body = {}
         ok, msg = _sqldev_result(r.status_code, body)
@@ -2247,11 +2285,12 @@ def sql_dev_approve():
         "embedding_model": "all-MiniLM-L6-v2",
     }
     base = _sqldev_console_base()
-    url = f"{base}/sql_agent/validation_like/{org_id}/{query_id}/"
+    path = f"validation_like/{org_id}/{query_id}/"
+    url = f"{base}/{CELERANT_API_PREFIX}/{path}"
     try:
-        r = requests.patch(url, json=payload,
-                           headers={**_sqldev_headers(), "Content-Type": "application/json"},
-                           timeout=60)
+        r, url = celerant_call("PATCH", base, path, json=payload,
+                               headers={**_sqldev_headers(), "Content-Type": "application/json"},
+                               timeout=60)
         try: body = r.json()
         except Exception: body = {}
         ok, msg = _sqldev_result(r.status_code, body)

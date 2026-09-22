@@ -3,6 +3,37 @@
 {% block header_title %}Activity Logs{% endblock %}
 {% block header_sub %}— Query history pulled from Celerant, grouped by organization{% endblock %}
 
+{% block head_extra %}
+<style>
+  .al-sql-btn { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .al-sql-btn[disabled] { opacity:.45; cursor:not-allowed; }
+  .al-sql-overlay { position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:100;
+    display:none; align-items:center; justify-content:center; padding:16px; }
+  .al-sql-overlay.open { display:flex; }
+  .al-sql-modal { background:var(--surface); color:var(--text); border:1px solid var(--border);
+    border-radius:var(--radius); box-shadow:var(--shadow-md); width:min(880px, 100%);
+    max-height:calc(100vh - 32px); display:flex; flex-direction:column; }
+  .al-sql-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px;
+    padding:16px 18px 10px; border-bottom:1px solid var(--border); }
+  .al-sql-head h2 { margin:0; font-size:16px; }
+  .al-sql-meta { margin-top:4px; font-size:12px; color:var(--text-muted); overflow-wrap:anywhere; }
+  .al-sql-close { background:none; border:0; color:var(--text-muted); font-size:22px; line-height:1;
+    cursor:pointer; padding:2px 6px; border-radius:var(--radius-sm); }
+  .al-sql-close:hover { background:var(--surface-hover); color:var(--text); }
+  .al-sql-body { padding:14px 18px 18px; overflow:auto; }
+  .al-sql-code { position:relative; }
+  .al-sql-code pre { margin:0; background:var(--pre-bg); color:var(--pre-text); border-radius:var(--radius-sm);
+    padding:14px 48px 14px 14px; font:12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space:pre-wrap; overflow-wrap:anywhere; max-height:60vh; overflow:auto; }
+  .al-sql-copy { position:absolute; top:8px; right:8px; display:inline-flex; align-items:center; justify-content:center;
+    width:32px; height:32px; border-radius:var(--radius-sm); border:1px solid rgba(203,213,225,.25);
+    background:rgba(15,23,42,.6); color:#cbd5e1; cursor:pointer; }
+  .al-sql-copy:hover { background:rgba(51,65,85,.9); color:#fff; }
+  .al-sql-copy.copied { color:#4ade80; border-color:rgba(74,222,128,.5); }
+  .al-sql-copy svg { width:16px; height:16px; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="card">
   <h2>Fetch history</h2>
@@ -20,7 +51,7 @@
         <select name="org_ids" id="al-org-select" required style="flex:1">
           <option value="">— loading organizations… —</option>
         </select>
-        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent/all_orgs/">⟳</button>
+        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent_v2/all_orgs/">⟳</button>
       </div>
       <span class="meta" id="al-orgs-status"></span>
     </label>
@@ -66,6 +97,24 @@
 
 <div id="al-totals"></div>
 <div id="al-orgs"></div>
+
+<div id="al-sql-overlay" class="al-sql-overlay" aria-hidden="true">
+  <div class="al-sql-modal" role="dialog" aria-modal="true" aria-labelledby="al-sql-title">
+    <div class="al-sql-head">
+      <div>
+        <h2 id="al-sql-title">Generated SQL</h2>
+        <div class="al-sql-meta" id="al-sql-meta"></div>
+      </div>
+      <button type="button" class="al-sql-close" id="al-sql-close" aria-label="Close">×</button>
+    </div>
+    <div class="al-sql-body">
+      <div class="al-sql-code">
+        <pre id="al-sql-text"></pre>
+        <button type="button" class="al-sql-copy" id="al-sql-copy" title="Copy SQL" aria-label="Copy SQL"></button>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -79,7 +128,7 @@ const orgsEl = document.getElementById('al-orgs');
 // Per-org search state, keyed by org id (database_id).
 const _filters = {};
 
-// Cache of orgs from /sql_agent/all_orgs/. dbId -> {name, organization_id, database_id}
+// Cache of orgs from /sql_agent_v2/all_orgs/. dbId -> {name, organization_id, database_id}
 // Kept so the per-org report header can show the friendly name.
 const _orgsByDbId = {};
 
@@ -125,6 +174,75 @@ loadOrgs();
 })();
 
 function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
+
+// ── SQL popup ───────────────────────────────────────────────────────────────
+// history_data returns the generated SQL as `sql`; tolerate a couple of
+// alternate names / a nested {sql: ...} object in case the shape shifts.
+function sqlOf(r) {
+  let v = r.sql ?? r.generated_sql ?? r.sql_query ?? '';
+  if (v && typeof v === 'object') v = v.sql || v.query || JSON.stringify(v, null, 2);
+  return String(v || '').trim();
+}
+
+const COPY_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+const CHECK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+
+const sqlOverlay = document.getElementById('al-sql-overlay');
+const sqlText = document.getElementById('al-sql-text');
+const sqlMeta = document.getElementById('al-sql-meta');
+const sqlCopyBtn = document.getElementById('al-sql-copy');
+const sqlCloseBtn = document.getElementById('al-sql-close');
+sqlCopyBtn.innerHTML = COPY_ICON;
+let _sqlReturnFocus = null;
+let _copyResetTimer = null;
+
+function openSqlModal(r, trigger) {
+  sqlText.textContent = sqlOf(r);
+  const bits = [r.natural_language_query, r.login_name, shortDate(r.created_at)].filter(Boolean);
+  sqlMeta.textContent = bits.join(' · ');
+  sqlCopyBtn.innerHTML = COPY_ICON;
+  sqlCopyBtn.classList.remove('copied');
+  _sqlReturnFocus = trigger || null;
+  sqlOverlay.classList.add('open');
+  sqlOverlay.setAttribute('aria-hidden', 'false');
+  sqlCloseBtn.focus();
+}
+
+function closeSqlModal() {
+  sqlOverlay.classList.remove('open');
+  sqlOverlay.setAttribute('aria-hidden', 'true');
+  if (_sqlReturnFocus) _sqlReturnFocus.focus();
+}
+
+async function copySql() {
+  const text = sqlText.textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    // Fallback for browsers/contexts without the async clipboard API.
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  sqlCopyBtn.innerHTML = CHECK_ICON;
+  sqlCopyBtn.classList.add('copied');
+  sqlCopyBtn.title = 'Copied';
+  SQA.toast('SQL copied to clipboard.', 'success');
+  clearTimeout(_copyResetTimer);
+  _copyResetTimer = setTimeout(() => {
+    sqlCopyBtn.innerHTML = COPY_ICON;
+    sqlCopyBtn.classList.remove('copied');
+    sqlCopyBtn.title = 'Copy SQL';
+  }, 1800);
+}
+
+sqlCopyBtn.addEventListener('click', copySql);
+sqlCloseBtn.addEventListener('click', closeSqlModal);
+sqlOverlay.addEventListener('click', (e) => { if (e.target === sqlOverlay) closeSqlModal(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && sqlOverlay.classList.contains('open')) closeSqlModal();
+});
 function pct(x){ return x == null ? '—' : (Math.round(x * 1000) / 10) + '%'; }
 function badge(cls, text){ return `<span class="badge ${cls}">${esc(text)}</span>`; }
 function shortDate(s){ return s ? esc(String(s).slice(0,19).replace('T',' ')) : '—'; }
@@ -163,7 +281,7 @@ function setFilter(key) {
 }
 
 function rerenderAllTables() {
-  orgsEl.querySelectorAll('[data-org-idx]').forEach(card => {
+  orgsEl.querySelectorAll('.card[data-org-idx]').forEach(card => {
     const idx = parseInt(card.getAttribute('data-org-idx'), 10);
     const org = _orgByIdx[idx];
     if (org) card.querySelector('.al-records').innerHTML = renderRecordsTable(org);
@@ -286,15 +404,28 @@ function renderRecordsTable(org) {
       <td>${esc(r.login_name || '')}</td>
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
+      <td style="text-align:right">${sqlOf(r)
+        ? `<button type="button" class="btn btn-sm al-sql-btn" data-org-idx="${org.__idx}" data-k="${r.__k}">&lt;/&gt; SQL</button>`
+        : `<button type="button" class="btn btn-sm al-sql-btn" disabled title="No SQL in the API response for this query">&lt;/&gt; SQL</button>`}</td>
     </tr>`).join('');
   return `<div style="overflow-x:auto"><table class="table">
-    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Question</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>User</th><th>Status</th><th>Question</th><th style="text-align:right">SQL</th></tr></thead>
     <tbody>${trs}</tbody>
   </table></div>`;
 }
 
 // 0-based index assigned at render time so dashed org IDs don't break selectors.
 let _orgByIdx = [];
+
+// Row "SQL" buttons — delegated so it keeps working after every re-render.
+orgsEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.al-sql-btn');
+  if (!btn || btn.disabled) return;
+  const org = _orgByIdx[parseInt(btn.dataset.orgIdx, 10)];
+  const k = parseInt(btn.dataset.k, 10);
+  const rec = org && (org.records || []).find(r => r.__k === k);
+  if (rec) openSqlModal(rec, btn);
+});
 
 function renderOrg(org, idx) {
   // Show the friendly org name only — the database_id stays hidden from the UI.
@@ -346,9 +477,11 @@ function renderResult(data) {
   }
   renderTotals(data.totals);
   _orgByIdx = data.organizations.slice();
+  // Stable keys so a row's SQL button can find its record after filtering/sorting.
+  _orgByIdx.forEach((o, i) => { o.__idx = i; (o.records || []).forEach((r, k) => { r.__k = k; }); });
   orgsEl.innerHTML = _orgByIdx.map((o, i) => renderOrg(o, i)).join('');
   // Wire up per-org filter inputs and download buttons.
-  orgsEl.querySelectorAll('[data-org-idx]').forEach(card => {
+  orgsEl.querySelectorAll('.card[data-org-idx]').forEach(card => {
     const idx = parseInt(card.getAttribute('data-org-idx'), 10);
     const org = _orgByIdx[idx];
     const input = card.querySelector('.al-filter');

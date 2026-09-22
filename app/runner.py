@@ -493,7 +493,7 @@ _CELERANT_URL_FIXER = r"""
   // /backoffice/report/run-sql/ returns 404). Be conservative.
   const NEEDS_SLASH = [
     /\/console\/organization_validation\/[^\/?#]+$/,   // JWT exchange
-    /\/sql_agent\/generate_sql\/[^?#]*[^\/]$/,          // NL → SQL LLM call
+    /\/sql_agent(?:_v2)?\/generate_sql\/[^?#]*[^\/]$/, // NL → SQL LLM call (v1 + v2)
   ];
   function fixURL(url) {
     if (typeof url !== 'string') return url;
@@ -514,7 +514,7 @@ _CELERANT_URL_FIXER = r"""
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     return _origOpen.call(this, method, fixURL(url), ...rest);
   };
-  console.log('[skylar-qa] Celerant URL fixer: trailing slash for /console/organization_validation/ + /sql_agent/generate_sql/ only');
+  console.log('[skylar-qa] Celerant URL fixer: trailing slash for /console/organization_validation/ + /sql_agent(_v2)/generate_sql/ only');
 })();
 """
 
