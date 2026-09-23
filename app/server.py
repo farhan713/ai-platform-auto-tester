@@ -1065,6 +1065,16 @@ def _is_route_not_found(resp: Any) -> bool:
         return False
 
 
+def _record_user(r: dict[str, Any]) -> str:
+    """Display name for a history record. v1 history_data carries login_name;
+    v2 dropped it and only sends user_id, so fall back to that."""
+    name = str(r.get("login_name") or "").strip()
+    if name:
+        return name
+    uid = str(r.get("user_id") or "").strip()
+    return f"User {uid}" if uid else ""
+
+
 def _celerant_request(method: str, url: str, **kwargs: Any) -> Any:
     """requests.request with retries for transient gateway failures. Celerant's
     v2 ingress intermittently answers 503 "no healthy upstream" — the request
@@ -1689,9 +1699,9 @@ def activity_logs_fetch():
         for r in records:
             s = (r.get("query_status") or "unknown").lower()
             statuses[s] = statuses.get(s, 0) + 1
-            ln = r.get("login_name")
+            ln = _record_user(r)
             if ln:
-                users.add(str(ln))
+                users.add(ln)
             sid = r.get("session_id")
             if sid:
                 sessions.add(str(sid))
@@ -1885,7 +1895,7 @@ def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
         rag = sum(1 for r in recs if r.get("llm_invoked") is False)
         complete = sum(1 for r in recs if (r.get("query_status") or "").lower() == "complete")
         failed   = sum(1 for r in recs if (r.get("query_status") or "").lower() == "failed")
-        users    = sorted({str(r.get("login_name")) for r in recs if r.get("login_name")})
+        users    = sorted({u for u in (_record_user(r) for r in recs) if u})
         sessions = {str(r.get("session_id")) for r in recs if r.get("session_id")}
         ts_list  = [r.get("created_at") for r in recs if r.get("created_at")]
         per_org.append({
@@ -1918,7 +1928,7 @@ def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
         "rag":      sum(1 for r in all_recs if r.get("llm_invoked") is False),
         "complete": sum(1 for r in all_recs if (r.get("query_status") or "").lower() == "complete"),
         "failed":   sum(1 for r in all_recs if (r.get("query_status") or "").lower() == "failed"),
-        "unique_users":    len({(r.get("_db_id"), r.get("login_name")) for r in all_recs if r.get("login_name")}),
+        "unique_users":    len({(r.get("_db_id"), _record_user(r)) for r in all_recs if _record_user(r)}),
         "unique_sessions": len({(r.get("_db_id"), r.get("session_id")) for r in all_recs if r.get("session_id")}),
     }
 
@@ -1967,7 +1977,7 @@ def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
     # users across tenants).
     user_counter = Counter()
     for r in all_recs:
-        ln = r.get("login_name")
+        ln = _record_user(r)
         if ln:
             user_counter[f"{ln}  ·  {r.get('_org_name') or ''}"] += 1
     top_users = [{"label": k, "total": v} for k, v in user_counter.most_common(10)]
@@ -1980,7 +1990,7 @@ def _aggregate_insights(orgs_data: list[dict[str, Any]]) -> dict[str, Any]:
     recent_failures = [{
         "created_at": r.get("created_at"),
         "org": r.get("_org_name"),
-        "user": r.get("login_name"),
+        "user": _record_user(r),
         "session_id": r.get("session_id"),
         "query": r.get("natural_language_query"),
         "llm_invoked": r.get("llm_invoked"),

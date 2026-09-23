@@ -22,6 +22,9 @@
     cursor:pointer; padding:2px 6px; border-radius:var(--radius-sm); }
   .al-sql-close:hover { background:var(--surface-hover); color:var(--text); }
   .al-sql-body { padding:14px 18px 18px; overflow:auto; }
+  .al-sql-facts { display:grid; grid-template-columns:auto 1fr; gap:6px 14px; margin:0 0 14px; font-size:12.5px; }
+  .al-sql-facts dt { color:var(--text-muted); }
+  .al-sql-facts dd { margin:0; color:var(--text); overflow-wrap:anywhere; }
   .al-sql-code { position:relative; }
   .al-sql-code pre { margin:0; background:var(--pre-bg); color:var(--pre-text); border-radius:var(--radius-sm);
     padding:14px 48px 14px 14px; font:12.5px/1.6 var(--font-mono);
@@ -103,12 +106,13 @@
   <div class="al-sql-modal" role="dialog" aria-modal="true" aria-labelledby="al-sql-title">
     <div class="al-sql-head">
       <div>
-        <h2 id="al-sql-title">Generated SQL</h2>
+        <h2 id="al-sql-title">Query details</h2>
         <div class="al-sql-meta" id="al-sql-meta"></div>
       </div>
       <button type="button" class="al-sql-close" id="al-sql-close" aria-label="Close">{{ icon('x') }}</button>
     </div>
     <div class="al-sql-body">
+      <dl class="al-sql-facts" id="al-sql-facts"></dl>
       <div class="al-sql-code">
         <pre id="al-sql-text"></pre>
         <button type="button" class="al-sql-copy" id="al-sql-copy" title="Copy SQL" aria-label="Copy SQL"></button>
@@ -179,6 +183,12 @@ function esc(s){ return SQA.escapeHtml(s == null ? '' : String(s)); }
 // ── SQL popup ───────────────────────────────────────────────────────────────
 // history_data returns the generated SQL as `sql`; tolerate a couple of
 // alternate names / a nested {sql: ...} object in case the shape shifts.
+// v1 history_data returns login_name; v2 returns only user_id.
+function userOf(r) {
+  const n = (r.login_name || '').trim();
+  return n || (r.user_id != null && String(r.user_id).trim() ? 'User ' + r.user_id : '');
+}
+
 function sqlOf(r) {
   let v = r.sql ?? r.generated_sql ?? r.sql_query ?? '';
   if (v && typeof v === 'object') v = v.sql || v.query || JSON.stringify(v, null, 2);
@@ -191,16 +201,34 @@ const CHECK_ICON = SQA.icon('check');
 const sqlOverlay = document.getElementById('al-sql-overlay');
 const sqlText = document.getElementById('al-sql-text');
 const sqlMeta = document.getElementById('al-sql-meta');
+const sqlFacts = document.getElementById('al-sql-facts');
 const sqlCopyBtn = document.getElementById('al-sql-copy');
 const sqlCloseBtn = document.getElementById('al-sql-close');
 sqlCopyBtn.innerHTML = COPY_ICON;
 let _sqlReturnFocus = null;
 let _copyResetTimer = null;
 
+const CASEY = s => String(s).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+
 function openSqlModal(r, trigger) {
-  sqlText.textContent = sqlOf(r);
-  const bits = [r.natural_language_query, r.login_name, shortDate(r.created_at)].filter(Boolean);
+  const sql = sqlOf(r);
+  sqlText.textContent = sql || 'No SQL was returned for this query.';
+  const bits = [r.natural_language_query, userOf(r), shortDate(r.created_at)].filter(Boolean);
   sqlMeta.textContent = bits.join(' · ');
+  // Everything else history_data returns, shown only when it has a value.
+  const facts = [
+    ['Status', r.query_status ? statusBadgeFor(r.query_status) : null],
+    ['Source', r.llm_invoked === true || r.llm_invoked === false ? llmBadge(r.llm_invoked) : null],
+    ['What happened', r.status_message ? esc(r.status_message) : null],
+    ['Execution', r.execution_status ? esc(CASEY(r.execution_status)) : null],
+    ['Rows returned', r.row_count != null ? esc(r.row_count) : null],
+    ['Repair', r.repair_status && String(r.repair_status).toLowerCase() !== 'none' ? esc(CASEY(r.repair_status)) : null],
+    ['Error', r.error_message ? `<span style="color:var(--fail)">${esc(r.error_message)}</span>` : null],
+  ].filter(f => f[1] !== null && f[1] !== '');
+  sqlFacts.innerHTML = facts.length
+    ? facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')
+    : '';
+  sqlFacts.style.display = facts.length ? '' : 'none';
   sqlCopyBtn.innerHTML = COPY_ICON;
   sqlCopyBtn.classList.remove('copied');
   _sqlReturnFocus = trigger || null;
@@ -290,7 +318,7 @@ function rerenderAllTables() {
 }
 
 // ── CSV / Excel helpers ─────────────────────────────────────────────────────
-const EXPORT_HEADERS = ['Time (UTC)','Organization','User','User ID','Status','Question'];
+const EXPORT_HEADERS = ['Time (UTC)','Organization','User','User ID','Status','Question','What happened','Execution','Rows','Error','Generated SQL'];
 
 function recordToRow(r, orgName) {
   return [
@@ -299,7 +327,12 @@ function recordToRow(r, orgName) {
     r.login_name || '',
     r.user_id || '',
     r.query_status || '',
-    r.natural_language_query || ''
+    r.natural_language_query || '',
+    r.status_message || '',
+    r.execution_status || '',
+    r.row_count != null ? r.row_count : '',
+    r.error_message || '',
+    sqlOf(r)
   ];
 }
 
@@ -393,7 +426,7 @@ function renderRecordsTable(org) {
   let rows = applyStatusFilter(org.records || []);
   if (f) {
     rows = rows.filter(r => {
-      const blob = [r.natural_language_query, r.login_name, r.query_status, r.user_id].join(' ').toLowerCase();
+      const blob = [r.natural_language_query, r.login_name, r.user_id, r.query_status, r.status_message, sqlOf(r)].join(' ').toLowerCase();
       return blob.includes(f);
     });
   }
@@ -402,7 +435,7 @@ function renderRecordsTable(org) {
   const trs = rows.map(r => `
     <tr>
       <td>${shortDate(r.created_at)}</td>
-      <td>${esc(r.login_name || '')}</td>
+      <td>${esc(userOf(r))}</td>
       <td>${statusBadgeFor(r.query_status)}</td>
       <td>${esc((r.natural_language_query || '').slice(0,180))}${(r.natural_language_query||'').length>180?'…':''}</td>
       <td style="text-align:right">${sqlOf(r)
@@ -457,7 +490,7 @@ function renderOrg(org, idx) {
       <span class="count-pill PASS">Complete<b>${s.complete}</b></span>
       <span class="count-pill FAIL">Failed<b>${s.failed}</b></span>
       <span class="count-pill">Users<b>${s.user_count}</b></span>
-      <span class="count-pill">Sessions<b>${s.session_count}</b></span>
+      ${s.session_count ? `<span class="count-pill">Sessions<b>${s.session_count}</b></span>` : ''}
       <span class="count-pill">Range<b style="font-size:11px">${shortDate(s.first_ts)} → ${shortDate(s.last_ts)}</b></span>
     </div>
     <label style="margin:0 0 8px; display:block">
