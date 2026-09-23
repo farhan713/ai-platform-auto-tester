@@ -48,6 +48,13 @@ def pool() -> ConnectionPool:
             conninfo=_conninfo(),
             min_size=1, max_size=10,
             timeout=20,
+            # Managed Postgres restarts (maintenance / failover) kill every
+            # pooled connection. Without a liveness check the pool hands out a
+            # dead one and the request 500s with AdminShutdown; check_connection
+            # pings first and transparently replaces it. max_lifetime also
+            # rotates connections so none linger across a restart.
+            check=ConnectionPool.check_connection,
+            max_lifetime=30 * 60,
             kwargs={"row_factory": dict_row, "autocommit": True},
             open=True,
         )
@@ -81,16 +88,31 @@ def cursor() -> Iterator[psycopg.Cursor]:
 # ---------------------------------------------------------------------------
 # Tiny query helpers — enough for our needs without an ORM
 # ---------------------------------------------------------------------------
+def _read_with_retry(run: Any) -> Any:
+    """Run a read once more if the connection dies mid-flight (server restart).
+    Reads only — a write is not retried, since a statement that reached the
+    server before the connection dropped could otherwise be applied twice."""
+    try:
+        return run()
+    except (psycopg.OperationalError, psycopg.InterfaceError):
+        time.sleep(0.5)
+        return run()
+
+
 def fetch_one(sql: str, params: tuple = ()) -> dict[str, Any] | None:
-    with cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()
+    def run() -> dict[str, Any] | None:
+        with cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+    return _read_with_retry(run)
 
 
 def fetch_all(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-    with cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+    def run() -> list[dict[str, Any]]:
+        with cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    return _read_with_retry(run)
 
 
 def execute(sql: str, params: tuple = ()) -> None:
