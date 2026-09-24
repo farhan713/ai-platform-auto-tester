@@ -117,7 +117,43 @@ def _boot():
 
 @app.context_processor
 def inject_globals():
-    return {"app_version": APP_VERSION, "active": "", "g": g}
+    return {"app_version": APP_VERSION, "active": "", "g": g,
+            "is_admin": auth.is_admin(), "user_role": auth.effective_role(getattr(g, "user", None))}
+
+
+# ---------------------------------------------------------------------------
+# Roles. Admin sees everything; celerant sees Dashboard, Activity Logs and
+# SQL Dev. Enforced here for EVERY endpoint rather than per-route, so a hidden
+# nav link can never be bypassed by typing the URL.
+# ---------------------------------------------------------------------------
+_OPEN_ENDPOINTS = frozenset({"login", "signup", "logout", "static"})
+CELERANT_ENDPOINTS = frozenset({
+    "dashboard", "api_stats",                                     # Dashboard
+    "activity_logs_page", "activity_logs_orgs", "activity_logs_fetch",
+    "sql_dev_page", "sql_dev_feedback", "sql_dev_save_draft", "sql_dev_approve",
+})
+
+
+def _wants_json() -> bool:
+    return (request.path.startswith("/api/")
+            or request.is_json
+            or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            or (request.accept_mimetypes["application/json"]
+                > request.accept_mimetypes["text/html"]))
+
+
+@app.before_request
+def _enforce_role() -> Any:
+    ep = request.endpoint or ""
+    if ep in _OPEN_ENDPOINTS or ep in CELERANT_ENDPOINTS:
+        return None
+    if not getattr(g, "user", None):
+        return None                      # login_required handles anonymous users
+    if auth.is_admin():
+        return None
+    if _wants_json():
+        return jsonify({"ok": False, "error": "Your account does not have access to this feature."}), 403
+    return redirect(url_for("dashboard"))
 
 
 @app.template_global()
@@ -2467,6 +2503,84 @@ def job_variant_report_api(job_id: str):
     if not vg:
         return jsonify({"error": "This run is not a variant test."}), 400
     return jsonify(_variant_report(job_id, vg))
+
+
+# ---------------------------------------------------------------------------
+# Users — admin-only account and role management, so roles never need SQL.
+# ---------------------------------------------------------------------------
+@app.route("/users")
+@auth.admin_required
+def users_page():
+    rows = db.fetch_all("""
+        SELECT u.id, u.email, u.name, u.role, u.created_at, u.last_login_at,
+               (SELECT COUNT(*) FROM runs r WHERE r.user_id = u.id) AS run_count
+        FROM users u ORDER BY u.created_at
+    """)
+    locked = auth.admin_emails()
+    users = [{**u,
+              "effective_role": auth.effective_role(u),
+              "locked": (u["email"] or "").lower() in locked} for u in rows]
+    return render_template("users.html", active="users", users=users,
+                           admin_emails=sorted(locked))
+
+
+@app.route("/users/role", methods=["POST"])
+@auth.admin_required
+def users_set_role():
+    user_id = (request.form.get("user_id") or "").strip()
+    role = (request.form.get("role") or "").strip()
+    if role not in auth.ROLES:
+        return jsonify({"ok": False, "error": "Unknown role."}), 400
+    target = auth.get_user(user_id)
+    if not target:
+        return jsonify({"ok": False, "error": "Account not found."}), 404
+    if (target["email"] or "").lower() in auth.admin_emails():
+        return jsonify({"ok": False, "error": "This account is admin via SQA_ADMIN_EMAILS; change that setting instead."}), 400
+    if target["id"] == auth.current_user_id() and role != auth.ROLE_ADMIN:
+        return jsonify({"ok": False, "error": "You can't remove your own admin access."}), 400
+    if role != auth.ROLE_ADMIN and _admin_count() <= 1 and auth.effective_role(target) == auth.ROLE_ADMIN:
+        return jsonify({"ok": False, "error": "This is the last admin — promote someone else first."}), 400
+    db.execute("UPDATE users SET role = %s WHERE id = %s", (role, user_id))
+    return jsonify({"ok": True, "role": role})
+
+
+@app.route("/users/create", methods=["POST"])
+@auth.admin_required
+def users_create():
+    role = (request.form.get("role") or auth.ROLE_CELERANT).strip()
+    if role not in auth.ROLES:
+        return jsonify({"ok": False, "error": "Unknown role."}), 400
+    try:
+        user = auth.create_user(request.form.get("email") or "",
+                                request.form.get("password") or "",
+                                request.form.get("name") or "", role=role)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Could not create the account: {e}"}), 500
+    return jsonify({"ok": True, "id": user["id"]})
+
+
+@app.route("/users/delete", methods=["POST"])
+@auth.admin_required
+def users_delete():
+    user_id = (request.form.get("user_id") or "").strip()
+    target = auth.get_user(user_id)
+    if not target:
+        return jsonify({"ok": False, "error": "Account not found."}), 404
+    if target["id"] == auth.current_user_id():
+        return jsonify({"ok": False, "error": "You can't remove your own account."}), 400
+    if auth.effective_role(target) == auth.ROLE_ADMIN and _admin_count() <= 1:
+        return jsonify({"ok": False, "error": "This is the last admin — promote someone else first."}), 400
+    db.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    return jsonify({"ok": True})
+
+
+def _admin_count() -> int:
+    """Admins that exist in the database (SQA_ADMIN_EMAILS accounts included
+    only once they have signed up)."""
+    rows = db.fetch_all("SELECT email, role FROM users")
+    return sum(1 for r in rows if auth.effective_role(r) == auth.ROLE_ADMIN)
 
 
 @app.route("/settings")

@@ -11,6 +11,11 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at   TIMESTAMPTZ
 );
 
+-- Roles: 'admin' | 'celerant'. Legacy 'user' rows stay valid and are treated
+-- as celerant by auth.effective_role(); no data migration needed.
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
+ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin', 'celerant'));
+
 CREATE TABLE IF NOT EXISTS test_files (
     id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

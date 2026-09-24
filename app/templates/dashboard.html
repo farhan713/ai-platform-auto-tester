@@ -59,6 +59,8 @@
 {% block scripts %}
 <script src="{{ url_for('static', filename='vendor/chart.umd.js') }}"></script>
 <script>Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;</script>
+<script>// Celerant role has no access to run pages — don't render dead links.
+const CAN_OPEN_RUNS = {{ 'true' if is_admin else 'false' }};</script>
 <script>
 async function loadDashboard() {
   try {
@@ -139,14 +141,14 @@ async function loadDashboard() {
       rr.innerHTML = '<tr><td colspan="4" class="table-empty">No runs yet — start one from <a href="/runs/new">New Run</a>.</td></tr>';
     } else {
       rr.innerHTML = s.recent_runs.map(r => `
-        <tr class="clickable" onclick="location.href='/jobs/${encodeURIComponent(r.id)}'">
+        <tr class="${CAN_OPEN_RUNS ? 'clickable' : ''}" ${CAN_OPEN_RUNS ? `onclick="location.href='/jobs/${encodeURIComponent(r.id)}'"` : ''}>
           <td><code>${SQA.escapeHtml(r.id.slice(0, 18))}</code></td>
           <td><span class="meta">${SQA.fmtDate(r.created_at)}</span></td>
           <td>
             <span class="badge ${(r.status||'').toUpperCase()}">${SQA.escapeHtml(r.status||'?')}</span>
             ${r.summary ? `<span class="meta" style="margin-left:6px">${r.summary.PASS||0}P · ${r.summary.PARTIAL||0}W · ${r.summary.FAIL||0}F · ${r.summary.TIMEOUT||0}T</span>` : ''}
           </td>
-          <td><a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(r.id)}">Open →</a></td>
+          <td>${CAN_OPEN_RUNS ? `<a class="btn btn-sm btn-ghost" href="/jobs/${encodeURIComponent(r.id)}">Open →</a>` : ''}</td>
         </tr>`).join('');
     }
   } catch (e) {

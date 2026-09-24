@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block header_title %}Users{% endblock %}
+{% block header_sub %}— Who can sign in, and what they can see{% endblock %}
+
+{% block head_extra %}
+<style>
+  .u-role { display:inline-flex; align-items:center; gap:6px; }
+  .u-role select { min-width:120px; }
+  .u-you { font-size:11px; color:var(--text-muted); }
+  .u-locked { font-size:11px; color:var(--text-muted); display:inline-flex; align-items:center; gap:5px; }
+  .u-locked .i { width:13px; height:13px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="card">
+  <h2>Accounts</h2>
+  <p class="meta" style="margin-top:-4px">
+    <b>Admin</b> sees every page. <b>Celerant</b> sees Dashboard, Activity Logs and SQL&nbsp;Dev only.
+    {% if admin_emails %}
+      Emails listed in <code>SQA_ADMIN_EMAILS</code> are always admin and can't be changed here:
+      {% for e in admin_emails %}<code>{{ e }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    {% endif %}
+  </p>
+
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Email</th><th>Name</th><th>Role</th><th>Runs</th>
+          <th>Created</th><th>Last sign-in</th><th style="text-align:right">Remove</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for u in users %}
+        <tr data-user-id="{{ u.id }}">
+          <td>{{ u.email }}{% if u.id == g.user.id %} <span class="u-you">(you)</span>{% endif %}</td>
+          <td>{{ u.name or '—' }}</td>
+          <td>
+            {% if u.locked %}
+              <span class="u-locked">{{ icon('gear-six') }} admin · from config</span>
+            {% else %}
+              <span class="u-role">
+                <select class="u-role-select" data-user-id="{{ u.id }}" aria-label="Role for {{ u.email }}">
+                  <option value="celerant" {% if u.effective_role == 'celerant' %}selected{% endif %}>Celerant</option>
+                  <option value="admin" {% if u.effective_role == 'admin' %}selected{% endif %}>Admin</option>
+                </select>
+              </span>
+            {% endif %}
+          </td>
+          <td>{{ u.run_count }}</td>
+          <td><span class="meta">{{ u.created_at.strftime('%Y-%m-%d') if u.created_at else '—' }}</span></td>
+          <td><span class="meta">{{ u.last_login_at.strftime('%Y-%m-%d %H:%M') if u.last_login_at else 'never' }}</span></td>
+          <td style="text-align:right">
+            {% if u.id == g.user.id %}
+              <span class="u-you">—</span>
+            {% else %}
+              <button class="btn btn-sm u-delete" data-user-id="{{ u.id }}"
+                      data-email="{{ u.email }}" data-runs="{{ u.run_count }}">{{ icon('x') }} Remove</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Add an account</h2>
+  <p class="meta" style="margin-top:-4px">Creates the account straight away. Share the password with the person; they can sign in immediately.</p>
+  <form class="form" id="u-create">
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Email <em>required</em></span>
+        <input type="email" name="email" required autocomplete="off" placeholder="name@company.com">
+      </label>
+      <label>
+        <span class="label-text">Name</span>
+        <input type="text" name="name" autocomplete="off" placeholder="Optional">
+      </label>
+    </div>
+    <div class="grid-2">
+      <label>
+        <span class="label-text">Password <em>required</em></span>
+        <input type="text" name="password" required autocomplete="off" minlength="8" placeholder="At least 8 characters">
+        <small>Shown as plain text so you can copy it — they should change it after signing in.</small>
+      </label>
+      <label>
+        <span class="label-text">Role</span>
+        <select name="role">
+          <option value="celerant" selected>Celerant — Dashboard, Activity Logs, SQL Dev</option>
+          <option value="admin">Admin — everything</option>
+        </select>
+      </label>
+    </div>
+    <button type="submit" class="btn btn-primary" id="u-create-submit">{{ icon('plus') }} Create account</button>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST', body: new URLSearchParams(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!d.ok) throw new Error(d.error || `Request failed (HTTP ${r.status})`);
+  return d;
+}
+
+document.querySelectorAll('.u-role-select').forEach(sel => {
+  sel.dataset.prev = sel.value;
+  sel.addEventListener('change', async () => {
+    sel.disabled = true;
+    try {
+      await post('{{ url_for("users_set_role") }}', { user_id: sel.dataset.userId, role: sel.value });
+      sel.dataset.prev = sel.value;
+      SQA.toast('Role updated.', 'success');
+    } catch (e) {
+      sel.value = sel.dataset.prev;
+      SQA.toast(e.message, 'error');
+    } finally { sel.disabled = false; }
+  });
+});
+
+document.querySelectorAll('.u-delete').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const runs = parseInt(btn.dataset.runs, 10) || 0;
+    const extra = runs ? `\n\nThis also deletes their ${runs} run(s) and any test files they uploaded.` : '';
+    if (!confirm(`Remove ${btn.dataset.email}?${extra}`)) return;
+    btn.disabled = true;
+    try {
+      await post('{{ url_for("users_delete") }}', { user_id: btn.dataset.userId });
+      document.querySelector(`tr[data-user-id="${btn.dataset.userId}"]`).remove();
+      SQA.toast('Account removed.', 'success');
+    } catch (e) {
+      btn.disabled = false;
+      SQA.toast(e.message, 'error');
+    }
+  });
+});
+
+const createForm = document.getElementById('u-create');
+const createBtn = document.getElementById('u-create-submit');
+createForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  createBtn.disabled = true;
+  try {
+    const fd = new FormData(createForm);
+    await post('{{ url_for("users_create") }}', Object.fromEntries(fd));
+    SQA.toast('Account created.', 'success');
+    setTimeout(() => location.reload(), 600);
+  } catch (err) {
+    SQA.toast(err.message, 'error');
+    createBtn.disabled = false;
+  }
+});
+</script>
+{% endblock %}
