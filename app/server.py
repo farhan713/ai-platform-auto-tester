@@ -1134,11 +1134,55 @@ def _celerant_request(method: str, url: str, **kwargs: Any) -> Any:
     return resp
 
 
-def celerant_call(method: str, console: str | None, path: str, **kwargs: Any) -> tuple[Any, str]:
+# Celerant is adding a role segment to the end of some paths: 1 = admin,
+# 2 = celerant (e.g. /all_orgs/1/ and /history_data/{org}/0/20/1/). It is not
+# live yet — their API still reads a trailing segment on /all_orgs/ as an org
+# id and 404s. So we send it, and on a 404 fall back to the path without it and
+# remember that for a while. When their side ships, we start using it with no
+# redeploy. SQA_CELERANT_ROLE_PATH=off disables it; =force skips the fallback.
+CELERANT_ROLE_PATH_MODE = os.environ.get("SQA_CELERANT_ROLE_PATH", "auto").strip().lower()
+CELERANT_ROLE_FLAGS = {auth.ROLE_ADMIN: "1", auth.ROLE_CELERANT: "2"}
+_ROLE_PATH_RETRY_AFTER = 10 * 60          # seconds to wait before probing again
+_role_path_unsupported_until: dict[str, float] = {}
+
+
+def celerant_role_flag() -> str:
+    """'1' for an admin user, '2' for a celerant user. Falls back to celerant
+    outside a request context — worker threads must pass the flag explicitly."""
+    try:
+        user = getattr(g, "user", None)
+    except RuntimeError:
+        user = None
+    return CELERANT_ROLE_FLAGS.get(auth.effective_role(user), "2")
+
+
+def _role_path_supported(origin: str) -> bool:
+    if CELERANT_ROLE_PATH_MODE == "off":
+        return False
+    if CELERANT_ROLE_PATH_MODE == "force":
+        return True
+    return time.time() >= _role_path_unsupported_until.get(origin, 0.0)
+
+
+def celerant_call(method: str, console: str | None, path: str,
+                  role_scoped: bool = False, role_flag: str | None = None,
+                  **kwargs: Any) -> tuple[Any, str]:
     """Call {origin}/sql_agent_v2/{path}, falling back to v1 if v2 lacks the
-    route. Returns (response, url_actually_used)."""
+    route. With role_scoped=True the caller's role flag is appended to the path
+    first, dropping back to the plain path while Celerant lacks that route.
+    Returns (response, url_actually_used)."""
     origin = _celerant_origin(console)
     path = path.lstrip("/")
+
+    if role_scoped and _role_path_supported(origin):
+        role_path = f"{path.rstrip('/')}/{role_flag or celerant_role_flag()}/"
+        url = f"{origin}/{CELERANT_API_PREFIX}/{role_path}"
+        resp = _celerant_request(method, url, **kwargs)
+        if resp.status_code != 404:
+            return resp, url
+        if CELERANT_ROLE_PATH_MODE != "force":
+            _role_path_unsupported_until[origin] = time.time() + _ROLE_PATH_RETRY_AFTER
+
     url = f"{origin}/{CELERANT_API_PREFIX}/{path}"
     resp = _celerant_request(method, url, **kwargs)
     if (CELERANT_API_FALLBACK_PREFIX and CELERANT_API_FALLBACK_PREFIX != CELERANT_API_PREFIX
@@ -1660,7 +1704,7 @@ def _fetch_all_orgs_normalized(console: str, bearer: str = "") -> list[dict[str,
     """GET {console}/sql_agent_v2/all_orgs/ and return a normalized, name-sorted
     list of {id, name, organization_id}. Raises on transport / non-2xx."""
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
-    resp, _ = celerant_call("GET", console, "all_orgs/", headers=headers, timeout=30)
+    resp, _ = celerant_call("GET", console, "all_orgs/", headers=headers, timeout=30, role_scoped=True)
     resp.raise_for_status()
     raw = (resp.json() or {}).get("responseBody", {}).get("data") or []
     out = [n for n in (_normalize_org(o) for o in raw) if n and n["id"]]
@@ -1764,7 +1808,7 @@ def activity_logs_fetch():
         query = urlencode({"from_date": from_d, "to_date": to_d})
         url = f"{_celerant_origin(console)}/{CELERANT_API_PREFIX}/{path}?{query}"
         try:
-            resp, used = celerant_call("GET", console, path,
+            resp, used = celerant_call("GET", console, path, role_scoped=True,
                                        params={"from_date": from_d, "to_date": to_d},
                                        headers=headers, timeout=120)
             # Full URL WITH the date query params — exactly what was sent, and
@@ -1843,6 +1887,7 @@ def _fetch_orgs_history_parallel(
 
     console = console.rstrip("/")
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    role_flag = celerant_role_flag()   # read here; g is not available in the pool
     errors: list[str] = []
 
     # 1) Get the full org list (normalized across API shape changes).
@@ -1875,7 +1920,7 @@ def _fetch_orgs_history_parallel(
         industry = org.get("industry", "")
         try:
             r, _ = celerant_call("GET", console, f"history_data/{hid}/0/{_INSIGHTS_LIMIT_PER_ORG}/",
-                                 headers=headers,
+                                 role_scoped=True, role_flag=role_flag, headers=headers,
                                  params={"from_date": from_mmddyyyy, "to_date": to_mmddyyyy},
                                  timeout=60)
             r.raise_for_status()
