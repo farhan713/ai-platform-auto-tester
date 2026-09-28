@@ -55,7 +55,7 @@
         <select name="org_ids" id="al-org-select" required style="flex:1">
           <option value="">— loading organizations… —</option>
         </select>
-        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent_v2/all_orgs/" aria-label="Reload organizations">{{ icon('arrow-clockwise') }}</button>
+        <button type="button" class="btn btn-sm" id="al-org-reload" title="Re-fetch from /sql_agent/all_orgs/" aria-label="Reload organizations">{{ icon('arrow-clockwise') }}</button>
       </div>
       <span class="meta" id="al-orgs-status"></span>
     </label>
@@ -133,7 +133,7 @@ const orgsEl = document.getElementById('al-orgs');
 // Per-org search state, keyed by org id (database_id).
 const _filters = {};
 
-// Cache of orgs from /sql_agent_v2/all_orgs/. dbId -> {name, organization_id, database_id}
+// Cache of orgs from /sql_agent/all_orgs/. dbId -> {name, organization_id, database_id}
 // Kept so the per-org report header can show the friendly name.
 const _orgsByDbId = {};
 

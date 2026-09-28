@@ -1074,12 +1074,12 @@ def test_pages_page():
 # CORS (the call is made server-side).
 # ---------------------------------------------------------------------------
 
-# Celerant API version. Every server-side call goes to sql_agent_v2 first.
-# Some routes we use (history_data, train_sql_examples_backoffice_validated)
-# aren't on v2 yet, so when v2 answers with FastAPI's bare route-404 we retry
-# the same path on v1. Once Celerant ships a route on v2 the fallback simply
-# stops firing — no redeploy needed.
-CELERANT_API_PREFIX = os.environ.get("SQA_CELERANT_API_PREFIX", "sql_agent_v2").strip("/")
+# Celerant API version. Every server-side call goes to
+# https://celerantai.com/sql_agent/... (v1). To try v2 again without a code
+# change set SQA_CELERANT_API_PREFIX=sql_agent_v2; routes v2 lacks (FastAPI's
+# bare route-404) then retry on the fallback prefix below. While the prefix is
+# already sql_agent the fallback never fires.
+CELERANT_API_PREFIX = os.environ.get("SQA_CELERANT_API_PREFIX", "sql_agent").strip("/")
 CELERANT_API_FALLBACK_PREFIX = os.environ.get("SQA_CELERANT_API_FALLBACK_PREFIX", "sql_agent").strip("/")
 
 
@@ -1167,8 +1167,8 @@ def _role_path_supported(origin: str) -> bool:
 def celerant_call(method: str, console: str | None, path: str,
                   role_scoped: bool = False, role_flag: str | None = None,
                   **kwargs: Any) -> tuple[Any, str]:
-    """Call {origin}/sql_agent_v2/{path}, falling back to v1 if v2 lacks the
-    route. With role_scoped=True the caller's role flag is appended to the path
+    """Call {origin}/{CELERANT_API_PREFIX}/{path}, retrying on the fallback
+    prefix if the primary lacks the route. With role_scoped=True the caller's role flag is appended to the path
     first, dropping back to the plain path while Celerant lacks that route.
     Returns (response, url_actually_used)."""
     origin = _celerant_origin(console)
@@ -1701,7 +1701,7 @@ def _normalize_org(o: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _fetch_all_orgs_normalized(console: str, bearer: str = "") -> list[dict[str, Any]]:
-    """GET {console}/sql_agent_v2/all_orgs/ and return a normalized, name-sorted
+    """GET {console}/sql_agent/all_orgs/ and return a normalized, name-sorted
     list of {id, name, organization_id}. Raises on transport / non-2xx."""
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
     resp, _ = celerant_call("GET", console, "all_orgs/", headers=headers, timeout=30, role_scoped=True)
@@ -2198,7 +2198,7 @@ def insights_data():
 # generate a visualization, save a draft, and approve into the trained set.
 # Every call is proxied server-side to the celerantai SQL-Agent API.
 # ---------------------------------------------------------------------------
-# Console ORIGIN — celerant_call() appends the versioned /sql_agent_v2/... path.
+# Console ORIGIN — celerant_call() appends the versioned /sql_agent/... path.
 SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com").rstrip("/")
 
 
