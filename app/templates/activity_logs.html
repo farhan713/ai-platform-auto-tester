@@ -149,9 +149,9 @@ async function loadOrgs() {
   sel.disabled = true;
   status.textContent = '';
   try {
-    const r = await SQA.fetchJSON('{{ url_for("activity_logs_orgs") }}');
-    if (!r.ok) throw new Error(r.error || 'Failed to load organizations');
-    const orgs = r.orgs || [];
+    const orgs = (await Celerant.orgs(document.getElementById('al-console_url').value,
+                                      document.getElementById('al-bearer_token').value.trim()))
+      .map(o => ({ name: o.name, database_id: o.id, organization_id: o.organization_id }));
     for (const k of Object.keys(_orgsByDbId)) delete _orgsByDbId[k];
     for (const o of orgs) _orgsByDbId[o.database_id] = o;
     sel.innerHTML = '<option value="">— select an organization —</option>'
@@ -534,6 +534,85 @@ function renderResult(data) {
   });
 }
 
+function recordStats(records) {
+  let llm = 0, rag = 0, first = null, last = null;
+  const statuses = {}, users = new Set(), sessions = new Set();
+  for (const r of records) {
+    if (r.llm_invoked === true) llm++;
+    else if (r.llm_invoked === false) rag++;
+    const s = String(r.query_status || 'unknown').toLowerCase();
+    statuses[s] = (statuses[s] || 0) + 1;
+    const u = userOf(r);
+    if (u) users.add(u);
+    if (r.session_id) sessions.add(String(r.session_id));
+    const ts = r.created_at;
+    if (ts) {
+      if (first === null || ts < first) first = ts;
+      if (last === null || ts > last) last = ts;
+    }
+  }
+  return {
+    llm, rag,
+    complete: statuses.complete || 0,
+    failed: statuses.failed || 0,
+    status_breakdown: statuses,
+    users: [...users].sort(),
+    user_count: users.size,
+    session_count: sessions.size,
+    first_ts: first, last_ts: last,
+  };
+}
+
+// One history_data call per org, straight to Celerant (visible in DevTools).
+async function fetchOrgHistory(orgId, opts) {
+  const path = `history_data/${encodeURIComponent(orgId)}/${opts.offset}/${opts.limit}/`;
+  try {
+    const res = await Celerant.call('GET', path, {
+      console: opts.console, token: opts.token, roleScoped: true, timeoutMs: 120000,
+      params: { from_date: opts.from, to_date: opts.to },
+    });
+    const data = (((res.body || {}).responseBody || {}).data);
+    const records = (data && typeof data === 'object' && data.history_records) || [];
+    return {
+      org_id: orgId, ok: res.ok, status_code: res.status, url: res.url,
+      history_count: data && typeof data === 'object' ? (data.history_count ?? null) : null,
+      count: records.length, records, stats: recordStats(records),
+      error: res.ok ? null : Celerant.errorMessage(res),
+    };
+  } catch (err) {
+    const url = `${Celerant.origin(opts.console)}/${CELERANT_CFG.prefix}/${path}?`
+      + new URLSearchParams({ from_date: opts.from, to_date: opts.to });
+    return { org_id: orgId, ok: false, status_code: null, url, error: err.message,
+             count: 0, records: [], stats: recordStats([]) };
+  }
+}
+
+async function fetchHistory() {
+  const orgIds = String(document.getElementById('al-org-select').value || '')
+    .split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+  if (orgIds.length > 25) return { ok: false, error: 'Up to 25 organizations per request.' };
+  const from = Celerant.toMmDdYyyy(document.getElementById('al-from').value);
+  const to = Celerant.toMmDdYyyy(document.getElementById('al-to').value);
+  if (!from || !to) return { ok: false, error: 'Provide both from_date and to_date (YYYY-MM-DD).' };
+  const offset = Math.max(0, parseInt(document.getElementById('al-offset').value, 10) || 0);
+  const limit = Math.min(1000, Math.max(1, parseInt(document.getElementById('al-limit').value, 10) || 100));
+  const opts = { from, to, offset, limit,
+                 console: document.getElementById('al-console_url').value,
+                 token: document.getElementById('al-bearer_token').value.trim() };
+
+  const organizations = [];
+  const totals = { orgs: 0, queries: 0, llm: 0, rag: 0, complete: 0, failed: 0 };
+  for (const id of orgIds) {
+    const entry = await fetchOrgHistory(id, opts);
+    organizations.push(entry);
+    if (!entry.ok) continue;
+    totals.orgs++;
+    totals.queries += entry.count;
+    for (const k of ['llm', 'rag', 'complete', 'failed']) totals[k] += entry.stats[k];
+  }
+  return { ok: true, from_date: from, to_date: to, offset, limit, totals, organizations };
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const sel = document.getElementById('al-org-select');
@@ -544,9 +623,7 @@ form.addEventListener('submit', async (e) => {
   totalsEl.innerHTML = '';
   orgsEl.innerHTML = '<div class="card"><p class="meta">Waiting for the history endpoint…</p></div>';
   try {
-    const fd = new FormData(form);
-    const r = await fetch('{{ url_for("activity_logs_fetch") }}', { method: 'POST', body: new URLSearchParams(fd) });
-    const data = await r.json();
+    const data = await fetchHistory();
     renderResult(data);
     statusEl.textContent = '';
     if (data.ok) SQA.toast(`Fetched ${data.totals.queries} queries across ${data.totals.orgs} organization(s).`, 'success');

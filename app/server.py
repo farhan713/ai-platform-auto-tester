@@ -118,7 +118,13 @@ def _boot():
 @app.context_processor
 def inject_globals():
     return {"app_version": APP_VERSION, "active": "", "g": g,
-            "is_admin": auth.is_admin(), "user_role": auth.effective_role(getattr(g, "user", None))}
+            "is_admin": auth.is_admin(), "user_role": auth.effective_role(getattr(g, "user", None)),
+            # Read by static/celerant.js, which calls the Celerant API from the browser.
+            "celerant_cfg": {"prefix": CELERANT_API_PREFIX,
+                             "fallback_prefix": CELERANT_API_FALLBACK_PREFIX,
+                             "role_path_mode": CELERANT_ROLE_PATH_MODE,
+                             "role_flag": celerant_role_flag(),
+                             "default_console": "https://celerantai.com"}}
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +135,8 @@ def inject_globals():
 _OPEN_ENDPOINTS = frozenset({"login", "signup", "logout", "static"})
 CELERANT_ENDPOINTS = frozenset({
     "dashboard", "api_stats",                                     # Dashboard
-    "activity_logs_page", "activity_logs_orgs", "activity_logs_fetch",
-    "sql_dev_page", "sql_dev_feedback", "sql_dev_save_draft", "sql_dev_approve",
+    "activity_logs_page",
+    "sql_dev_page", "sql_dev_demo_feedback",
 })
 
 
@@ -1067,11 +1073,10 @@ def test_pages_page():
 
 
 # ---------------------------------------------------------------------------
-# Training — proxy to Celerant's train_sql_examples_backoffice_validated API.
-# Lets a QA user upload a CSV of validated SQL examples (or point at a server
-# filepath) and POST it to the tenant's training endpoint, then see which
-# rows were saved and which failed — all without leaving the tool or fighting
-# CORS (the call is made server-side).
+# Celerant SQL-Agent API. Activity Logs, SQL Dev and Training call it straight
+# from the browser (static/celerant.js, configured via inject_globals) so the
+# real requests show up in DevTools. Insights still fans out server-side
+# through celerant_call() below; the two clients share the same rules.
 # ---------------------------------------------------------------------------
 
 # Celerant API version. Every server-side call goes to
@@ -1197,115 +1202,6 @@ def celerant_call(method: str, console: str | None, path: str,
 def training_page():
     return render_template("training.html", active="training",
                            default_console="https://celerantai.com")
-
-
-@app.route("/training/submit", methods=["POST"])
-@auth.login_required
-def training_submit():
-    """Proxy a training request to the Celerant SQL-Agent training endpoint.
-
-    The Celerant endpoint executes every CSV row's sql_query against the
-    tenant's run-sql endpoint and only persists rows whose response status
-    is 'success'; failed rows come back in the response. We run this call
-    server-side (long timeout, no browser CORS) and hand the JSON straight
-    back to the page.
-    """
-    import requests  # lazy import — only needed for this feature
-
-    database_id = (request.form.get("database_id") or "").strip().strip("/")
-    if not database_id:
-        return jsonify({"ok": False, "error": "Database ID is required."}), 400
-
-    # Optional console origin override (default celerantai.com).
-    console = request.form.get("console_url")
-    train_path = f"train_sql_examples_backoffice_validated/{database_id}/"
-    url = f"{_celerant_origin(console)}/{CELERANT_API_PREFIX}/{train_path}"
-
-    # Query params — only send the ones the user actually set.
-    params: dict[str, str] = {}
-    filepath = (request.form.get("sql_examples_filepath") or "").strip()
-    if filepath:
-        params["sql_examples_filepath"] = filepath
-    for key in ("skip_display_clean", "skip_nlq_variants"):
-        val = request.form.get(key)
-        if val in ("true", "false"):
-            params[key] = val
-
-    # Optional CSV file upload (multipart). One of file/filepath is required.
-    files = None
-    parsed_questions: list[dict[str, str]] = []
-    upload = request.files.get("sql_examples_file")
-    if upload and upload.filename:
-        csv_bytes = upload.read()
-        files = {
-            "sql_examples_file": (
-                upload.filename,
-                csv_bytes,
-                upload.mimetype or "text/csv",
-            )
-        }
-        # Parse the CSV into questions so the page can offer a follow-up
-        # "test these same questions on the SQL Agent" run after training succeeds.
-        try:
-            text = csv_bytes.decode("utf-8-sig", errors="replace")
-            reader = csv.DictReader(io.StringIO(text))
-            for row in reader:
-                nl = (row.get("natural_language_query") or "").strip()
-                sql = (row.get("sql_query") or "").strip()
-                if nl:
-                    parsed_questions.append(
-                        {"natural_language_query": nl, "expected_sql": sql}
-                    )
-        except Exception:
-            parsed_questions = []
-    if not files and not filepath:
-        return jsonify({
-            "ok": False,
-            "error": "Provide either a CSV file to upload, or a server-side "
-                     "sql_examples_filepath. At least one is required.",
-        }), 400
-
-    # Optional bearer token — HTTPBearer is defined in the spec but not
-    # enforced for this endpoint; pass it through if the tenant requires it.
-    headers: dict[str, str] = {}
-    token = (request.form.get("bearer_token") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    started = time.time()
-    try:
-        resp, url = celerant_call("POST", console, train_path, params=params,
-                                  files=files, headers=headers, timeout=600)
-    except requests.exceptions.SSLError:
-        # Fall back to no-verify if the tenant uses a self-signed cert.
-        try:
-            resp, url = celerant_call("POST", console, train_path, params=params,
-                                      files=files, headers=headers, timeout=600,
-                                      verify=False)
-        except Exception as e:
-            return jsonify({"ok": False, "url": url,
-                            "error": f"Request failed (SSL): {type(e).__name__}: {e}"}), 502
-    except Exception as e:
-        return jsonify({"ok": False, "url": url,
-                        "error": f"Request failed: {type(e).__name__}: {e}"}), 502
-    elapsed_ms = int((time.time() - started) * 1000)
-
-    try:
-        body = resp.json()
-    except Exception:
-        body = (resp.text or "")[:100_000]
-
-    return jsonify({
-        "ok": 200 <= resp.status_code < 300,
-        "status_code": resp.status_code,
-        "url": url,
-        "params": params,
-        "elapsed_ms": elapsed_ms,
-        "response": body,
-        # Parsed from the uploaded CSV so the page can offer a follow-up
-        # "test these on the SQL Agent" run without re-uploading.
-        "uploaded_questions": parsed_questions,
-    })
 
 
 @app.route("/training/test-run", methods=["POST"])
@@ -1719,150 +1615,6 @@ def activity_logs_page():
                            default_console="https://celerantai.com")
 
 
-@app.route("/activity-logs/orgs")
-@auth.login_required
-def activity_logs_orgs():
-    """Proxy to GET {console}/sql_agent/all_orgs/ so the dropdown can be
-    populated server-side (no CORS, no Celerant token leak to the browser).
-    Normalizes across the old/new response shapes (see _normalize_org)."""
-    console = (request.args.get("console_url") or "https://celerantai.com").strip()
-    token = (request.args.get("bearer_token") or "").strip()
-    try:
-        orgs = _fetch_all_orgs_normalized(console, token)
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
-    # Expose 'database_id' as the id field for backward-compat with the
-    # existing activity_logs.html JS (it submits that value).
-    slim = [{"name": o["name"], "database_id": o["id"],
-             "organization_id": o["organization_id"]} for o in orgs]
-    return jsonify({"ok": True, "count": len(slim), "orgs": slim})
-
-
-@app.route("/activity-logs/fetch", methods=["POST"])
-@auth.login_required
-def activity_logs_fetch():
-    """Fetch history for each org id (one per line) and return a combined
-    per-org report. No data is stored — this is a live proxy."""
-    import requests
-
-    raw_ids = (request.form.get("org_ids") or "").strip()
-    org_ids = [s.strip() for s in re.split(r"[\s,]+", raw_ids) if s.strip()]
-    if not org_ids:
-        return jsonify({"ok": False, "error": "Provide at least one Organization ID."}), 400
-    if len(org_ids) > 25:
-        return jsonify({"ok": False, "error": "Up to 25 organizations per request."}), 400
-
-    from_d = _yyyy_mm_dd_to_mm_dd_yyyy(request.form.get("from_date") or "")
-    to_d   = _yyyy_mm_dd_to_mm_dd_yyyy(request.form.get("to_date") or "")
-    if not from_d or not to_d:
-        return jsonify({"ok": False, "error": "Provide both from_date and to_date (YYYY-MM-DD)."}), 400
-
-    try:
-        offset = max(0, int(request.form.get("offset") or 0))
-        limit  = min(1000, max(1, int(request.form.get("limit") or 100)))
-    except ValueError:
-        return jsonify({"ok": False, "error": "offset and limit must be integers."}), 400
-
-    console = request.form.get("console_url")
-    headers: dict[str, str] = {}
-    token = (request.form.get("bearer_token") or "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    def _stats(records: list[dict[str, Any]]) -> dict[str, Any]:
-        llm = sum(1 for r in records if r.get("llm_invoked") is True)
-        rag = sum(1 for r in records if r.get("llm_invoked") is False)
-        statuses: dict[str, int] = {}
-        users: set[str] = set()
-        sessions: set[str] = set()
-        first = last = None
-        for r in records:
-            s = (r.get("query_status") or "unknown").lower()
-            statuses[s] = statuses.get(s, 0) + 1
-            ln = _record_user(r)
-            if ln:
-                users.add(ln)
-            sid = r.get("session_id")
-            if sid:
-                sessions.add(str(sid))
-            ts = r.get("created_at")
-            if ts:
-                first = ts if (first is None or ts < first) else first
-                last  = ts if (last  is None or ts > last)  else last
-        return {
-            "llm": llm, "rag": rag,
-            "complete": statuses.get("complete", 0),
-            "failed":   statuses.get("failed", 0),
-            "status_breakdown": statuses,
-            "users":    sorted(users),
-            "user_count": len(users),
-            "session_count": len(sessions),
-            "first_ts": first, "last_ts": last,
-        }
-
-    from urllib.parse import urlencode
-    out_orgs: list[dict[str, Any]] = []
-    grand = {"orgs": 0, "queries": 0, "llm": 0, "rag": 0, "complete": 0, "failed": 0}
-    for org_id in org_ids:
-        path = f"history_data/{org_id}/{offset}/{limit}/"
-        query = urlencode({"from_date": from_d, "to_date": to_d})
-        url = f"{_celerant_origin(console)}/{CELERANT_API_PREFIX}/{path}?{query}"
-        try:
-            resp, used = celerant_call("GET", console, path, role_scoped=True,
-                                       params={"from_date": from_d, "to_date": to_d},
-                                       headers=headers, timeout=120)
-            # Full URL WITH the date query params — exactly what was sent, and
-            # what we show in the UI so the date range is visible/verifiable.
-            url = f"{used}?{query}"
-            try:
-                body = resp.json()
-            except Exception:
-                body = (resp.text or "")[:50_000]
-            records = []
-            history_count = None
-            if isinstance(body, dict):
-                rb = body.get("responseBody") or {}
-                data = rb.get("data") if isinstance(rb, dict) else None
-                if isinstance(data, dict):
-                    records = data.get("history_records") or []
-                    history_count = data.get("history_count")
-            entry = {
-                "org_id": org_id,
-                "ok": 200 <= resp.status_code < 300,
-                "status_code": resp.status_code,
-                "url": url,
-                "history_count": history_count,
-                "count": len(records),
-                "records": records,
-                "stats": _stats(records),
-                "error": None if 200 <= resp.status_code < 300 else (
-                    body.get("responseHeader", {}).get("message") if isinstance(body, dict) else str(body)[:200]
-                ),
-            }
-        except Exception as e:
-            entry = {
-                "org_id": org_id, "ok": False, "status_code": None,
-                "url": url, "error": f"{type(e).__name__}: {e}",
-                "count": 0, "records": [], "stats": _stats([]),
-            }
-        out_orgs.append(entry)
-        if entry["ok"]:
-            grand["orgs"] += 1
-            grand["queries"] += entry["count"]
-            grand["llm"] += entry["stats"]["llm"]
-            grand["rag"] += entry["stats"]["rag"]
-            grand["complete"] += entry["stats"]["complete"]
-            grand["failed"] += entry["stats"]["failed"]
-
-    return jsonify({
-        "ok": True,
-        "from_date": from_d, "to_date": to_d,
-        "offset": offset, "limit": limit,
-        "totals": grand,
-        "organizations": out_orgs,
-    })
-
-
 # ---------------------------------------------------------------------------
 # Insights — cross-org dashboard. Fans out to /sql_agent/all_orgs/ then pulls
 # /history_data/{db_id}/0/<limit>/?from&to in parallel for every org and
@@ -2195,231 +1947,33 @@ def insights_data():
 # ---------------------------------------------------------------------------
 # SQL Dev — mirror of the Celerant "SQL Developer" dashboard. Lets a reviewer
 # pull reported / disliked / completed queries for an org, correct the SQL,
-# generate a visualization, save a draft, and approve into the trained set.
-# Every call is proxied server-side to the celerantai SQL-Agent API.
+# save a draft, and approve into the trained set. The page calls the
+# celerantai SQL-Agent API straight from the browser (static/celerant.js).
 # ---------------------------------------------------------------------------
-# Console ORIGIN — celerant_call() appends the versioned /sql_agent/... path.
 SQLDEV_API_BASE = os.environ.get("SQA_SQLDEV_API_BASE", "https://celerantai.com").rstrip("/")
 
 
-def _sqldev_console_base() -> str:
-    return _celerant_origin(request.values.get("console_url") or SQLDEV_API_BASE)
-
-
-def _sqldev_headers() -> dict[str, str]:
-    h = {}
-    tok = (request.values.get("bearer_token") or "").strip()
-    if tok:
-        h["Authorization"] = f"Bearer {tok}"
-    return h
-
-
-def _sqldev_transform_feedback(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten the feedback_data response into a single list of review rows,
-    exactly like the Angular dashboard's loadFeedbackData()."""
-    out: list[dict[str, Any]] = []
-    # The backend renamed this key validated_history_examples ->
-    # validated_sql_history_examples; accept both.
-    vh = (data.get("validated_sql_history_examples")
-          or data.get("validated_history_examples") or {})
-    ex = (data.get("examples") or {})
-    uv = (data.get("user_visit_history") or {})
-
-    for q in (vh.get("validation_status_clicked") or []):
-        out.append({**q, "id": q.get("query_id"), "status": "not_verified",
-                    "reported_date": q.get("created_at"),
-                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
-                    "isDisliked": False})
-    for q in (vh.get("validation_status_dislike") or []):
-        out.append({**q, "id": q.get("query_id"), "status": "not_verified",
-                    "reported_date": q.get("created_at"),
-                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
-                    "isDisliked": True})
-    for q in (ex.get("users_sql_queries") or []):
-        out.append({**q, "id": q.get("example_id"), "query_id": q.get("example_id"),
-                    "dev_sql_query": "", "status": "completed_by_user",
-                    "reported_date": q.get("created_at"),
-                    "corrected_sql": q.get("sql_query"), "isDisliked": False})
-    for q in (ex.get("developer_sql_queries") or []):
-        if not q:
-            continue
-        qid = q.get("query_id") or q.get("example_id")
-        out.append({**q, "id": qid, "query_id": qid, "status": "completed_by_sql_dev",
-                    "reported_date": q.get("created_at"),
-                    "corrected_sql": q.get("dev_sql_query") or q.get("sql_query"),
-                    "isDisliked": False})
-    for q in (uv.get("result") or []):
-        out.append({**q, "id": q.get("query_id"), "dev_sql_query": "",
-                    "status": "user_visit", "reported_date": q.get("created_at"),
-                    "corrected_sql": q.get("sql_query"), "isDisliked": False})
-    return out
+def _sqldev_demo_enabled() -> bool:
+    return os.environ.get("SQA_SQLDEV_DEMO", "").strip() in ("1", "true", "yes")
 
 
 @app.route("/sql-dev")
 @auth.login_required
 def sql_dev_page():
     return render_template("sql_dev.html", active="sql_dev",
-                           default_console="https://celerantai.com",
-                           current_user_id=auth.current_user_id())
+                           default_console=SQLDEV_API_BASE,
+                           current_user_id=auth.current_user_id(),
+                           sqldev_demo=_sqldev_demo_enabled())
 
 
-@app.route("/sql-dev/feedback")
+@app.route("/sql-dev/demo-feedback")
 @auth.login_required
-def sql_dev_feedback():
-    """GET feedback_data/{org_id}/{start}/{end}/?from_date&to_date — the review
-    queue. Returns the flattened rows + the per-category counts for pagination."""
-    import requests
-    from urllib.parse import urlencode
-    org_id = (request.args.get("org_id") or "").strip()
-    if not org_id:
-        return jsonify({"ok": False, "error": "org_id is required"}), 400
-    try:
-        start = max(0, int(request.args.get("start") or 0))
-        end   = max(start, int(request.args.get("end") or 9))
-    except ValueError:
-        return jsonify({"ok": False, "error": "start/end must be integers"}), 400
-    from_d = _yyyy_mm_dd_to_mm_dd_yyyy(request.args.get("from_date") or "")
-    to_d   = _yyyy_mm_dd_to_mm_dd_yyyy(request.args.get("to_date") or "")
-
-    # Demo mode (env-gated, OFF in production) so the page is usable while the
-    # Celerant feedback_data endpoint is returning HTTP 500.
-    if os.environ.get("SQA_SQLDEV_DEMO", "").strip() in ("1", "true", "yes"):
-        return jsonify({"ok": True, "demo": True, **_sqldev_demo_feedback()})
-
-    base = _sqldev_console_base()
-    path = f"feedback_data/{org_id}/{start}/{end}/"
-    params = {"from_date": from_d, "to_date": to_d} if (from_d and to_d) else None
-    query = ("?" + urlencode(params)) if params else ""
-    url = f"{base}/{CELERANT_API_PREFIX}/{path}{query}"
-    try:
-        r, used = celerant_call("GET", base, path, params=params,
-                                headers=_sqldev_headers(), timeout=60)
-        url = f"{used}{query}"
-        try:
-            body = r.json()
-        except Exception:
-            body = {}
-        data = ((body.get("responseBody") or {}).get("data")) if isinstance(body, dict) else None
-        if not (200 <= r.status_code < 300) or data is None:
-            msg = (body.get("responseHeader", {}) or {}).get("message") if isinstance(body, dict) else None
-            return jsonify({"ok": False, "status_code": r.status_code, "url": url,
-                            "error": msg or f"feedback_data returned HTTP {r.status_code}"}), 502
-        vh = (data.get("validated_sql_history_examples")
-              or data.get("validated_history_examples") or {})
-        ex = data.get("examples") or {}
-        uv = data.get("user_visit_history") or {}
-        counts = {
-            "clicked": vh.get("clicked_queries_count") or 0,
-            "dislike": vh.get("dislike_queries_count") or 0,
-            "user": ex.get("user_queries_count") or 0,
-            "developer": ex.get("developer_queries_count") or 0,
-            "user_visit": uv.get("user_visit_history_count") or 0,
-        }
-        return jsonify({"ok": True, "url": url, "rows": _sqldev_transform_feedback(data),
-                        "counts": counts})
-    except Exception as e:
-        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
-
-
-def _sqldev_result(status_code: int, body: Any) -> tuple[bool, str]:
-    """Interpret a validation_from_developer / validation_like response.
-
-    These write endpoints use a FLAT shape {message, data, datalist} — NOT
-    the {responseHeader, responseBody} wrapper the read endpoints use. We
-    accept either and return (ok, message). validation_like also returns
-    data.valid == false when the SQL fails schema validation.
-    """
-    if not isinstance(body, dict):
-        return (200 <= status_code < 300), (str(body)[:300] if body else f"HTTP {status_code}")
-    rh = body.get("responseHeader")
-    if isinstance(rh, dict):  # wrapped shape
-        return rh.get("message_type") == "Success", (rh.get("message") or "")
-    # flat shape
-    msg = (body.get("message") or "").strip()
-    data = body.get("data")
-    low = msg.lower()
-    failed = any(w in low for w in (
-        "issue", "error", "failed", "invalid", "please try again",
-        "could not", "unable", "not reference", "does not"))
-    if isinstance(data, dict) and data.get("valid") is False:
-        failed = True
-    ok = (200 <= status_code < 300) and not failed
-    return ok, (msg or ("ok" if ok else f"HTTP {status_code}"))
-
-
-@app.route("/sql-dev/save-draft", methods=["POST"])
-@auth.login_required
-def sql_dev_save_draft():
-    """PATCH validation_from_developer/{org_id}/{query_id}/ — save a draft
-    correction {natural_language_query, dev_sql_query, visualization}."""
-    import requests
-    org_id = (request.form.get("org_id") or "").strip()
-    query_id = (request.form.get("query_id") or "").strip()
-    if not org_id or not query_id:
-        return jsonify({"ok": False, "error": "org_id and query_id are required"}), 400
-    try:
-        viz = json.loads(request.form.get("visualization") or "{}")
-    except Exception:
-        viz = {}
-    payload = {
-        "natural_language_query": request.form.get("natural_language_query") or "",
-        "dev_sql_query": request.form.get("dev_sql_query") or "",
-        "visualization": viz,
-    }
-    base = _sqldev_console_base()
-    path = f"validation_from_developer/{org_id}/{query_id}/"
-    url = f"{base}/{CELERANT_API_PREFIX}/{path}"
-    try:
-        r, url = celerant_call("PATCH", base, path, json=payload,
-                               headers={**_sqldev_headers(), "Content-Type": "application/json"},
-                               timeout=60)
-        try: body = r.json()
-        except Exception: body = {}
-        ok, msg = _sqldev_result(r.status_code, body)
-        return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
-                        "message": msg, "error": None if ok else msg})
-    except Exception as e:
-        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
-
-
-@app.route("/sql-dev/approve", methods=["POST"])
-@auth.login_required
-def sql_dev_approve():
-    """PATCH validation_like/{org_id}/{query_id}/ — approve into the trained
-    examples. Uses the UPDATED SQLExampleMetadata schema (the Swagger dropped
-    the old description/business_context fields)."""
-    import requests
-    org_id = (request.form.get("org_id") or "").strip()
-    query_id = (request.form.get("query_id") or "").strip()
-    if not org_id or not query_id:
-        return jsonify({"ok": False, "error": "org_id and query_id are required"}), 400
-    try:
-        viz = json.loads(request.form.get("visualization") or "{}")
-    except Exception:
-        viz = {}
-    payload = {
-        "natural_language_query": request.form.get("natural_language_query") or "",
-        "sql_query": request.form.get("sql_query") or "",
-        "visualization": viz,
-        "query_category": request.form.get("query_category") or "default",
-        "validation_by": "developer",
-        "user_id": request.form.get("user_id") or "-1",
-        "embedding_model": "all-MiniLM-L6-v2",
-    }
-    base = _sqldev_console_base()
-    path = f"validation_like/{org_id}/{query_id}/"
-    url = f"{base}/{CELERANT_API_PREFIX}/{path}"
-    try:
-        r, url = celerant_call("PATCH", base, path, json=payload,
-                               headers={**_sqldev_headers(), "Content-Type": "application/json"},
-                               timeout=60)
-        try: body = r.json()
-        except Exception: body = {}
-        ok, msg = _sqldev_result(r.status_code, body)
-        return jsonify({"ok": ok, "status_code": r.status_code, "url": url,
-                        "message": msg, "error": None if ok else msg})
-    except Exception as e:
-        return jsonify({"ok": False, "url": url, "error": f"{type(e).__name__}: {e}"}), 502
+def sql_dev_demo_feedback():
+    """Synthetic review queue (env-gated, OFF in production) so the page is
+    usable while the Celerant feedback_data endpoint is returning HTTP 500."""
+    if not _sqldev_demo_enabled():
+        return jsonify({"ok": False, "error": "Demo mode is off."}), 404
+    return jsonify({"ok": True, "demo": True, **_sqldev_demo_feedback()})
 
 
 def _sqldev_demo_feedback() -> dict[str, Any]:

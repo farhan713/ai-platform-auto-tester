@@ -186,9 +186,8 @@ let _orgSearch = '';
 
 async function loadOrgFilter() {
   try {
-    const qs = new URLSearchParams({ console_url: consoleEl.value.trim(), bearer_token: bearerEl.value.trim() });
-    const r = await SQA.fetchJSON('/activity-logs/orgs?' + qs.toString());
-    _allOrgs = (r && r.ok && r.orgs) ? r.orgs : [];
+    _allOrgs = (await Celerant.orgs(consoleEl.value.trim(), bearerEl.value.trim()))
+      .map(o => ({ name: o.name, database_id: o.id }));
   } catch (e) { _allOrgs = []; }
   renderOrgList();
 }

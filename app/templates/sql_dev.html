@@ -140,6 +140,7 @@
 {% block scripts %}
 <script>
 const CURRENT_USER_ID = {{ current_user_id|tojson }};
+const SQLDEV_DEMO = {{ sqldev_demo|tojson }};
 const esc = s => SQA.escapeHtml(s == null ? '' : String(s));
 
 let _rows=[], _counts={}, _tab='all', _sub='developer', _selected=null;
@@ -170,26 +171,66 @@ function pill(r){const m=metaFor(r);return `<span class="sd-pill ${m.cls}">${m.l
 // ---- org dropdown ----
 async function loadOrgs(){
   const sel=document.getElementById('sd-org');sel.innerHTML='<option value="">— loading… —</option>';sel.disabled=true;
-  try{const c=cfg();const qs=new URLSearchParams({console_url:c.console_url,bearer_token:c.bearer_token});
-    const r=await SQA.fetchJSON('/activity-logs/orgs?'+qs.toString());
-    if(!r.ok)throw new Error(r.error||'failed');
+  try{const c=cfg();
+    const orgs=await Celerant.orgs(c.console_url,c.bearer_token);
     sel.innerHTML='<option value="">— select an organization —</option>'+
-      (r.orgs||[]).map(o=>`<option value="${esc(o.database_id)}">${esc(o.name)}</option>`).join('');
+      orgs.map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
     sel.disabled=false;
   }catch(e){sel.innerHTML='<option value="">— failed to load —</option>';banner('warn','Could not load organizations: '+esc(e.message));}
 }
 
-// ---- feedback (uses raw fetch so a 502 doesn't throw an ugly JSON) ----
+// Flatten feedback_data into one list of review rows, like the Angular
+// dashboard's loadFeedbackData(). The backend renamed
+// validated_history_examples -> validated_sql_history_examples; accept both.
+function transformFeedback(data){
+  const out=[];
+  const vh=data.validated_sql_history_examples||data.validated_history_examples||{};
+  const ex=data.examples||{}, uv=data.user_visit_history||{};
+  for(const q of (vh.validation_status_clicked||[]))
+    out.push({...q,id:q.query_id,status:'not_verified',reported_date:q.created_at,
+      corrected_sql:q.dev_sql_query||q.sql_query,isDisliked:false});
+  for(const q of (vh.validation_status_dislike||[]))
+    out.push({...q,id:q.query_id,status:'not_verified',reported_date:q.created_at,
+      corrected_sql:q.dev_sql_query||q.sql_query,isDisliked:true});
+  for(const q of (ex.users_sql_queries||[]))
+    out.push({...q,id:q.example_id,query_id:q.example_id,dev_sql_query:'',status:'completed_by_user',
+      reported_date:q.created_at,corrected_sql:q.sql_query,isDisliked:false});
+  for(const q of (ex.developer_sql_queries||[])){
+    if(!q)continue;
+    const qid=q.query_id||q.example_id;
+    out.push({...q,id:qid,query_id:qid,status:'completed_by_sql_dev',reported_date:q.created_at,
+      corrected_sql:q.dev_sql_query||q.sql_query,isDisliked:false});
+  }
+  for(const q of (uv.result||[]))
+    out.push({...q,id:q.query_id,dev_sql_query:'',status:'user_visit',reported_date:q.created_at,
+      corrected_sql:q.sql_query,isDisliked:false});
+  const counts={clicked:vh.clicked_queries_count||0,dislike:vh.dislike_queries_count||0,
+    user:ex.user_queries_count||0,developer:ex.developer_queries_count||0,
+    user_visit:uv.user_visit_history_count||0};
+  return {rows:out,counts};
+}
+
+// feedback_data, straight to Celerant. Demo mode (SQA_SQLDEV_DEMO, off in
+// production) serves a synthetic queue from the server instead.
+async function fetchFeedback(org){
+  if(SQLDEV_DEMO){const d=await SQA.fetchJSON('{{ url_for("sql_dev_demo_feedback") }}');return {ok:true,demo:true,...d};}
+  const c=cfg();
+  const from=Celerant.toMmDdYyyy(document.getElementById('sd-from').value);
+  const to=Celerant.toMmDdYyyy(document.getElementById('sd-to').value);
+  const res=await Celerant.call('GET',`feedback_data/${encodeURIComponent(org)}/${_start}/${_end}/`,{
+    console:c.console_url,token:c.bearer_token,timeoutMs:60000,
+    params:(from&&to)?{from_date:from,to_date:to}:undefined});
+  const data=(((res.body||{}).responseBody||{}).data);
+  if(!res.ok||!data||typeof data!=='object')return {ok:false,status_code:res.status,url:res.url,error:Celerant.errorMessage(res)};
+  return {ok:true,url:res.url,...transformFeedback(data)};
+}
+
 async function loadFeedback(){
   const org=document.getElementById('sd-org').value;
   if(!org){banner('info','Select an organization to load its review queue.');return;}
-  const c=cfg();
-  const qs=new URLSearchParams({org_id:org,start:_start,end:_end,
-    from_date:document.getElementById('sd-from').value,to_date:document.getElementById('sd-to').value,
-    console_url:c.console_url,bearer_token:c.bearer_token});
   document.getElementById('sd-list').innerHTML='<div class="sd-empty"><span class="sd-spin" style="width:22px;height:22px;border-width:3px"></span><div>Loading queries…</div></div>';
   let r;
-  try{const resp=await fetch('/sql-dev/feedback?'+qs.toString());r=await resp.json();}
+  try{r=await fetchFeedback(org);}
   catch(e){banner('warn','Request failed: '+esc(e.message));return;}
   if(!r.ok){
     _rows=[];_counts={};renderList();
@@ -311,14 +352,39 @@ function renderDetail(){
 function busy(btn,on,label){if(on){btn.dataset.t=btn.innerHTML;btn.innerHTML='<span class="sd-spin"></span> '+(label||'…');btn.disabled=true;}
   else{btn.innerHTML=btn.dataset.t||btn.innerHTML;btn.disabled=false;}}
 
+// validation_from_developer / validation_like answer with a FLAT
+// {message, data, datalist} body, not the {responseHeader, responseBody}
+// wrapper the reads use. Accept either; validation_like also reports
+// data.valid === false when the SQL fails schema validation.
+function writeResult(res){
+  const b=res.body;
+  if(!b||typeof b!=='object')return {ok:res.ok,message:b?String(b).slice(0,300):`HTTP ${res.status}`};
+  if(b.responseHeader&&typeof b.responseHeader==='object')
+    return {ok:b.responseHeader.message_type==='Success',message:b.responseHeader.message||''};
+  const msg=String(b.message||'').trim(), low=msg.toLowerCase();
+  let failed=['issue','error','failed','invalid','please try again','could not','unable','not reference','does not']
+    .some(w=>low.includes(w));
+  if(b.data&&typeof b.data==='object'&&b.data.valid===false)failed=true;
+  const ok=res.ok&&!failed;
+  return {ok,message:msg||(ok?'ok':`HTTP ${res.status}`)};
+}
+
+// PATCH straight to Celerant (visible in DevTools with its JSON payload).
+async function patchValidation(endpoint,payload){
+  const c=cfg(), org=document.getElementById('sd-org').value;
+  const res=await Celerant.call('PATCH',`${endpoint}/${encodeURIComponent(org)}/${encodeURIComponent(_selected.id)}/`,
+    {console:c.console_url,token:c.bearer_token,json:payload,timeoutMs:60000});
+  return writeResult(res);
+}
+
 async function saveDraft(ev){
   if(!editable()){SQA.toast('Only not-verified / user-visit queries are editable.','error');return;}
   const btn=ev.currentTarget;busy(btn,true,'Saving');
-  try{const org=document.getElementById('sd-org').value;
-    const fd=new URLSearchParams({org_id:org,query_id:_selected.id,natural_language_query:_selected.natural_language_query,
-      dev_sql_query:_selected.corrected_sql,...cfg()});
-    const r=await fetch('/sql-dev/save-draft',{method:'POST',body:fd});const d=await r.json();
-    if(d.ok)SQA.toast('Draft saved. You can approve now.','success');else SQA.toast('Save failed: '+(d.error||''),'error');
+  try{
+    const d=await patchValidation('validation_from_developer',{
+      natural_language_query:_selected.natural_language_query||'',
+      dev_sql_query:_selected.corrected_sql||'',visualization:{}});
+    if(d.ok)SQA.toast('Draft saved. You can approve now.','success');else SQA.toast('Save failed: '+(d.message||''),'error');
   }catch(e){SQA.toast(e.message,'error');}finally{busy(btn,false);}
 }
 
@@ -326,13 +392,14 @@ async function approve(ev){
   if(!editable()){SQA.toast('Already completed.','error');return;}
   if(!confirm('Approve this query into the trained examples?'))return;
   const btn=ev.currentTarget;busy(btn,true,'Approving');
-  try{const org=document.getElementById('sd-org').value;
-    const fd=new URLSearchParams({org_id:org,query_id:_selected.id,natural_language_query:_selected.natural_language_query,
-      sql_query:_selected.corrected_sql||_selected.sql_query,
-      query_category:'default',user_id:CURRENT_USER_ID||'-1',...cfg()});
-    const r=await fetch('/sql-dev/approve',{method:'POST',body:fd});const d=await r.json();
+  try{
+    const d=await patchValidation('validation_like',{
+      natural_language_query:_selected.natural_language_query||'',
+      sql_query:_selected.corrected_sql||_selected.sql_query||'',
+      visualization:{},query_category:'default',validation_by:'developer',
+      user_id:CURRENT_USER_ID||'-1',embedding_model:'all-MiniLM-L6-v2'});
     if(d.ok){SQA.toast('Approved into the trained set!','success');loadFeedback();}
-    else SQA.toast('Approve failed: '+(d.error||''),'error');
+    else SQA.toast('Approve failed: '+(d.message||''),'error');
   }catch(e){SQA.toast(e.message,'error');}finally{busy(btn,false);}
 }
 

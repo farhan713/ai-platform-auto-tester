@@ -210,6 +210,73 @@ function renderResult(data) {
   resultEl.innerHTML = html;
 }
 
+// Minimal RFC 4180 parser: quoted fields may hold commas, quotes ("") and
+// newlines — which SQL in the examples CSV routinely does.
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else field += ch;
+    } else if (ch === '"' && field === '') quoted = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// {natural_language_query, expected_sql} per CSV row, for the follow-up
+// "test these on the SQL Agent" run.
+async function questionsFromCsv(file) {
+  try {
+    const rows = parseCsv((await file.text()).replace(/^﻿/, ''));
+    const header = (rows.shift() || []).map(h => h.trim());
+    const nlIdx = header.indexOf('natural_language_query');
+    const sqlIdx = header.indexOf('sql_query');
+    if (nlIdx < 0) return [];
+    return rows
+      .map(r => ({ natural_language_query: (r[nlIdx] || '').trim(),
+                   expected_sql: sqlIdx < 0 ? '' : (r[sqlIdx] || '').trim() }))
+      .filter(q => q.natural_language_query);
+  } catch (_) {
+    return [];
+  }
+}
+
+// POST straight to Celerant's training endpoint (visible in DevTools).
+async function submitTraining(dbId) {
+  const params = {};
+  const filepath = document.getElementById('t-filepath').value.trim();
+  if (filepath) params.sql_examples_filepath = filepath;
+  for (const key of ['skip_display_clean', 'skip_nlq_variants']) {
+    const v = document.getElementById('t-' + key).value;
+    if (v === 'true' || v === 'false') params[key] = v;
+  }
+  const file = document.getElementById('t-file').files[0];
+  let body, uploaded = [];
+  if (file) {
+    body = new FormData();
+    body.append('sql_examples_file', file.type ? file : new File([file], file.name, { type: 'text/csv' }), file.name);
+    uploaded = await questionsFromCsv(file);
+  }
+  const res = await Celerant.call('POST',
+    `train_sql_examples_backoffice_validated/${encodeURIComponent(dbId.replace(/^\/+|\/+$/g, ''))}/`, {
+      console: document.getElementById('t-console_url').value,
+      token: document.getElementById('t-bearer_token').value.trim(),
+      params: Object.keys(params).length ? params : undefined,
+      body, timeoutMs: 600000,
+    });
+  return { ok: res.ok, status_code: res.status, url: res.url, params,
+           elapsed_ms: res.ms, response: res.body, uploaded_questions: uploaded };
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const dbId = document.getElementById('t-database_id').value.trim();
@@ -227,9 +294,7 @@ form.addEventListener('submit', async (e) => {
   resultEl.innerHTML = '<p class="meta">Waiting for the Celerant training endpoint to respond…</p>';
 
   try {
-    const fd = new FormData(form);
-    const r = await fetch('{{ url_for("training_submit") }}', { method: 'POST', body: fd });
-    const data = await r.json();
+    const data = await submitTraining(dbId);
     renderResult(data);
     // On a successful training call AND when the CSV parsed cleanly, reveal
     // the follow-up "test these on the SQL Agent" form pre-loaded with the
