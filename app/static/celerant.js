@@ -9,8 +9,9 @@
 // Mirrors celerant_call() in server.py, which Insights still uses:
 //   - versioned prefix (sql_agent) with a fallback prefix on FastAPI's bare
 //     route-404 ({"detail": "Not Found"});
-//   - role segment (1 = admin, 2 = celerant) appended to role-scoped paths,
-//     dropping back to the plain path on 404 and remembering that for 10 min;
+//   - role segment (1 = admin, 2 = celerant) appended to role-scoped paths
+//     first, trying the plain path only if that 404s ("auto" mode also
+//     remembers a role-path 404 for 10 min);
 //   - retries for gateway blips: 503 "no healthy upstream" for any method,
 //     plus 502/503/504 and network errors for GETs.
 // Config comes from window.CELERANT_CFG, rendered by base.html.
@@ -18,7 +19,7 @@
   const CFG = window.CELERANT_CFG || {};
   const PREFIX = (CFG.prefix || 'sql_agent').replace(/^\/+|\/+$/g, '');
   const FALLBACK = (CFG.fallback_prefix || '').replace(/^\/+|\/+$/g, '');
-  const ROLE_MODE = CFG.role_path_mode || 'auto';
+  const ROLE_MODE = CFG.role_path_mode || 'force';
   const ROLE_FLAG = CFG.role_flag || '2';
   const DEFAULT_CONSOLE = CFG.default_console || 'https://celerantai.com';
   const ROLE_RETRY_AFTER_MS = 10 * 60 * 1000;
@@ -48,6 +49,11 @@
     const until = Date.now() + ROLE_RETRY_AFTER_MS;
     _roleMemo[base] = until;
     try { sessionStorage.setItem(ROLE_KEY + base, String(until)); } catch (_) {}
+  }
+
+  function _clearRoleUnsupported(base) {
+    delete _roleMemo[base];
+    try { sessionStorage.removeItem(ROLE_KEY + base); } catch (_) {}
   }
 
   function _rolePathSupported(base) {
@@ -125,10 +131,12 @@
     const init = { method: method.toUpperCase(), headers, body, credentials: 'omit' };
     const started = performance.now();
 
+    const roleUrl = `${base}/${PREFIX}/${cleanPath.replace(/\/+$/, '')}/${opts.roleFlag || ROLE_FLAG}/${qs}`;
+    const tryRole = opts.roleScoped && _rolePathSupported(base);
     let url;
     let resp;
-    if (opts.roleScoped && _rolePathSupported(base)) {
-      url = `${base}/${PREFIX}/${cleanPath.replace(/\/+$/, '')}/${opts.roleFlag || ROLE_FLAG}/${qs}`;
+    if (tryRole) {
+      url = roleUrl;
       resp = await _send(url, init, opts.timeoutMs);
       if (resp.status === 404) {
         if (ROLE_MODE !== 'force') _markRoleUnsupported(base);
@@ -141,6 +149,18 @@
       if (FALLBACK && FALLBACK !== PREFIX && await _isRouteNotFound(resp)) {
         url = `${base}/${FALLBACK}/${cleanPath}${qs}`;
         resp = await _send(url, init, opts.timeoutMs);
+      }
+      // The role segment was skipped on a remembered 404, but the plain path
+      // is gone too — Celerant has likely switched over. Forget and retry it.
+      if (opts.roleScoped && !tryRole && ROLE_MODE !== 'off' && resp.status === 404) {
+        _clearRoleUnsupported(base);
+        const roleResp = await _send(roleUrl, init, opts.timeoutMs);
+        if (roleResp.status !== 404) {
+          url = roleUrl;
+          resp = roleResp;
+        } else {
+          _markRoleUnsupported(base);
+        }
       }
     }
 

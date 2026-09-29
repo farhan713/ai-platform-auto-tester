@@ -1139,13 +1139,14 @@ def _celerant_request(method: str, url: str, **kwargs: Any) -> Any:
     return resp
 
 
-# Celerant is adding a role segment to the end of some paths: 1 = admin,
-# 2 = celerant (e.g. /all_orgs/1/ and /history_data/{org}/0/20/1/). It is not
-# live yet — their API still reads a trailing segment on /all_orgs/ as an org
-# id and 404s. So we send it, and on a 404 fall back to the path without it and
-# remember that for a while. When their side ships, we start using it with no
-# redeploy. SQA_CELERANT_ROLE_PATH=off disables it; =force skips the fallback.
-CELERANT_ROLE_PATH_MODE = os.environ.get("SQA_CELERANT_ROLE_PATH", "auto").strip().lower()
+# Celerant scopes some paths by a trailing role segment: 1 = admin,
+# 2 = celerant (e.g. /all_orgs/1/ and /history_data/{org}/0/20/1/); the plain
+# paths are gone. By default ("force") every role-scoped call goes to the role
+# path first and only tries the plain path if that 404s.
+# SQA_CELERANT_ROLE_PATH=auto instead remembers a role-path 404 for a while and
+# skips straight to the plain path, retrying the role path if the plain one
+# 404s too; =off never sends the segment.
+CELERANT_ROLE_PATH_MODE = os.environ.get("SQA_CELERANT_ROLE_PATH", "force").strip().lower()
 CELERANT_ROLE_FLAGS = {auth.ROLE_ADMIN: "1", auth.ROLE_CELERANT: "2"}
 _ROLE_PATH_RETRY_AFTER = 10 * 60          # seconds to wait before probing again
 _role_path_unsupported_until: dict[str, float] = {}
@@ -1178,13 +1179,13 @@ def celerant_call(method: str, console: str | None, path: str,
     Returns (response, url_actually_used)."""
     origin = _celerant_origin(console)
     path = path.lstrip("/")
+    role_url = f"{origin}/{CELERANT_API_PREFIX}/{path.rstrip('/')}/{role_flag or celerant_role_flag()}/"
+    tried_role = role_scoped and _role_path_supported(origin)
 
-    if role_scoped and _role_path_supported(origin):
-        role_path = f"{path.rstrip('/')}/{role_flag or celerant_role_flag()}/"
-        url = f"{origin}/{CELERANT_API_PREFIX}/{role_path}"
-        resp = _celerant_request(method, url, **kwargs)
+    if tried_role:
+        resp = _celerant_request(method, role_url, **kwargs)
         if resp.status_code != 404:
-            return resp, url
+            return resp, role_url
         if CELERANT_ROLE_PATH_MODE != "force":
             _role_path_unsupported_until[origin] = time.time() + _ROLE_PATH_RETRY_AFTER
 
@@ -1194,6 +1195,15 @@ def celerant_call(method: str, console: str | None, path: str,
             and _is_route_not_found(resp)):
         url = f"{origin}/{CELERANT_API_FALLBACK_PREFIX}/{path}"
         resp = _celerant_request(method, url, **kwargs)
+
+    # The role segment was skipped on a remembered 404, but the plain path is
+    # gone too — Celerant has likely switched over. Forget and retry it.
+    if role_scoped and not tried_role and CELERANT_ROLE_PATH_MODE != "off" and resp.status_code == 404:
+        _role_path_unsupported_until.pop(origin, None)
+        role_resp = _celerant_request(method, role_url, **kwargs)
+        if role_resp.status_code != 404:
+            return role_resp, role_url
+        _role_path_unsupported_until[origin] = time.time() + _ROLE_PATH_RETRY_AFTER
     return resp, url
 
 
