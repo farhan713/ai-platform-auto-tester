@@ -196,12 +196,19 @@
              industry: s(o.industry_type), organization_id: orgUuid };
   }
 
-  /** GET all_orgs/ (role-scoped) → name-sorted [{id, name, industry, organization_id}]. */
-  async function orgs(consoleUrl, token) {
+  /** all_orgs includes an "All organizations" entry (org_id "all"). history_data
+   *  accepts it and returns every org's records combined; feedback_data does not. */
+  function isAllOrgs(o) {
+    return String((o && o.id) || '').toLowerCase() === 'all';
+  }
+
+  /** GET all_orgs/ (role-scoped) → name-sorted [{id, name, industry, organization_id}].
+   *  Pass {includeAll: false} to drop the combined "All organizations" entry. */
+  async function orgs(consoleUrl, token, opts = {}) {
     const res = await call('GET', 'all_orgs/', { console: consoleUrl, token, roleScoped: true, timeoutMs: 30000 });
     if (!res.ok) throw new Error(errorMessage(res));
     const raw = (((res.body || {}).responseBody || {}).data) || [];
-    return raw.map(normalizeOrg).filter(o => o && o.id)
+    return raw.map(normalizeOrg).filter(o => o && o.id && (opts.includeAll !== false || !isAllOrgs(o)))
       .sort((a, b) => (a.name || '').toLowerCase().localeCompare((b.name || '').toLowerCase()));
   }
 
@@ -213,5 +220,5 @@
     return /^\d{2}-\d{2}-\d{4}$/.test(s) ? s : '';
   }
 
-  window.Celerant = { call, orgs, origin, errorMessage, normalizeOrg, toMmDdYyyy };
+  window.Celerant = { call, orgs, isAllOrgs, origin, errorMessage, normalizeOrg, toMmDdYyyy };
 })();

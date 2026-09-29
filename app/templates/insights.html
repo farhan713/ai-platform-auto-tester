@@ -186,7 +186,8 @@ let _orgSearch = '';
 
 async function loadOrgFilter() {
   try {
-    _allOrgs = (await Celerant.orgs(consoleEl.value.trim(), bearerEl.value.trim()))
+    // Nothing selected already means every org; the combined entry would double-count.
+    _allOrgs = (await Celerant.orgs(consoleEl.value.trim(), bearerEl.value.trim(), { includeAll: false }))
       .map(o => ({ name: o.name, database_id: o.id }));
   } catch (e) { _allOrgs = []; }
   renderOrgList();

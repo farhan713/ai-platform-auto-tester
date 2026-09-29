@@ -1608,12 +1608,16 @@ def _normalize_org(o: dict[str, Any]) -> dict[str, Any] | None:
 
 def _fetch_all_orgs_normalized(console: str, bearer: str = "") -> list[dict[str, Any]]:
     """GET {console}/sql_agent/all_orgs/ and return a normalized, name-sorted
-    list of {id, name, organization_id}. Raises on transport / non-2xx."""
+    list of {id, name, organization_id}. Raises on transport / non-2xx.
+
+    Drops the combined "All organizations" entry (org_id "all"): Insights fans
+    out per org, so fetching it as well would count every record twice."""
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
     resp, _ = celerant_call("GET", console, "all_orgs/", headers=headers, timeout=30, role_scoped=True)
     resp.raise_for_status()
     raw = (resp.json() or {}).get("responseBody", {}).get("data") or []
-    out = [n for n in (_normalize_org(o) for o in raw) if n and n["id"]]
+    out = [n for n in (_normalize_org(o) for o in raw)
+           if n and n["id"] and n["id"].lower() != "all"]
     out.sort(key=lambda o: (o["name"] or "").lower())
     return out
 

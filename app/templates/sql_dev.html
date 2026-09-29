@@ -172,7 +172,8 @@ function pill(r){const m=metaFor(r);return `<span class="sd-pill ${m.cls}">${m.l
 async function loadOrgs(){
   const sel=document.getElementById('sd-org');sel.innerHTML='<option value="">— loading… —</option>';sel.disabled=true;
   try{const c=cfg();
-    const orgs=await Celerant.orgs(c.console_url,c.bearer_token);
+    // Review queues are per org — feedback_data has no combined "all" view.
+    const orgs=await Celerant.orgs(c.console_url,c.bearer_token,{includeAll:false});
     sel.innerHTML='<option value="">— select an organization —</option>'+
       orgs.map(o=>`<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
     sel.disabled=false;
