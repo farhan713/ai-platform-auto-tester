@@ -48,6 +48,9 @@
   .sd-pill.cu{background:var(--code-bg);color:var(--text-muted)}
   .sd-pill.cd{background:color-mix(in srgb,var(--pass) 12%,transparent);color:var(--pass)}
   .sd-pill.uv{background:var(--accent-soft);color:var(--accent)}
+  .sd-pill.ver{background:color-mix(in srgb,var(--pass) 12%,transparent);color:var(--pass)}
+  .sd-pill.ver .i{width:12px;height:12px}
+  .sd-pill.unver{background:color-mix(in srgb,var(--text-muted) 12%,transparent);color:var(--text-muted)}
   .acc-nv{background:var(--partial)} .acc-dis{background:var(--fail)} .acc-cu{background:var(--text-muted)}
   .acc-cd{background:var(--pass)} .acc-uv{background:var(--brand-2)}
 
@@ -166,7 +169,40 @@ const META={
   user_visit:{cls:'uv',acc:'acc-uv',label:'User Visit'},
 };
 function metaFor(r){ if(r.status==='not_verified'&&r.isDisliked) return META.disliked; return META[r.status]||META.not_verified; }
+
+// feedback_data reports a saved example's verified state as verified ("True"
+// /"False" or a bool) plus verification_status ("Verified"/"Not Verified").
+// Only the examples sections carry it — null means "this row has no state".
+function verifiedOf(r){
+  if(!r||r.verified===undefined||r.verified===null)return null;
+  if(typeof r.verified==='boolean')return r.verified;
+  const v=String(r.verified).trim().toLowerCase();
+  if(v==='true')return true;
+  if(v==='false')return false;
+  return null;
+}
+// Toggling is only meaningful for saved examples (they have an example_id).
+const canVerify=r=>!!(r&&r.example_id);
+
+// POST sql_example/{example_id}/verified  {"verified": true|false}
+// Answers with the usual wrapper: responseHeader.message "Verification
+// updated." and responseBody.data {example_id, verified, verification_status}.
+async function postVerified(exampleId,verified){
+  const c=cfg();
+  const res=await Celerant.call('POST',`sql_example/${encodeURIComponent(exampleId)}/verified`,
+    {console:c.console_url,token:c.bearer_token,json:{verified:!!verified},timeoutMs:60000});
+  const b=(res.body&&typeof res.body==='object')?res.body:{};
+  const hdr=b.responseHeader||{};
+  const ok=res.ok&&(hdr.message_type?hdr.message_type==='Success':true);
+  return {ok,message:hdr.message||Celerant.errorMessage(res),data:(b.responseBody||{}).data||null};
+}
 function pill(r){const m=metaFor(r);return `<span class="sd-pill ${m.cls}">${m.label}</span>`;}
+function verifiedBadge(r){
+  const v=verifiedOf(r);
+  if(v===null)return '';
+  return v?`<span class="sd-pill ver" title="${esc(r.verification_status||'Verified')}">${SQA.icon('check')} Verified</span>`
+          :`<span class="sd-pill unver" title="${esc(r.verification_status||'Not Verified')}">Not verified</span>`;
+}
 
 // ---- org dropdown ----
 async function loadOrgs(){
@@ -283,7 +319,7 @@ function renderList(){
     const selCls=(_selected&&_selected.id===r.id)?' sel':'';
     return `<div class="sd-card${selCls}" data-i="${i}">
       <span class="accent ${m.acc}"></span>
-      <div class="meta-row">${pill(r)}<span class="who">${SQA.icon('user')} ${esc(r.login_name||'—')}</span></div>
+      <div class="meta-row">${pill(r)}${verifiedBadge(r)}<span class="who">${SQA.icon('user')} ${esc(r.login_name||'—')}</span></div>
       <div class="q">${esc((r.natural_language_query||'').slice(0,100))}${(r.natural_language_query||'').length>100?'…':''}</div>
       <div class="meta-row"><span class="who">${esc(fmtTime(r.reported_date))}</span></div>
     </div>`;}).join('');
@@ -328,10 +364,13 @@ function renderDetail(){
       <div style="display:flex;gap:8px">
         <button class="btn" id="sd-save" ${ed?'':'disabled'} title="${ed?'Save a draft correction':'Only editable for not-verified / user-visit queries'}">${SQA.icon('floppy-disk')} Save draft</button>
         <button class="btn btn-primary" id="sd-approve" ${ed?'':'disabled'}>${SQA.icon('check')} Approve</button>
+        ${canVerify(r)?`<button class="btn" id="sd-verify" title="Mark this saved example verified or not verified">${
+          verifiedOf(r)===true?SQA.icon('x')+' Mark not verified':SQA.icon('check')+' Mark verified'}</button>`:''}
       </div>
     </div>
     <p style="margin:10px 0 2px;font-size:15px;font-weight:600">${esc(r.natural_language_query)}</p>
-    <div class="sd-qmeta"><span>${SQA.icon('user')} ${esc(r.login_name||'—')}</span><span>${SQA.icon('clock')} ${esc(String(r.reported_date||'').slice(0,19).replace('T',' '))}</span></div>
+    <div class="sd-qmeta"><span>${SQA.icon('user')} ${esc(r.login_name||'—')}</span><span>${SQA.icon('clock')} ${esc(String(r.reported_date||'').slice(0,19).replace('T',' '))}</span>${
+      verifiedOf(r)===null?'':`<span>${verifiedBadge(r)}</span>`}</div>
 
     ${feedbackBlock(r)}
 
@@ -348,6 +387,8 @@ function renderDetail(){
   d.querySelector('#sd-corrected').addEventListener('input',e=>{_selected.corrected_sql=e.target.value;});
   d.querySelector('#sd-save').addEventListener('click',saveDraft);
   d.querySelector('#sd-approve').addEventListener('click',approve);
+  const vb=d.querySelector('#sd-verify');
+  if(vb)vb.addEventListener('click',toggleVerified);
 }
 
 function busy(btn,on,label){if(on){btn.dataset.t=btn.innerHTML;btn.innerHTML='<span class="sd-spin"></span> '+(label||'…');btn.disabled=true;}
@@ -402,6 +443,26 @@ async function approve(ev){
     if(d.ok){SQA.toast('Approved into the trained set!','success');loadFeedback();}
     else SQA.toast('Approve failed: '+(d.message||''),'error');
   }catch(e){SQA.toast(e.message,'error');}finally{busy(btn,false);}
+}
+
+async function toggleVerified(ev){
+  const r=_selected;
+  if(!canVerify(r)){SQA.toast('Only saved examples can be verified.','error');return;}
+  const next=verifiedOf(r)!==true;        // unknown or false -> verify it
+  const btn=ev.currentTarget;busy(btn,true,next?'Verifying':'Updating');
+  try{
+    const d=await postVerified(r.example_id,next);
+    if(!d.ok){SQA.toast('Could not update: '+(d.message||''),'error');return;}
+    // Trust the server's echo when it sends one.
+    const got=d.data||{};
+    r.verified=(got.verified!==undefined)?got.verified:next;
+    r.verification_status=got.verification_status||(next?'Verified':'Not Verified');
+    const inList=_rows.find(x=>x.example_id===r.example_id);
+    if(inList&&inList!==r){inList.verified=r.verified;inList.verification_status=r.verification_status;}
+    renderDetail();renderList();
+    SQA.toast(d.message||(next?'Marked verified.':'Marked not verified.'),'success');
+  }catch(e){SQA.toast(e.message,'error');}
+  finally{const b=document.getElementById('sd-verify');if(b)busy(b,false);}
 }
 
 function setTab(t){_tab=t;_start=0;_end=9;
