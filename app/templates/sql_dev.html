@@ -51,6 +51,12 @@
   .sd-pill.ver{background:color-mix(in srgb,var(--pass) 12%,transparent);color:var(--pass)}
   .sd-pill.ver .i{width:12px;height:12px}
   .sd-pill.unver{background:color-mix(in srgb,var(--text-muted) 12%,transparent);color:var(--text-muted)}
+  .sd-pill.ranok{background:color-mix(in srgb,var(--pass) 12%,transparent);color:var(--pass)}
+  .sd-pill.ranfail{background:color-mix(in srgb,var(--fail) 11%,transparent);color:var(--fail)}
+  .sd-pill.ranok .i,.sd-pill.ranfail .i{width:12px;height:12px}
+  .sd-run{padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);font-size:13px;line-height:1.5}
+  .sd-run.fail{border-color:color-mix(in srgb,var(--fail) 35%,transparent);background:color-mix(in srgb,var(--fail) 6%,transparent)}
+  .sd-run.ok{border-color:color-mix(in srgb,var(--pass) 35%,transparent);background:color-mix(in srgb,var(--pass) 6%,transparent)}
   .acc-nv{background:var(--partial)} .acc-dis{background:var(--fail)} .acc-cu{background:var(--text-muted)}
   .acc-cd{background:var(--pass)} .acc-uv{background:var(--brand-2)}
 
@@ -149,12 +155,13 @@ const esc = s => SQA.escapeHtml(s == null ? '' : String(s));
 
 let _rows=[], _counts={}, _tab='all', _sub='developer', _selected=null;
 let _start=0,_end=9; const PAGE=10;
-// Completed and Verified split the saved examples by their verified flag.
-// feedback_data can't filter on it, and it pages each section on its own, so
-// those two tabs load one wider window and page through it here instead.
-const EX_WINDOW=500;
+// One feedback_data call loads up to WINDOW rows of every section; the tabs
+// filter and page that set here. The API can't filter on verified, and its
+// counts are just the size of the page it returned, so server paging can't
+// give real totals.
+const WINDOW=500;
 const exTab=t=>t==='completed'||t==='verified';
-let _win=null;   // 'page' = _rows is the server page _start.._end; 'ex' = the examples window
+let _savedQs=new Set();  // questions that already have a saved example
 
 (function(){const t=new Date(),y=new Date(Date.now()-30*864e5),iso=d=>d.toISOString().slice(0,10);
   document.getElementById('sd-to').value=iso(t);document.getElementById('sd-from').value=iso(y);})();
@@ -209,6 +216,33 @@ function verifiedBadge(r){
   if(v===null)return '';
   return v?`<span class="sd-pill ver" title="${esc(r.verification_status||'Verified')}">${SQA.icon('check')} Verified</span>`
           :`<span class="sd-pill unver" title="${esc(r.verification_status||'Not Verified')}">Not verified</span>`;
+}
+
+// Whether the SQL actually ran. user_visit_history rows carry
+// sql_run_succeeded (bool) and result_status (text). Celerant doesn't fill
+// them in yet — null on every row as of Nov 2026 — so these stay quiet until
+// it does. undefined = the row type has no such field.
+function runOf(r){
+  if(!r||!('sql_run_succeeded' in r))return undefined;
+  const v=r.sql_run_succeeded;
+  if(v===true||v===false)return v;
+  const t=String(v??'').trim().toLowerCase();
+  return t==='true'?true:t==='false'?false:null;
+}
+function runBadge(r){
+  const v=runOf(r);
+  if(v===false)return `<span class="sd-pill ranfail" title="${esc(r.result_status||'The SQL failed when it ran')}">${SQA.icon('warning')} SQL failed</span>`;
+  if(v===true)return `<span class="sd-pill ranok" title="${esc(r.result_status||'The SQL ran successfully')}">${SQA.icon('check')} Ran OK</span>`;
+  return '';
+}
+function runBlock(r){
+  const v=runOf(r);
+  if(v===undefined)return '';
+  const msg=String(r.result_status??'').trim();
+  const body=v===false?`<div class="sd-run fail"><b>The SQL failed when it ran.</b>${msg?'<br>'+esc(msg):''}</div>`
+    :v===true?`<div class="sd-run ok"><b>The SQL ran successfully.</b>${msg?'<br>'+esc(msg):''}</div>`
+    :`<div class="sd-run"><span class="meta">Celerant hasn't reported whether this SQL ran successfully${msg?':':'.'}</span>${msg?' '+esc(msg):''}</div>`;
+  return `<div class="sd-section"><div class="head"><h3>${SQA.icon('play')} SQL run result</h3></div>${body}</div>`;
 }
 
 // ---- org dropdown ----
@@ -273,41 +307,43 @@ async function loadFeedback(){
   const org=document.getElementById('sd-org').value;
   if(!org){banner('info','Select an organization to load its review queue.');return;}
   document.getElementById('sd-list').innerHTML='<div class="sd-empty"><span class="sd-spin" style="width:22px;height:22px;border-width:3px"></span><div>Loading queries…</div></div>';
-  const ex=exTab(_tab);
+  _start=0;_end=PAGE-1;
   let r;
-  try{r=ex?await fetchFeedback(org,0,EX_WINDOW):await fetchFeedback(org,_start,_end);}   // end is exclusive: 0/500 -> 500 rows
+  try{r=await fetchFeedback(org,0,WINDOW);}   // end is exclusive: 0/500 -> 500 rows
   catch(e){banner('warn','Request failed: '+esc(e.message));return;}
   if(!r.ok){
-    _rows=[];_counts={};_win=null;updateCounts();renderList();
+    _rows=[];_counts={};_savedQs=new Set();updateCounts();renderList();
     banner('warn','The Celerant <b>feedback</b> endpoint is currently unavailable (HTTP '+(r.status_code||'5xx')+'). '
       +'This is an upstream service issue — not a problem with this page. The review queue will populate automatically once it recovers.');
     return;
   }
-  const capped=ex&&!r.demo&&Math.max(r.counts.user||0,r.counts.developer||0)>=EX_WINDOW;
+  const capped=!r.demo&&Object.values(r.counts||{}).some(n=>n>=WINDOW);
   banner(r.demo||capped?'info':null, r.demo?'<b>Demo data</b> — showing a synthetic review queue while the live feedback endpoint is unavailable.'
-    :capped?`Showing the first ${EX_WINDOW} examples for these dates. Narrow the date range to see the rest.`:null);
-  _rows=r.rows||[];_counts=r.counts||{};_win=ex?'ex':'page';
+    :capped?`Showing the first ${WINDOW} rows of each section for these dates. Narrow the date range to see the rest.`:null);
+  _rows=r.rows||[];_counts=r.counts||{};
+  _savedQs=new Set(_rows.filter(isExample).map(r=>normQ(r.natural_language_query)));
   updateCounts();renderList();
 }
 
 const isExample=r=>r.status==='completed_by_sql_dev'||r.status==='completed_by_user';
 const isVerifiedEx=r=>isExample(r)&&verifiedOf(r)===true;
+const normQ=s=>String(s||'').toLowerCase().replace(/\s+/g,' ').trim();
+// Not Verified = everything still waiting for a reviewer:
+//  - queries a user flagged (clicked "validate" or disliked),
+//  - user visits nobody has approved yet (Approve saves an example under the
+//    same question, which takes the visit off this list),
+//  - saved examples that aren't verified.
+function needsReview(r){
+  if(r.status==='not_verified')return true;
+  if(r.status==='user_visit')return !_savedQs.has(normQ(r.natural_language_query));
+  return isExample(r)&&verifiedOf(r)!==true;
+}
 function updateCounts(){
   const ex=_rows.filter(isExample), ver=ex.filter(isVerifiedEx).length;
-  document.getElementById('sd-c-nv').textContent=(_counts.clicked||0)+(_counts.dislike||0);
+  document.getElementById('sd-c-nv').textContent=_rows.filter(needsReview).length;
   document.getElementById('sd-c-cm').textContent=ex.length-ver;
   document.getElementById('sd-c-vf').textContent=ver;
-  document.getElementById('sd-c-uv').textContent=(_counts.user_visit||0);
-}
-// Client-side paging: the examples tabs once their window is loaded.
-const localPaging=()=>exTab(_tab)&&_win==='ex';
-
-function tabCount(){
-  if(_tab==='all')return(_counts.clicked||0)+(_counts.dislike||0)+(_counts.user||0)+(_counts.developer||0)+(_counts.user_visit||0);
-  if(_tab==='not_verified')return(_counts.clicked||0)+(_counts.dislike||0);
-  if(_tab==='completed')return _sub==='developer'?(_counts.developer||0):(_counts.user||0);
-  if(_tab==='user_visits')return(_counts.user_visit||0);
-  return 0;
+  document.getElementById('sd-c-uv').textContent=_rows.filter(r=>r.status==='user_visit').length;
 }
 function visibleRows(){
   const q=(document.getElementById('sd-search').value||'').toLowerCase();
@@ -316,7 +352,7 @@ function visibleRows(){
     const ms=!q||[r.natural_language_query,r.sql_query,r.login_name].some(v=>(v||'').toLowerCase().includes(q));
     let mt=false;
     if(_tab==='all')mt=true;
-    else if(_tab==='not_verified')mt=r.status==='not_verified';
+    else if(_tab==='not_verified')mt=needsReview(r);
     else if(exTab(_tab))mt=(_sub==='developer'?r.status==='completed_by_sql_dev':r.status==='completed_by_user')
       &&(_tab==='verified')===(verifiedOf(r)===true);
     else if(_tab==='user_visits')mt=r.status==='user_visit';
@@ -332,9 +368,8 @@ function fmtTime(s){const d=new Date(s);if(isNaN(d))return '';
 
 function renderList(){
   const all=visibleRows();
-  const local=localPaging();
-  if(local&&_start>0&&_start>=all.length){_start=Math.max(0,Math.floor((all.length-1)/PAGE)*PAGE);_end=_start+PAGE-1;}
-  const rows=local?all.slice(_start,_end+1):all;
+  if(_start>0&&_start>=all.length){_start=Math.max(0,Math.floor((all.length-1)/PAGE)*PAGE);_end=_start+PAGE-1;}
+  const rows=all.slice(_start,_end+1);
   const el=document.getElementById('sd-list');
   if(!rows.length){el.innerHTML='<div class="sd-empty"><span class="big">'+SQA.icon('tray')+'</span><div>No queries in this view for the selected dates.<br><span class="meta">Try a wider date range.</span></div></div>';
     document.getElementById('sd-pager').style.display='none';return;}
@@ -342,12 +377,12 @@ function renderList(){
     const selCls=(_selected&&_selected.id===r.id)?' sel':'';
     return `<div class="sd-card${selCls}" data-i="${i}">
       <span class="accent ${m.acc}"></span>
-      <div class="meta-row">${pill(r)}${verifiedBadge(r)}<span class="who">${SQA.icon('user')} ${esc(r.login_name||'—')}</span></div>
+      <div class="meta-row"><span style="display:inline-flex;gap:5px;flex-wrap:wrap">${pill(r)}${verifiedBadge(r)}${runBadge(r)}</span><span class="who">${SQA.icon('user')} ${esc(r.login_name||'—')}</span></div>
       <div class="q">${esc((r.natural_language_query||'').slice(0,100))}${(r.natural_language_query||'').length>100?'…':''}</div>
       <div class="meta-row"><span class="who">${esc(fmtTime(r.reported_date))}</span></div>
     </div>`;}).join('');
   el.querySelectorAll('.sd-card').forEach(d=>d.addEventListener('click',()=>selectRow(rows[parseInt(d.dataset.i)])));
-  const total=local?all.length:tabCount();
+  const total=all.length;
   const pager=document.getElementById('sd-pager');
   pager.style.display=total>PAGE?'flex':'none';
   document.getElementById('sd-page-info').textContent=`${_start+1}–${Math.min(_end+1,total)} of ${total}`;
@@ -396,6 +431,7 @@ function renderDetail(){
       verifiedOf(r)===null?'':`<span>${verifiedBadge(r)}</span>`}</div>
 
     ${feedbackBlock(r)}
+    ${runBlock(r)}
 
     <div class="sd-section">
       <div class="head"><h3>${SQA.icon('robot')} LLM-generated SQL <span class="meta" style="font-weight:400">read-only</span></h3></div>
@@ -488,25 +524,24 @@ async function toggleVerified(ev){
   finally{const b=document.getElementById('sd-verify');if(b)busy(b,false);}
 }
 
+// Tabs and sub-tabs only filter the loaded rows; Apply / org change reload.
 function setTab(t){const was=_tab;_tab=t;_start=0;_end=PAGE-1;
   document.querySelectorAll('.sd-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
   document.getElementById('sd-subtabs').style.display=exTab(t)?'inline-flex':'none';
-  if(exTab(t))setSub(exTab(was)?_sub:'developer');else loadFeedback();
+  if(exTab(t))setSub(exTab(was)?_sub:'developer');else renderList();
 }
-// Completed <-> Verified and Developer <-> User reuse the loaded window.
 function setSub(s){_sub=s;_start=0;_end=PAGE-1;
   document.querySelectorAll('.sd-subtab').forEach(b=>b.classList.toggle('active',b.dataset.sub===s));
-  if(!exTab(_tab))return;
-  if(_win==='ex')renderList();else loadFeedback();}
+  renderList();}
 document.querySelectorAll('.sd-tab').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.tab)));
 document.querySelectorAll('.sd-subtab').forEach(b=>b.addEventListener('click',()=>setSub(b.dataset.sub)));
-document.getElementById('sd-search').addEventListener('input',renderList);
+document.getElementById('sd-search').addEventListener('input',()=>{_start=0;_end=PAGE-1;renderList();});
 document.getElementById('sd-sort').addEventListener('change',renderList);
 document.getElementById('sd-apply').addEventListener('click',()=>{_start=0;_end=9;loadFeedback();});
 document.getElementById('sd-org').addEventListener('change',()=>{_start=0;_end=9;loadFeedback();});
 document.getElementById('sd-org-reload').addEventListener('click',loadOrgs);
-document.getElementById('sd-prev').addEventListener('click',()=>{_start=Math.max(0,_start-PAGE);_end=_start+PAGE-1;localPaging()?renderList():loadFeedback();});
-document.getElementById('sd-next').addEventListener('click',()=>{_start+=PAGE;_end=_start+PAGE-1;localPaging()?renderList():loadFeedback();});
+document.getElementById('sd-prev').addEventListener('click',()=>{_start=Math.max(0,_start-PAGE);_end=_start+PAGE-1;renderList();});
+document.getElementById('sd-next').addEventListener('click',()=>{_start+=PAGE;_end=_start+PAGE-1;renderList();});
 
 document.querySelector('.sd-tab[data-tab="all"]').classList.add('active');
 loadOrgs();
